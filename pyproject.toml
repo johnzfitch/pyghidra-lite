@@ -1,0 +1,49 @@
+[project]
+name = "pyghidra-lite"
+version = "0.1.0"
+description = "Lightweight MCP server for Ghidra-based reverse engineering with iOS, Linux, and game file support"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "zack" }]
+keywords = ["ghidra", "reverse-engineering", "mcp", "ios", "macho", "elf", "game-hacking"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Disassemblers",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "pyghidra>=2.0.0",
+    "pydantic>=2.0.0",
+    "click>=8.0.0",
+    "chromadb>=0.4.0",
+]
+
+[project.optional-dependencies]
+ios = ["lief>=0.14.0"]
+full = ["lief>=0.14.0", "capstone>=5.0.0", "unicorn>=2.0.0"]
+dev = ["pytest>=7.0.0", "ruff>=0.1.0"]
+
+[project.scripts]
+pyghidra-lite = "pyghidra_lite.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyghidra_lite"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
