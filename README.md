@@ -1,131 +1,143 @@
 # pyghidra-lite
 
-Lightweight MCP server for Ghidra-based reverse engineering with optimized context cost and extended platform support.
+Lightweight MCP server for Ghidra-based reverse engineering. Focused toolset with smart backend features.
 
-## Features
+## Design Philosophy
 
-### Core (optimized from pyghidra-mcp)
-- Decompile functions to pseudo-C
-- Symbol/function search
-- Semantic code search (vector similarity)
-- Import/export listing
-- Cross-reference analysis
-- String search
-- Raw memory reading
+1. **Small tool surface**: 17 focused tools that agents actually use
+2. **Rich metadata**: Functions include `refs_in`, `refs_out`, `has_strings`, `is_library` for prioritization
+3. **Stable IDs**: Content-addressed `unit_id` and `stable_id` survive renames
+4. **Analysis profiles**: `fast`/`default`/`deep` tradeoff without changing tools
+5. **Container support**: APK/IPA/AppImage auto-extraction
 
-### iOS / Mach-O
-- Segment and section listing
-- Objective-C class/method extraction
-- Swift type demangling
-- Entitlements extraction
-- Info.plist parsing
+## Tools
 
-### Linux / ELF
-- Section analysis
-- Shared library dependencies
-- AppImage extraction and analysis
+### Import
+| Tool | Description |
+|------|-------------|
+| `import_binary` | Import binary or container with profile selection |
+| `delete_binary` | Remove from project |
+| `reanalyze` | Re-run with different profile |
 
-### Analysis Tools
-- Entropy analysis (find encrypted/packed regions)
-- Vulnerability pattern detection
-- String cross-reference mapping
-- Function comparison/diffing
+### Discovery
+| Tool | Description |
+|------|-------------|
+| `list_binaries` | List all binaries with status |
+| `get_info` | Binary metadata (arch, format, counts) |
+| `get_status` | Analysis progress |
+| `list_functions` | Functions with metadata (sortable by refs) |
+| `list_imports` | Imports with capability tags |
+| `list_exports` | Exported symbols |
 
-### Game Files (planned)
-- Unity AssetBundle parsing
-- Unreal Engine .pak extraction
+### Analysis
+| Tool | Description |
+|------|-------------|
+| `decompile` | Pseudo-C with callees and strings |
+| `get_xrefs` | Who calls/uses this |
+| `get_callees` | What this function calls |
+
+### Search
+| Tool | Description |
+|------|-------------|
+| `search_functions` | Semantic code search |
+| `search_strings` | Strings with xrefs |
+| `search_symbols` | Symbol name search |
+
+### Data
+| Tool | Description |
+|------|-------------|
+| `read_bytes` | Raw memory |
+| `read_string` | Null-terminated string |
+
+## Analysis Profiles
+
+| Profile | Use Case |
+|---------|----------|
+| `fast` | Quick triage, minimal decompiler |
+| `default` | Balanced analysis |
+| `deep` | Full analysis for obfuscated code |
+
+```python
+# Import with fast profile for triage
+import_binary("/path/to/app.apk", profile="fast")
+
+# Re-analyze specific binary with deep profile
+reanalyze("libnative.so", profile="deep")
+```
+
+## Container Support
+
+```python
+# APK auto-extracts to multiple units
+import_binary("/path/to/app.apk")
+# Returns: ContainerInfo with units=[libfoo.so, libbar.so, classes.dex, ...]
+
+# IPA extracts main binary + frameworks
+import_binary("/path/to/App.ipa")
+
+# AppImage extracts embedded ELFs
+import_binary("/path/to/App.AppImage")
+```
+
+## Function Metadata
+
+`list_functions` returns prioritization hints:
+
+```python
+FunctionInfo(
+    name="decrypt_data",
+    address="0x1234",
+    stable_id="a1b2c3...",     # Survives renames
+    size=256,
+    refs_in=47,                 # Many callers = important
+    refs_out=3,                 # Few callees = leaf function
+    has_strings=True,           # References literals
+    is_library=False,           # Not known stdlib
+    is_thunk=False,             # Not a wrapper
+)
+```
+
+Sort by `refs_in` to find important functions, `refs_out` to find orchestrators.
+
+## Provenance
+
+All results include provenance for reproducibility:
+
+```python
+Provenance(
+    unit_id="abc123...",
+    profile=AnalysisProfile.DEFAULT,
+    ghidra_version="11.0",
+    tool_version="0.1.0",
+)
+```
 
 ## Installation
 
 ```bash
-# Basic install
-pipx install git+https://github.com/YOUR_USER/pyghidra-lite
+# From source
+cd pyghidra-lite
+pip install -e .
 
-# With iOS support (lief)
-pipx install "git+https://github.com/YOUR_USER/pyghidra-lite[ios]"
-
-# Full install (lief + capstone + unicorn)
-pipx install "git+https://github.com/YOUR_USER/pyghidra-lite[full]"
+# Run server
+pyghidra-lite --profile default /path/to/binary
 ```
 
-## Usage
-
-### As MCP Server
+## MCP Configuration
 
 Add to `~/.claude/.mcp.json`:
+
 ```json
 {
   "mcpServers": {
     "pyghidra-lite": {
       "command": "pyghidra-lite",
-      "args": ["--transport", "stdio"]
+      "args": ["--transport", "stdio", "--profile", "default"]
     }
   }
 }
 ```
 
-### CLI
+## Credits
 
-```bash
-pyghidra-lite --help
-pyghidra-lite /path/to/binary
-```
-
-## Context Optimization
-
-This fork reduces token usage by ~40% compared to pyghidra-mcp:
-
-| Optimization | Tokens Saved |
-|--------------|--------------|
-| Trimmed tool descriptions | 100-150 |
-| Removed wrapper classes | 30-40 |
-| Simplified field schemas | 50-80 |
-| **Total** | **~200-300** |
-
-## Tool Reference
-
-### Core Tools
-| Tool | Description |
-|------|-------------|
-| `decompile` | Decompile function to pseudo-C |
-| `list_binaries` | List project binaries |
-| `get_metadata` | Get binary metadata |
-| `search_symbols` | Search symbols by name |
-| `search_code` | Semantic code search |
-| `list_exports` | List exports |
-| `list_imports` | List imports |
-| `get_xrefs` | Get cross-references |
-| `search_strings` | Search strings |
-| `read_bytes` | Read raw memory |
-
-### iOS Tools
-| Tool | Description |
-|------|-------------|
-| `macho_segments` | List Mach-O segments |
-| `macho_sections` | List Mach-O sections |
-| `objc_classes` | List Objective-C classes |
-| `objc_methods` | List class methods |
-| `objc_selectors` | Search selectors |
-| `swift_types` | List Swift types |
-| `ios_entitlements` | Extract entitlements |
-| `ios_info_plist` | Parse Info.plist |
-
-### Linux Tools
-| Tool | Description |
-|------|-------------|
-| `elf_sections` | List ELF sections |
-| `elf_dependencies` | List shared libs |
-| `appimage_info` | AppImage metadata |
-
-### Analysis Tools
-| Tool | Description |
-|------|-------------|
-| `analyze_entropy` | Find encrypted regions |
-| `find_vuln_patterns` | Detect vulnerabilities |
-| `string_xrefs` | Strings with references |
-| `list_functions` | List all functions |
-| `compare_functions` | Diff two functions |
-
-## License
-
-MIT
+Architecture insights from ChatGPT's scaffold document. Context optimization learnings from pyghidra-mcp.
