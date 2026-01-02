@@ -16,6 +16,7 @@ from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
 
 from pyghidra_lite import __version__
+from pyghidra_lite.backend import GhidraBackend, compute_unit_id
 from pyghidra_lite.models import (
     AnalysisProfile,
     AnalysisStatus,
@@ -33,21 +34,21 @@ from pyghidra_lite.models import (
     StringXref,
     SymbolInfo,
 )
+from pyghidra_lite.tools import GhidraTools
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-_context = None
+# Global backend instance
+_backend: GhidraBackend | None = None
 
 
-def compute_unit_id(data: bytes) -> str:
-    """Content-addressed ID for a binary."""
-    return hashlib.sha256(data).hexdigest()[:16]
-
-
-def compute_stable_id(unit_id: str, address: str) -> str:
-    """Stable function ID that survives renames."""
-    return hashlib.sha256(f"{unit_id}:{address}".encode()).hexdigest()[:16]
+def get_backend() -> GhidraBackend:
+    """Get the global backend instance."""
+    global _backend
+    if _backend is None:
+        raise RuntimeError("Backend not initialized")
+    return _backend
 
 
 def detect_container_type(path: Path) -> str | None:
@@ -142,23 +143,29 @@ def import_binary(
 
 def _import_single_binary(path: Path, profile: AnalysisProfile) -> BinaryUnit:
     """Import a single binary file."""
+    backend = get_backend()
+
     with open(path, "rb") as f:
         data = f.read()
 
     unit_id = compute_unit_id(data)
     kind = detect_binary_kind(path, data[:16])
 
-    # TODO: Actually import into Ghidra project
     logger.info(f"Importing {path.name} ({kind}) with profile={profile.value}")
 
-    return BinaryUnit(
-        unit_id=unit_id,
-        name=path.name,
-        path=str(path),
-        kind=kind,
-        analyzed=False,
-        profile=profile,
-    )
+    try:
+        handle = backend.import_binary(path, profile, analyze=True)
+        return BinaryUnit(
+            unit_id=handle.unit_id,
+            name=handle.name,
+            path=str(path),
+            kind=kind,
+            analyzed=handle.analyzed,
+            profile=profile,
+        )
+    except Exception as e:
+        logger.error(f"Import failed: {e}")
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Import failed: {e}"))
 
 
 def _extract_container(path: Path, container_type: str, profile: AnalysisProfile) -> ContainerInfo:
@@ -186,6 +193,7 @@ def _extract_zip_container(
     path: Path, asset_id: str, container_type: str, profile: AnalysisProfile
 ) -> list[BinaryUnit]:
     """Extract binaries from APK/IPA/ZIP."""
+    backend = get_backend()
     units = []
     interesting_patterns = {
         "apk": ["lib/", "classes", ".dex", ".so"],
@@ -194,33 +202,41 @@ def _extract_zip_container(
     }
     patterns = interesting_patterns.get(container_type, [])
 
-    with zipfile.ZipFile(path, "r") as zf:
-        for name in zf.namelist():
-            if any(p in name for p in patterns) or name.endswith((".so", ".dex", ".dylib")):
-                try:
-                    data = zf.read(name)
-                    if len(data) < 16:
-                        continue
-                    kind = detect_binary_kind(Path(name), data[:16])
-                    if kind in ("elf", "macho", "pe", "dex"):
-                        units.append(BinaryUnit(
-                            unit_id=compute_unit_id(data),
-                            name=Path(name).name,
-                            path=name,
-                            parent_id=asset_id,
-                            kind=kind,
-                            analyzed=False,
-                            profile=profile,
-                        ))
-                except Exception as e:
-                    logger.warning(f"Failed to extract {name}: {e}")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        with zipfile.ZipFile(path, "r") as zf:
+            for name in zf.namelist():
+                if any(p in name for p in patterns) or name.endswith((".so", ".dex", ".dylib")):
+                    try:
+                        data = zf.read(name)
+                        if len(data) < 16:
+                            continue
+                        kind = detect_binary_kind(Path(name), data[:16])
+                        if kind in ("elf", "macho", "pe", "dex"):
+                            # Extract to temp and import
+                            extracted = tmppath / Path(name).name
+                            extracted.write_bytes(data)
+                            try:
+                                handle = backend.import_binary(extracted, profile, analyze=True)
+                                units.append(BinaryUnit(
+                                    unit_id=handle.unit_id,
+                                    name=handle.name,
+                                    path=name,
+                                    parent_id=asset_id,
+                                    kind=kind,
+                                    analyzed=handle.analyzed,
+                                    profile=profile,
+                                ))
+                            except Exception as e:
+                                logger.warning(f"Failed to import {name}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Failed to extract {name}: {e}")
 
     return units
 
 
 def _extract_appimage(path: Path, asset_id: str, profile: AnalysisProfile) -> list[BinaryUnit]:
     """Extract binaries from AppImage (squashfs)."""
-    # TODO: Use squashfs-tools or appimage-extract
     logger.warning("AppImage extraction not yet implemented")
     return []
 
@@ -232,8 +248,19 @@ def _extract_appimage(path: Path, asset_id: str, profile: AnalysisProfile) -> li
 @mcp.tool()
 def list_binaries(ctx: Context) -> list[BinaryUnit]:
     """List all binaries in the project with analysis status."""
-    # TODO: Query Ghidra project
-    return []
+    backend = get_backend()
+    results = []
+    for name in backend.list_programs():
+        handle = backend.get_program(name)
+        results.append(BinaryUnit(
+            unit_id=handle.unit_id,
+            name=handle.name,
+            path=str(handle.file_path) if handle.file_path else None,
+            kind=handle.metadata.get("Executable Format", "unknown"),
+            analyzed=handle.analyzed,
+            profile=handle.profile,
+        ))
+    return results
 
 
 @mcp.tool()
@@ -243,8 +270,30 @@ def get_info(binary: str, ctx: Context) -> BinaryMetadata:
     Args:
         binary: Binary name or unit_id.
     """
-    # TODO: Query Ghidra project
-    raise McpError(ErrorData(code=INTERNAL_ERROR, message="Not implemented"))
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    program = handle.program
+    fm = program.getFunctionManager()
+    st = program.getSymbolTable()
+
+    return BinaryMetadata(
+        unit_id=handle.unit_id,
+        name=handle.name,
+        arch=handle.metadata.get("Processor"),
+        bits=int(handle.metadata.get("Address Size", "0").replace(" ", "").rstrip("bit") or 0) or None,
+        endian=handle.metadata.get("Endian"),
+        format=handle.metadata.get("Executable Format"),
+        num_functions=fm.getFunctionCount(),
+        num_symbols=st.getNumSymbols(),
+        num_strings=None,  # Expensive to compute
+        analyzed=handle.analyzed,
+        profile=handle.profile,
+        provenance=handle.get_provenance(),
+    )
 
 
 @mcp.tool()
@@ -254,8 +303,18 @@ def get_status(binary: str, ctx: Context) -> AnalysisStatus:
     Args:
         binary: Binary name or unit_id.
     """
-    # TODO: Query analysis state
-    raise McpError(ErrorData(code=INTERNAL_ERROR, message="Not implemented"))
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    return AnalysisStatus(
+        unit_id=handle.unit_id,
+        state="ready" if handle.analyzed else "analyzing",
+        profile=handle.profile,
+        progress=1.0 if handle.analyzed else 0.5,
+    )
 
 
 @mcp.tool()
@@ -266,7 +325,7 @@ def list_functions(
     limit: int = 50,
     sort_by: str = "name",
 ) -> list[FunctionInfo]:
-    """List functions with metadata annotations for prioritization.
+    """List functions with metadata for prioritization.
 
     Args:
         binary: Binary name or unit_id.
@@ -274,8 +333,14 @@ def list_functions(
         limit: Max results.
         sort_by: Sort by "name", "refs_in" (importance), or "refs_out" (complexity).
     """
-    # TODO: Query Ghidra, include refs_in/refs_out/has_strings/is_library
-    return []
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    return tools.list_functions(pattern=pattern, limit=limit, sort_by=sort_by)
 
 
 @mcp.tool()
@@ -289,8 +354,14 @@ def list_imports(
         pattern: Filter by name/library substring.
         limit: Max results.
     """
-    # TODO: Query Ghidra, add tags for known APIs
-    return []
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    return tools.list_imports(pattern=pattern, limit=limit)
 
 
 @mcp.tool()
@@ -304,8 +375,14 @@ def list_exports(
         pattern: Filter by name substring.
         limit: Max results.
     """
-    # TODO: Query Ghidra
-    return []
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    return tools.list_exports(pattern=pattern, limit=limit)
 
 
 # =============================================================================
@@ -313,15 +390,24 @@ def list_exports(
 # =============================================================================
 
 @mcp.tool()
-async def decompile(binary: str, function: str, ctx: Context) -> DecompiledFunction:
+def decompile(binary: str, function: str, ctx: Context) -> DecompiledFunction:
     """Decompile a function with metadata (callees, strings used).
 
     Args:
         binary: Binary name or unit_id.
         function: Function name or address (0x...).
     """
-    # TODO: Decompile and extract callees + strings
-    raise McpError(ErrorData(code=INTERNAL_ERROR, message="Not implemented"))
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    try:
+        return tools.decompile_function(function)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
 
 
 @mcp.tool()
@@ -333,8 +419,17 @@ def get_xrefs(binary: str, target: str, ctx: Context, limit: int = 50) -> list[C
         target: Function name or address.
         limit: Max results.
     """
-    # TODO: Query xrefs
-    return []
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    try:
+        return tools.get_xrefs(target, limit=limit)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
 
 
 @mcp.tool()
@@ -345,8 +440,17 @@ def get_callees(binary: str, function: str, ctx: Context) -> list[str]:
         binary: Binary name or unit_id.
         function: Function name or address.
     """
-    # TODO: Extract callees from function
-    return []
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    try:
+        return tools.get_callees(function)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
 
 
 # =============================================================================
@@ -357,15 +461,44 @@ def get_callees(binary: str, function: str, ctx: Context) -> list[str]:
 def search_functions(
     binary: str, query: str, ctx: Context, limit: int = 10
 ) -> list[CodeMatch]:
-    """Semantic search: find functions by description or code pattern.
+    """Search functions by name pattern (semantic search coming soon).
 
     Args:
         binary: Binary name or unit_id.
-        query: Natural language or code pattern.
+        query: Name pattern to search.
         limit: Max results.
     """
-    # TODO: Vector search over decompiled code
-    return []
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    # For now, just do pattern matching
+    functions = tools.list_functions(pattern=query, limit=limit)
+    results = []
+    for f in functions:
+        try:
+            decomp = tools.decompile_function(f.name)
+            results.append(CodeMatch(
+                function=f.name,
+                address=f.address,
+                stable_id=f.stable_id,
+                code=decomp.code[:500] + "..." if len(decomp.code) > 500 else decomp.code,
+                score=1.0,
+                match_reason=f"Name matches '{query}'",
+            ))
+        except Exception:
+            results.append(CodeMatch(
+                function=f.name,
+                address=f.address,
+                stable_id=f.stable_id,
+                code="// Decompilation failed",
+                score=0.5,
+                match_reason=f"Name matches '{query}'",
+            ))
+    return results
 
 
 @mcp.tool()
@@ -379,8 +512,14 @@ def search_strings(
         query: String pattern.
         limit: Max results.
     """
-    # TODO: Search strings, include xrefs and looks_like hints
-    return []
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    return tools.search_strings(query, limit=limit)
 
 
 @mcp.tool()
@@ -394,8 +533,14 @@ def search_symbols(
         query: Name substring (case-insensitive).
         limit: Max results.
     """
-    # TODO: Query symbol table
-    return []
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    return tools.search_symbols(query, limit=limit)
 
 
 # =============================================================================
@@ -413,8 +558,17 @@ def read_bytes(
         address: Hex address (0x...).
         size: Bytes to read (max 4096).
     """
-    # TODO: Read from Ghidra memory
-    raise McpError(ErrorData(code=INTERNAL_ERROR, message="Not implemented"))
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    try:
+        return tools.read_bytes(address, size)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
 
 
 @mcp.tool()
@@ -425,8 +579,17 @@ def read_string(binary: str, address: str, ctx: Context) -> str:
         binary: Binary name or unit_id.
         address: Hex address (0x...).
     """
-    # TODO: Read string from Ghidra
-    raise McpError(ErrorData(code=INTERNAL_ERROR, message="Not implemented"))
+    backend = get_backend()
+    try:
+        handle = backend.get_program(binary)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    tools = GhidraTools(handle)
+    try:
+        return tools.read_string(address)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
 
 
 # =============================================================================
@@ -440,8 +603,11 @@ def delete_binary(binary: str, ctx: Context) -> str:
     Args:
         binary: Binary name or unit_id.
     """
-    # TODO: Remove from Ghidra project
-    return f"Deleted {binary}"
+    backend = get_backend()
+    if backend.delete_program(binary):
+        return f"Deleted {binary}"
+    else:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Failed to delete {binary}"))
 
 
 @mcp.tool()
@@ -454,8 +620,26 @@ def reanalyze(
         binary: Binary name or unit_id.
         profile: New profile - "fast", "default", or "deep".
     """
-    # TODO: Re-run Ghidra analysis
-    raise McpError(ErrorData(code=INTERNAL_ERROR, message="Not implemented"))
+    backend = get_backend()
+    try:
+        profile_enum = AnalysisProfile(profile)
+    except ValueError:
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message=f"Invalid profile '{profile}'. Use: fast, default, deep"
+        ))
+
+    try:
+        handle = backend.get_program(binary)
+        backend.analyze_program(handle.name, profile_enum)
+        return AnalysisStatus(
+            unit_id=handle.unit_id,
+            state="ready",
+            profile=profile_enum,
+            progress=1.0,
+        )
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
 
 
 # =============================================================================
@@ -469,17 +653,54 @@ def reanalyze(
 @click.option("--host", type=str, default="127.0.0.1")
 @click.option("--profile", type=click.Choice(["fast", "default", "deep"]), default="default",
               help="Default analysis profile")
+@click.option("--project-name", type=str, default="pyghidra_lite",
+              help="Ghidra project name")
+@click.option("--project-dir", type=click.Path(path_type=Path), default=None,
+              help="Project directory (default: ~/.local/share/pyghidra-lite/projects)")
 @click.argument("binaries", nargs=-1, type=click.Path(exists=True, path_type=Path))
-def main(transport: str, port: int, host: str, profile: str, binaries: tuple[Path, ...]):
-    """pyghidra-lite: Lightweight RE MCP server."""
+def main(
+    transport: str,
+    port: int,
+    host: str,
+    profile: str,
+    project_name: str,
+    project_dir: Path | None,
+    binaries: tuple[Path, ...],
+):
+    """pyghidra-lite: Lightweight RE MCP server.
+
+    Import binaries at startup or use import_binary tool later.
+    """
+    global _backend
+
     logger.info(f"pyghidra-lite v{__version__} (profile={profile})")
 
-    # TODO: Initialize Ghidra context, import binaries with profile
+    # Initialize backend
+    profile_enum = AnalysisProfile(profile)
+    _backend = GhidraBackend(
+        project_name=project_name,
+        project_dir=project_dir,
+        default_profile=profile_enum,
+    )
+    _backend.start()
 
-    if transport == "stdio":
-        mcp.run(transport="stdio")
-    else:
-        mcp.run(transport="sse", host=host, port=port)
+    # Import any binaries passed on command line
+    for binary_path in binaries:
+        try:
+            _backend.import_binary(binary_path, profile_enum, analyze=True)
+        except Exception as e:
+            logger.error(f"Failed to import {binary_path}: {e}")
+
+    logger.info(f"Ready. {len(_backend.programs)} programs loaded.")
+
+    try:
+        if transport == "stdio":
+            mcp.run(transport="stdio")
+        else:
+            mcp.run(transport="sse", host=host, port=port)
+    finally:
+        if _backend:
+            _backend.close()
 
 
 if __name__ == "__main__":

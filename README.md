@@ -9,17 +9,74 @@ Lightweight MCP server for Ghidra-based reverse engineering. Focused toolset wit
 3. **Stable IDs**: Content-addressed `unit_id` and `stable_id` survive renames
 4. **Analysis profiles**: `fast`/`default`/`deep` tradeoff without changing tools
 5. **Container support**: APK/IPA/AppImage auto-extraction
+6. **Central project**: All binaries in `~/.local/share/pyghidra-lite/projects` (not per-cwd)
+
+## Requirements
+
+- Ghidra 11.x installed
+- `GHIDRA_INSTALL_DIR` environment variable set to Ghidra installation path
+- Python 3.11+
+
+## Installation
+
+```bash
+cd pyghidra-lite
+uv pip install -e .
+```
+
+## Usage
+
+### As MCP Server (Claude Code)
+
+Add to `~/.claude/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "pyghidra-lite": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/pyghidra-lite", "pyghidra-lite", "--transport", "stdio"]
+    }
+  }
+}
+```
+
+Or with a binary pre-loaded:
+
+```json
+{
+  "mcpServers": {
+    "pyghidra-lite": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/pyghidra-lite", "pyghidra-lite", "--profile", "fast", "/path/to/binary"]
+    }
+  }
+}
+```
+
+### Command Line
+
+```bash
+# Start server (binaries imported via MCP tools)
+uv run pyghidra-lite
+
+# Pre-load binaries with fast profile
+uv run pyghidra-lite --profile fast /path/to/app.apk
+
+# Use custom project location
+uv run pyghidra-lite --project-dir /tmp/ghidra-projects --project-name myproject
+```
 
 ## Tools
 
-### Import
+### Import (3)
 | Tool | Description |
 |------|-------------|
 | `import_binary` | Import binary or container with profile selection |
 | `delete_binary` | Remove from project |
 | `reanalyze` | Re-run with different profile |
 
-### Discovery
+### Discovery (6)
 | Tool | Description |
 |------|-------------|
 | `list_binaries` | List all binaries with status |
@@ -29,21 +86,21 @@ Lightweight MCP server for Ghidra-based reverse engineering. Focused toolset wit
 | `list_imports` | Imports with capability tags |
 | `list_exports` | Exported symbols |
 
-### Analysis
+### Analysis (3)
 | Tool | Description |
 |------|-------------|
 | `decompile` | Pseudo-C with callees and strings |
 | `get_xrefs` | Who calls/uses this |
 | `get_callees` | What this function calls |
 
-### Search
+### Search (3)
 | Tool | Description |
 |------|-------------|
-| `search_functions` | Semantic code search |
+| `search_functions` | Function name search |
 | `search_strings` | Strings with xrefs |
 | `search_symbols` | Symbol name search |
 
-### Data
+### Data (2)
 | Tool | Description |
 |------|-------------|
 | `read_bytes` | Raw memory |
@@ -53,7 +110,7 @@ Lightweight MCP server for Ghidra-based reverse engineering. Focused toolset wit
 
 | Profile | Use Case |
 |---------|----------|
-| `fast` | Quick triage, minimal decompiler |
+| `fast` | Quick triage, minimal decompiler analysis |
 | `default` | Balanced analysis |
 | `deep` | Full analysis for obfuscated code |
 
@@ -74,9 +131,6 @@ import_binary("/path/to/app.apk")
 
 # IPA extracts main binary + frameworks
 import_binary("/path/to/App.ipa")
-
-# AppImage extracts embedded ELFs
-import_binary("/path/to/App.AppImage")
 ```
 
 ## Function Metadata
@@ -99,6 +153,20 @@ FunctionInfo(
 
 Sort by `refs_in` to find important functions, `refs_out` to find orchestrators.
 
+## Import Capability Tags
+
+`list_imports` tags imports with capabilities:
+
+```python
+ImportInfo(
+    name="SSL_read",
+    library="libssl.so",
+    tags=["crypto", "network"],  # Auto-detected
+)
+```
+
+Tags: `crypto`, `network`, `file`, `process`, `memory`, `jni`
+
 ## Provenance
 
 All results include provenance for reproducibility:
@@ -107,37 +175,24 @@ All results include provenance for reproducibility:
 Provenance(
     unit_id="abc123...",
     profile=AnalysisProfile.DEFAULT,
-    ghidra_version="11.0",
+    ghidra_version="11.4.3",
     tool_version="0.1.0",
 )
 ```
 
-## Installation
+## Project Structure
 
-```bash
-# From source
-cd pyghidra-lite
-pip install -e .
+Unlike pyghidra-mcp which creates projects per working directory, pyghidra-lite uses a central location:
 
-# Run server
-pyghidra-lite --profile default /path/to/binary
+```
+~/.local/share/pyghidra-lite/
+└── projects/
+    └── pyghidra_lite/
+        ├── pyghidra_lite.gpr
+        └── pyghidra_lite.rep/
 ```
 
-## MCP Configuration
-
-Add to `~/.claude/.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "pyghidra-lite": {
-      "command": "pyghidra-lite",
-      "args": ["--transport", "stdio", "--profile", "default"]
-    }
-  }
-}
-```
-
-## Credits
-
-Architecture insights from ChatGPT's scaffold document. Context optimization learnings from pyghidra-mcp.
+This means:
+- Binaries are shared across sessions
+- No more scattered `pyghidra_mcp_projects/` directories
+- Persistent analysis results
