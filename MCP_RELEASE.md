@@ -79,19 +79,20 @@ Add to `~/.config/claude/config.json`:
 
 #### OpenAI Desktop / ChatGPT
 
-Add to your MCP configuration:
+Add to your MCP configuration file:
 
 ```json
 {
   "servers": {
     "pyghidra-lite": {
       "command": "pyghidra-lite",
-      "args": ["--allow-any-path"],
-      "transport": "stdio"
+      "args": ["--allow-any-path"]
     }
   }
 }
 ```
+
+Note: `stdio` transport is inferred automatically from the `command` field.
 
 ### Security Configuration
 
