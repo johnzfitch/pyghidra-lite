@@ -1,6 +1,19 @@
 # pyghidra-lite
 
+[![PyPI](https://img.shields.io/pypi/v/pyghidra-lite)](https://pypi.org/project/pyghidra-lite/)
+[![Python Version](https://img.shields.io/pypi/pyversions/pyghidra-lite)](https://pypi.org/project/pyghidra-lite/)
+[![License](https://img.shields.io/github/license/zackees/pyghidra-lite)](https://github.com/zackees/pyghidra-lite/blob/master/LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io/specification/2025-11-25)
+
 Lightweight MCP server for Ghidra-based reverse engineering. Focused toolset with smart backend features.
+
+## Quick Links
+
+- 📦 [PyPI Package](https://pypi.org/project/pyghidra-lite/)
+- 📚 [MCP Release Guide](MCP_RELEASE.md)
+- 🐛 [Issue Tracker](https://github.com/zackees/pyghidra-lite/issues)
+- 🤝 [Contributing](CONTRIBUTING.md)
+- 🔒 [Security Policy](SECURITY.md)
 
 ## Design Philosophy
 

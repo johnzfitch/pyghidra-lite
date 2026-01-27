@@ -5,7 +5,12 @@ description = "Lightweight MCP server for Ghidra-based reverse engineering with 
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
-authors = [{ name = "zack" }]
+authors = [
+    { name = "Zack Freedman", email = "zackees@gmail.com" }
+]
+maintainers = [
+    { name = "Zack Freedman", email = "zackees@gmail.com" }
+]
 keywords = ["ghidra", "reverse-engineering", "mcp", "ios", "macho", "elf", "game-hacking"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -32,8 +37,11 @@ emulation = ["capstone>=5.0.0", "unicorn>=2.0.0"]
 dev = ["pytest>=7.0.0", "ruff>=0.1.0", "mypy>=1.0.0"]
 
 [project.urls]
+Homepage = "https://github.com/zackees/pyghidra-lite"
 Repository = "https://github.com/zackees/pyghidra-lite"
 Issues = "https://github.com/zackees/pyghidra-lite/issues"
+Changelog = "https://github.com/zackees/pyghidra-lite/blob/master/CHANGELOG.md"
+Documentation = "https://github.com/zackees/pyghidra-lite/blob/master/MCP_RELEASE.md"
 
 [project.scripts]
 pyghidra-lite = "pyghidra_lite.server:main"
