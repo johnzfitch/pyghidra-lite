@@ -465,15 +465,19 @@ def import_binary(
 
 
 @mcp.tool()
-def list_binaries(ctx: Context) -> list[dict]:
-    """List all loaded binaries with their capabilities."""
+def list_binaries(ctx: Context, list_tools: bool = False) -> list[dict]:
+    """List all loaded binaries with their capabilities.
+
+    Args:
+        list_tools: Include available_tools list per binary (default False, saves tokens).
+    """
     def op():
         backend = get_backend()
         results = []
         for name in backend.list_programs():
             handle = backend.get_program(name)
             caps = _ensure_capabilities(handle)
-            results.append({
+            result = {
                 "name": handle.name,
                 "unit_id": handle.unit_id,
                 "analyzed": handle.analyzed,
@@ -486,8 +490,10 @@ def list_binaries(ctx: Context) -> list[dict]:
                     "hermes": caps.has_hermes,
                     "swift_module": caps.swift_module,
                 },
-                "available_tools": _available_tools(caps),
-            })
+            }
+            if list_tools:
+                result["available_tools"] = _available_tools(caps)
+            results.append(result)
         return results
 
     with _backend_lock:
@@ -1341,12 +1347,13 @@ def delete_binary(binary: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-def reanalyze(binary: str, ctx: Context, profile: str = "deep") -> dict:
+def reanalyze(binary: str, ctx: Context, profile: str = "deep", list_tools: bool = False) -> dict:
     """Re-run analysis with different profile. Re-detects capabilities.
 
     Args:
         binary: Binary name.
         profile: New profile - "fast", "default", or "deep".
+        list_tools: Include available_tools list (default False, saves tokens).
     """
     try:
         profile_enum = AnalysisProfile(profile)
@@ -1365,7 +1372,7 @@ def reanalyze(binary: str, ctx: Context, profile: str = "deep") -> dict:
         caps = detect_capabilities(handle)
         _capabilities[handle.name] = caps
 
-        return {
+        result = {
             "name": handle.name,
             "analyzed": True,
             "profile": profile,
@@ -1378,8 +1385,10 @@ def reanalyze(binary: str, ctx: Context, profile: str = "deep") -> dict:
                 "hermes": caps.has_hermes,
                 "swift_module": caps.swift_module,
             },
-            "available_tools": _available_tools(caps),
         }
+        if list_tools:
+            result["available_tools"] = _available_tools(caps)
+        return result
 
     with _backend_lock:
         return _guarded_tool_call("reanalyze", op)

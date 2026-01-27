@@ -56,3 +56,7 @@ Thumbs.db
 # Local data
 *.lock
 !uv.lock
+
+# Temporary handoff/optimization docs
+HANDOFF.md
+TOKEN_OPTIMIZATIONS.md

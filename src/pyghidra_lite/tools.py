@@ -509,8 +509,10 @@ class GhidraTools:
                 elif any(kw in val.lower() for kw in ["key", "token", "secret", "password"]):
                     looks_like = "key"
 
+                # Truncate very long strings to save tokens
+                truncated_val = val[:500] if len(val) > 500 else val
                 results.append(StringXref(
-                    value=val,
+                    value=truncated_val,
                     address=str(data.getAddress()),
                     refs=refs,
                     looks_like=looks_like,
