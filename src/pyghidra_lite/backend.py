@@ -317,6 +317,9 @@ class GhidraBackend:
         from ghidra.app.script import GhidraScriptUtil
         from ghidra.program.util import GhidraProgramUtilities
 
+        # Start transaction for program modifications
+        tx_id = handle.program.startTransaction("Analysis")
+        tx_success = False
         try:
             GhidraScriptUtil.acquireBundleHostReference()
             handle.flat_api.analyzeAll(handle.program)
@@ -325,10 +328,14 @@ class GhidraBackend:
                 GhidraProgramUtilities.setAnalyzedFlag(handle.program, True)
             elif hasattr(GhidraProgramUtilities, "markProgramAnalyzed"):
                 GhidraProgramUtilities.markProgramAnalyzed(handle.program)
+
+            tx_success = True
         finally:
+            # End transaction (commit if successful, rollback if failed)
+            handle.program.endTransaction(tx_id, tx_success)
             GhidraScriptUtil.releaseBundleHostReference()
             # Save to the binary's project
-            if handle.unit_id in self._projects:
+            if tx_success and handle.unit_id in self._projects:
                 self._projects[handle.unit_id].save(handle.program)
 
         handle.analyzed = True
