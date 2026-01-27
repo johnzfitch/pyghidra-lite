@@ -241,7 +241,7 @@ MIT License - See LICENSE file
 
 ## Authors
 
-- Zack Freedman
+- Zack Fitch
 
 ## Contributing
 
