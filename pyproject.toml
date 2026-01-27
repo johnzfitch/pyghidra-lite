@@ -27,9 +27,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ios = ["lief>=0.14.0"]
-full = ["lief>=0.14.0", "capstone>=5.0.0", "unicorn>=2.0.0"]
-dev = ["pytest>=7.0.0", "ruff>=0.1.0"]
+# Extended analysis tools (not required for core functionality)
+emulation = ["capstone>=5.0.0", "unicorn>=2.0.0"]
+dev = ["pytest>=7.0.0", "ruff>=0.1.0", "mypy>=1.0.0"]
+
+[project.urls]
+Repository = "https://github.com/zackees/pyghidra-lite"
+Issues = "https://github.com/zackees/pyghidra-lite/issues"
 
 [project.scripts]
 pyghidra-lite = "pyghidra_lite.server:main"
@@ -46,4 +50,20 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "W",    # pycodestyle warnings
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # simplify
+]
+ignore = [
+    "E501",   # line length (handled by formatter)
+    "SIM108", # ternary operators (readability preference)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pyghidra_lite"]

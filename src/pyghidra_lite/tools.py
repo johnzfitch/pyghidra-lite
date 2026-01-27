@@ -1,13 +1,12 @@
 """Ghidra tool implementations for pyghidra-lite."""
 
 import logging
-import re
+import time
 from typing import TYPE_CHECKING
 
 from pyghidra_lite.backend import ProgramHandle, compute_stable_id
 from pyghidra_lite.models import (
     BytesResult,
-    CodeMatch,
     CrossRef,
     DecompiledFunction,
     ExportInfo,
@@ -20,7 +19,12 @@ from pyghidra_lite.models import (
 if TYPE_CHECKING:
     from ghidra.program.model.listing import Function
 
+    from pyghidra_lite.backend import GhidraBackend
+
 logger = logging.getLogger(__name__)
+
+# Cache TTL in seconds (functions don't change during analysis session)
+CACHE_TTL = 300
 
 # Capability tags for common APIs
 CAPABILITY_TAGS = {
@@ -54,12 +58,70 @@ def get_capability_tags(name: str) -> list[str]:
 
 
 class GhidraTools:
-    """Tool implementations using Ghidra APIs."""
+    """Tool implementations using Ghidra APIs.
+
+    Includes caching for expensive operations to improve performance
+    on repeated queries within the same session.
+    """
 
     def __init__(self, handle: ProgramHandle):
+        if not isinstance(handle, ProgramHandle):
+            raise TypeError(
+                f"GhidraTools requires a ProgramHandle, got {type(handle).__name__}. "
+                f"Use GhidraTools.from_backend(backend, binary_name) instead."
+            )
         self.handle = handle
         self.program = handle.program
         self.decompiler = handle.decompiler
+
+        # Caches with timestamps
+        self._functions_cache: list[FunctionInfo] | None = None
+        self._functions_cache_time: float = 0
+        self._function_name_index: dict[str, Function] | None = None
+        self._symbols_cache: dict[str, list[SymbolInfo]] | None = None
+
+    def invalidate_cache(self) -> None:
+        """Invalidate all caches (call after re-analysis)."""
+        self._functions_cache = None
+        self._functions_cache_time = 0
+        self._function_name_index = None
+        self._symbols_cache = None
+
+    def _is_cache_valid(self) -> bool:
+        """Check if cache is still valid."""
+        return (self._functions_cache is not None and
+                time.time() - self._functions_cache_time < CACHE_TTL)
+
+    def _build_function_index(self) -> dict[str, "Function"]:
+        """Build name-to-function index for fast lookup."""
+        if self._function_name_index is not None:
+            return self._function_name_index
+
+        fm = self.program.getFunctionManager()
+        index: dict[str, Function] = {}
+
+        for func in fm.getFunctions(True):
+            name = func.getName()
+            index[name] = func
+            # Also index lowercase for case-insensitive lookup
+            index[name.lower()] = func
+
+        self._function_name_index = index
+        return index
+
+    @classmethod
+    def from_backend(cls, backend: "GhidraBackend", binary: str) -> "GhidraTools":
+        """Create GhidraTools from a backend and binary name.
+
+        Args:
+            backend: GhidraBackend instance
+            binary: Binary name or unit_id
+        """
+        from pyghidra_lite.backend import GhidraBackend
+        if not isinstance(backend, GhidraBackend):
+            raise TypeError(f"Expected GhidraBackend, got {type(backend).__name__}")
+        handle = backend.get_program(binary)
+        return cls(handle)
 
     def list_functions(
         self,
@@ -68,53 +130,38 @@ class GhidraTools:
         sort_by: str = "name",
         include_thunks: bool = False,
         include_external: bool = False,
+        include_metadata: bool = True,
     ) -> list[FunctionInfo]:
-        """List functions with metadata annotations."""
-        fm = self.program.getFunctionManager()
-        rm = self.program.getReferenceManager()
+        """List functions with optional metadata annotations.
 
-        results = []
-        for func in fm.getFunctions(True):
-            func: Function
-            if not include_external and func.isExternal():
-                continue
-            if not include_thunks and func.isThunk():
-                continue
-            if pattern and pattern.lower() not in func.getName().lower():
-                continue
+        Args:
+            pattern: Filter by name substring (case-insensitive).
+            limit: Max results (default 50).
+            sort_by: Sort order - "name", "refs_in", "refs_out", or "size".
+            include_thunks: Include thunk/trampoline functions.
+            include_external: Include external functions.
+            include_metadata: Include refs_in/refs_out counts (slower if True).
 
-            # Compute metadata
-            entry = func.getEntryPoint()
-            refs_in = len(list(rm.getReferencesTo(entry)))
-            refs_out = len(list(func.getCalledFunctions(None)))
+        Returns:
+            List of FunctionInfo objects.
+        """
+        # Use cached results if available and no filtering
+        if (self._is_cache_valid() and not pattern and
+            not include_thunks and not include_external and include_metadata):
+            results = self._functions_cache[:]
+        else:
+            results = self._build_function_list(
+                include_thunks, include_external, include_metadata
+            )
+            # Cache unfiltered results
+            if not pattern and not include_thunks and not include_external:
+                self._functions_cache = results[:]
+                self._functions_cache_time = time.time()
 
-            # Check for strings
-            has_strings = False
-            try:
-                body = func.getBody()
-                for addr in body.getAddresses(True):
-                    refs = rm.getReferencesFrom(addr)
-                    for ref in refs:
-                        data = self.program.getListing().getDataAt(ref.getToAddress())
-                        if data and data.hasStringValue():
-                            has_strings = True
-                            break
-                    if has_strings:
-                        break
-            except Exception:
-                pass
-
-            results.append(FunctionInfo(
-                name=func.getName(),
-                address=str(entry),
-                stable_id=compute_stable_id(self.handle.unit_id, str(entry)),
-                size=int(func.getBody().getNumAddresses()),
-                refs_in=refs_in,
-                refs_out=refs_out,
-                has_strings=has_strings,
-                is_library=func.getName().startswith("FID_"),  # FIDB convention
-                is_thunk=func.isThunk(),
-            ))
+        # Filter by pattern
+        if pattern:
+            pattern_lower = pattern.lower()
+            results = [f for f in results if pattern_lower in f.name.lower()]
 
         # Sort
         if sort_by == "refs_in":
@@ -128,8 +175,75 @@ class GhidraTools:
 
         return results[:limit]
 
-    def decompile_function(self, name_or_addr: str, timeout: int = 30) -> DecompiledFunction:
-        """Decompile a function."""
+    def _build_function_list(
+        self,
+        include_thunks: bool,
+        include_external: bool,
+        include_metadata: bool,
+    ) -> list[FunctionInfo]:
+        """Build function list (internal, may be cached)."""
+        fm = self.program.getFunctionManager()
+        rm = self.program.getReferenceManager() if include_metadata else None
+
+        results = []
+        for func in fm.getFunctions(True):
+            func: Function
+            if not include_external and func.isExternal():
+                continue
+            if not include_thunks and func.isThunk():
+                continue
+
+            entry = func.getEntryPoint()
+
+            # Only compute refs if metadata requested (expensive)
+            refs_in = None
+            refs_out = None
+            if include_metadata and rm:
+                try:
+                    refs_in = len(list(rm.getReferencesTo(entry)))
+                    refs_out = len(list(func.getCalledFunctions(None)))
+                except Exception as e:
+                    logger.debug("Failed to get refs for %s: %s", func.getName(), e)
+
+            # Note: has_strings is deferred to get_function_info for performance
+            # Checking every address in every function is O(n*m) - too expensive
+
+            results.append(FunctionInfo(
+                name=func.getName(),
+                address=str(entry),
+                stable_id=compute_stable_id(self.handle.unit_id, str(entry)),
+                size=int(func.getBody().getNumAddresses()),
+                refs_in=refs_in,
+                refs_out=refs_out,
+                has_strings=None,  # Deferred to get_function_info
+                is_library=func.getName().startswith("FID_"),
+                is_thunk=func.isThunk(),
+            ))
+
+        return results
+
+    def decompile_function(
+        self,
+        name_or_addr: str,
+        timeout: int = 30,
+        include_callees: bool = True,
+        include_strings: bool = True,
+        include_provenance: bool = False,
+        include_refs: bool = True,
+    ) -> DecompiledFunction:
+        """Decompile a function.
+
+        Args:
+            name_or_addr: Function name or hex address (0x...).
+            timeout: Decompilation timeout in seconds (default 30).
+            include_callees: Include list of called functions (default True).
+            include_strings: Include referenced strings (default True).
+            include_provenance: Include analysis provenance (default False, saves tokens).
+            include_refs: Include refs_in/refs_out counts (default True).
+
+        Returns:
+            DecompiledFunction with code and optional metadata.
+        """
         from ghidra.util.task import ConsoleTaskMonitor
 
         func = self._find_function(name_or_addr)
@@ -146,12 +260,28 @@ class GhidraTools:
             code = result.decompiledFunction.getC()
             signature = result.decompiledFunction.getSignature()
 
-        # Extract callees and strings
-        callees = [f.getName() for f in func.getCalledFunctions(None)]
-        strings_used = self._get_function_strings(func)
-
         entry = func.getEntryPoint()
-        rm = self.program.getReferenceManager()
+
+        # Only compute expensive fields if requested
+        callees = None
+        strings_used = None
+        refs_in = None
+        refs_out = None
+
+        if include_callees:
+            callees = [f.getName() for f in func.getCalledFunctions(None)]
+            if not callees:
+                callees = None
+
+        if include_strings:
+            strings_used = self._get_function_strings(func)
+            if not strings_used:
+                strings_used = None
+
+        if include_refs:
+            rm = self.program.getReferenceManager()
+            refs_in = len(list(rm.getReferencesTo(entry)))
+            refs_out = len(callees) if callees else len(list(func.getCalledFunctions(None)))
 
         return DecompiledFunction(
             name=func.getName(),
@@ -159,58 +289,87 @@ class GhidraTools:
             stable_id=compute_stable_id(self.handle.unit_id, str(entry)),
             signature=signature,
             code=code,
-            refs_in=len(list(rm.getReferencesTo(entry))),
-            refs_out=len(callees),
-            callees=callees if callees else None,
-            strings_used=strings_used if strings_used else None,
-            provenance=self.handle.get_provenance(),
+            refs_in=refs_in,
+            refs_out=refs_out,
+            callees=callees,
+            strings_used=strings_used,
+            provenance=self.handle.get_provenance() if include_provenance else None,
         )
 
     def _find_function(self, name_or_addr: str) -> "Function | None":
-        """Find a function by name or address."""
+        """Find a function by name or address.
+
+        Uses indexed lookup for O(1) name resolution instead of O(n) iteration.
+        Falls back to substring matching if exact match fails.
+        """
         fm = self.program.getFunctionManager()
 
-        # Try as address first
-        try:
-            addr = self.program.getAddressFactory().getAddress(name_or_addr.replace("0x", ""))
-            func = fm.getFunctionAt(addr)
-            if func:
-                return func
-        except Exception:
-            pass
+        # Try as address first (fast path)
+        if name_or_addr.startswith("0x") or name_or_addr.startswith("0X"):
+            try:
+                addr = self.program.getAddressFactory().getAddress(
+                    name_or_addr[2:] if name_or_addr.startswith(("0x", "0X")) else name_or_addr
+                )
+                func = fm.getFunctionAt(addr)
+                if func:
+                    return func
+            except Exception as e:
+                logger.debug("Address lookup failed for %s: %s", name_or_addr, e)
 
-        # Search by name
-        for func in fm.getFunctions(True):
-            if func.getName() == name_or_addr:
-                return func
+        # Build/use function index for O(1) lookup
+        index = self._build_function_index()
 
-        # Case-insensitive search
+        # Exact match (case-sensitive)
+        if name_or_addr in index:
+            return index[name_or_addr]
+
+        # Case-insensitive match
+        lower_name = name_or_addr.lower()
+        if lower_name in index:
+            return index[lower_name]
+
+        # Substring match as last resort (single pass)
         for func in fm.getFunctions(True):
-            if func.getName().lower() == name_or_addr.lower():
+            if name_or_addr.lower() in func.getName().lower():
                 return func
 
         return None
 
-    def _get_function_strings(self, func: "Function") -> list[str]:
-        """Get string literals referenced by a function."""
+    def _get_function_strings(self, func: "Function", max_strings: int = 20) -> list[str]:
+        """Get string literals referenced by a function.
+
+        Args:
+            func: The function to analyze.
+            max_strings: Maximum strings to return (default 20).
+
+        Returns:
+            List of unique string values found.
+        """
         strings = []
         rm = self.program.getReferenceManager()
+        listing = self.program.getListing()
+        seen = set()
+
         try:
             body = func.getBody()
             for addr in body.getAddresses(True):
                 refs = rm.getReferencesFrom(addr)
                 for ref in refs:
-                    data = self.program.getListing().getDataAt(ref.getToAddress())
-                    if data and data.hasStringValue():
-                        try:
+                    try:
+                        data = listing.getDataAt(ref.getToAddress())
+                        if data and data.hasStringValue():
                             val = str(data.getValue())
-                            if val and len(val) > 1:
+                            if val and len(val) > 1 and val not in seen:
+                                seen.add(val)
                                 strings.append(val)
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-        return list(set(strings))[:20]  # Limit to 20
+                                if len(strings) >= max_strings:
+                                    return strings
+                    except Exception as e:
+                        logger.debug("String extraction failed at %s: %s", addr, e)
+        except Exception as e:
+            logger.debug("String scan failed for %s: %s", func.getName(), e)
+
+        return strings
 
     def get_xrefs(self, target: str, limit: int = 50) -> list[CrossRef]:
         """Get cross-references to a target."""
@@ -367,7 +526,6 @@ class GhidraTools:
     def search_symbols(self, query: str, limit: int = 30) -> list[SymbolInfo]:
         """Search symbols by name."""
         st = self.program.getSymbolTable()
-        rm = self.program.getReferenceManager()
         results = []
         query_lower = query.lower()
 
@@ -390,8 +548,25 @@ class GhidraTools:
 
         return results
 
-    def read_bytes(self, address: str, size: int) -> BytesResult:
-        """Read raw bytes at an address."""
+    def read_bytes(
+        self,
+        address: str,
+        size: int,
+        include_provenance: bool = False,
+    ) -> BytesResult:
+        """Read raw bytes at an address.
+
+        Args:
+            address: Hex address (0x...) or symbol name.
+            size: Number of bytes to read (1-4096).
+            include_provenance: Include analysis provenance (default False).
+
+        Returns:
+            BytesResult with hex and ASCII representation.
+
+        Raises:
+            ValueError: If size is out of range or address is invalid.
+        """
         from jpype import JByte
 
         if size <= 0 or size > 4096:
@@ -421,8 +596,162 @@ class GhidraTools:
             size=len(data),
             hex=data.hex(),
             ascii=ascii_repr,
-            provenance=self.handle.get_provenance(),
+            provenance=self.handle.get_provenance() if include_provenance else None,
         )
+
+    def batch_decompile(
+        self,
+        functions: list[str],
+        timeout: int = 30,
+        include_callees: bool = False,
+        include_strings: bool = False,
+    ) -> list[DecompiledFunction]:
+        """Decompile multiple functions in one call.
+
+        More efficient than individual decompile calls due to reduced
+        MCP round-trips and shared decompiler context.
+
+        Args:
+            functions: List of function names or addresses.
+            timeout: Per-function timeout in seconds.
+            include_callees: Include callee lists (increases response size).
+            include_strings: Include string references (increases response size).
+
+        Returns:
+            List of DecompiledFunction results (failed functions have error in code).
+        """
+        results = []
+        for func_name in functions:
+            try:
+                result = self.decompile_function(
+                    func_name,
+                    timeout=timeout,
+                    include_callees=include_callees,
+                    include_strings=include_strings,
+                    include_provenance=False,
+                    include_refs=False,
+                )
+                results.append(result)
+            except Exception as e:
+                # Return error placeholder instead of failing entire batch
+                results.append(DecompiledFunction(
+                    name=func_name,
+                    address="",
+                    code=f"// Error: {e}",
+                ))
+        return results
+
+    def get_call_graph(
+        self,
+        function: str,
+        depth: int = 2,
+        direction: str = "both",
+    ) -> dict:
+        """Get call graph centered on a function.
+
+        Args:
+            function: Function name or address.
+            depth: How many levels to traverse (default 2).
+            direction: "callers", "callees", or "both".
+
+        Returns:
+            Dict with nodes (functions) and edges (calls).
+        """
+        func = self._find_function(function)
+        if not func:
+            raise ValueError(f"Function not found: {function}")
+
+        nodes = {}
+        edges = []
+        visited = set()
+
+        def add_node(f):
+            name = f.getName()
+            if name not in nodes:
+                nodes[name] = {
+                    "name": name,
+                    "address": str(f.getEntryPoint()),
+                    "is_external": f.isExternal(),
+                    "is_thunk": f.isThunk(),
+                }
+            return name
+
+        def traverse_callees(f, current_depth):
+            if current_depth > depth:
+                return
+            name = add_node(f)
+            if name in visited:
+                return
+            visited.add(name)
+
+            for callee in f.getCalledFunctions(None):
+                callee_name = add_node(callee)
+                edges.append({"from": name, "to": callee_name, "type": "calls"})
+                if current_depth < depth:
+                    traverse_callees(callee, current_depth + 1)
+
+        def traverse_callers(f, current_depth):
+            if current_depth > depth:
+                return
+            name = add_node(f)
+            if name in visited:
+                return
+            visited.add(name)
+
+            fm = self.program.getFunctionManager()
+            rm = self.program.getReferenceManager()
+            for ref in rm.getReferencesTo(f.getEntryPoint()):
+                caller = fm.getFunctionContaining(ref.getFromAddress())
+                if caller:
+                    caller_name = add_node(caller)
+                    edges.append({"from": caller_name, "to": name, "type": "calls"})
+                    if current_depth < depth:
+                        traverse_callers(caller, current_depth + 1)
+
+        # Start traversal
+        if direction in ("callees", "both"):
+            visited.clear()
+            traverse_callees(func, 0)
+
+        if direction in ("callers", "both"):
+            visited.clear()
+            traverse_callers(func, 0)
+
+        return {
+            "root": func.getName(),
+            "nodes": list(nodes.values()),
+            "edges": edges,
+        }
+
+    def get_memory_map(self) -> list[dict]:
+        """Get memory layout with sections and permissions.
+
+        Returns:
+            List of memory regions with name, address, size, and permissions.
+        """
+        mem = self.program.getMemory()
+        regions = []
+
+        for block in mem.getBlocks():
+            perms = []
+            if block.isRead():
+                perms.append("r")
+            if block.isWrite():
+                perms.append("w")
+            if block.isExecute():
+                perms.append("x")
+
+            regions.append({
+                "name": block.getName(),
+                "start": str(block.getStart()),
+                "end": str(block.getEnd()),
+                "size": int(block.getSize()),
+                "permissions": "".join(perms) or "---",
+                "initialized": block.isInitialized(),
+                "volatile": block.isVolatile(),
+            })
+
+        return regions
 
     def read_string(self, address: str) -> str:
         """Read null-terminated string at address."""

@@ -1,7 +1,8 @@
 """Models with metadata annotations, stable IDs, and provenance."""
 
 from enum import Enum
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel
 
 
 class AnalysisProfile(str, Enum):

@@ -2,7 +2,7 @@
 
 import hashlib
 import logging
-import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,8 +24,25 @@ DEFAULT_PROJECT_DIR = Path.home() / ".local" / "share" / "pyghidra-lite" / "proj
 
 
 def compute_unit_id(data: bytes) -> str:
-    """Content-addressed ID for a binary."""
+    """Content-addressed ID for a binary (in-memory bytes)."""
     return hashlib.sha256(data).hexdigest()[:16]
+
+
+def compute_unit_id_streaming(path: Path, chunk_size: int = 65536) -> str:
+    """Content-addressed ID using streaming hash (memory-efficient for large files).
+
+    Args:
+        path: Path to the binary file.
+        chunk_size: Read chunk size in bytes (default 64KB).
+
+    Returns:
+        16-character hex hash prefix.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return h.hexdigest()[:16]
 
 
 def compute_stable_id(unit_id: str, address: str) -> str:
@@ -64,23 +81,45 @@ class ProgramHandle:
 
 
 class GhidraBackend:
-    """Manages Ghidra project and program analysis."""
+    """Manages Ghidra project and program analysis.
+
+    Uses separate Ghidra projects per binary to enable multi-agent parallelism.
+    Each binary gets its own project directory to avoid lock contention.
+
+    For stdio transport (one process per agent), uses session isolation.
+    For SSE transport (shared server), set shared=True.
+    """
 
     def __init__(
         self,
         project_name: str = "pyghidra_lite",
         project_dir: Path | None = None,
         default_profile: AnalysisProfile = AnalysisProfile.DEFAULT,
+        shared: bool = False,
     ):
         self.project_name = project_name
         self.project_dir = project_dir or DEFAULT_PROJECT_DIR
         self.default_profile = default_profile
+        self.shared = shared
+
+        # Generate session ID for isolated mode (stdio transport)
+        if not shared:
+            self.session_id = f"session-{uuid.uuid4().hex[:8]}"
+            self.project_dir = self.project_dir / self.session_id
+        else:
+            self.session_id = "shared"
+
         self.programs: dict[str, ProgramHandle] = {}
-        self._project: "GhidraProject | None" = None
+        self._projects: dict[str, GhidraProject] = {}  # Per-binary projects
         self._started = False
 
-    def start(self) -> None:
-        """Initialize PyGhidra and open/create project."""
+    def start(self, eager_load: bool = False) -> None:
+        """Initialize PyGhidra (projects are loaded on-demand by default).
+
+        Args:
+            eager_load: If True, scan and load all existing projects at startup.
+                       Default is False for multi-agent compatibility.
+        """
         if self._started:
             return
 
@@ -88,43 +127,73 @@ class GhidraBackend:
         pyghidra.start(verbose=False)
         self._started = True
 
-        self._project = self._get_or_create_project()
-        self._load_existing_programs()
-        logger.info(f"Backend ready. Project: {self.project_name}")
+        # Only scan existing projects if explicitly requested
+        # Default is lazy loading for multi-agent support
+        if eager_load:
+            self._scan_existing_projects()
+            logger.info(f"Backend ready. {len(self.programs)} programs loaded.")
+        else:
+            logger.info("Backend ready (lazy loading enabled).")
 
-    def _get_or_create_project(self) -> "GhidraProject":
-        """Get or create the Ghidra project."""
+    def _get_or_create_project_for_binary(self, unit_id: str) -> "GhidraProject":
+        """Get or create a Ghidra project for a specific binary (by unit_id)."""
         from ghidra.base.project import GhidraProject
         from ghidra.framework.model import ProjectLocator
 
-        project_path = self.project_dir / self.project_name
+        # Use unit_id as project name for isolation
+        project_path = self.project_dir / unit_id
         project_path.mkdir(exist_ok=True, parents=True)
         project_str = str(project_path.absolute())
 
-        locator = ProjectLocator(project_str, self.project_name)
-        if locator.exists():
-            logger.info(f"Opening existing project: {self.project_name}")
-            return GhidraProject.openProject(project_str, self.project_name, True)
-        else:
-            logger.info(f"Creating new project: {self.project_name}")
-            return GhidraProject.createProject(project_str, self.project_name, False)
+        locator = ProjectLocator(project_str, unit_id)
+        try:
+            if locator.exists():
+                logger.debug(f"Opening existing project: {unit_id}")
+                return GhidraProject.openProject(project_str, unit_id, True)
+            else:
+                logger.info(f"Creating new project: {unit_id}")
+                return GhidraProject.createProject(project_str, unit_id, False)
+        except Exception as e:
+            if "LockException" in str(type(e).__name__) or "Unable to lock" in str(e):
+                lock_file = project_path / f"{unit_id}.lock"
+                raise RuntimeError(
+                    f"Binary {unit_id} is locked by another process.\n"
+                    f"Either stop the other process or delete: {lock_file}"
+                ) from e
+            raise
 
-    def _load_existing_programs(self) -> None:
-        """Load programs already in the project."""
-        if not self._project:
+    def _scan_existing_projects(self) -> None:
+        """Scan project directory for existing per-binary projects and load them."""
+        if not self.project_dir.exists():
             return
 
-        root_folder = self._project.getRootFolder()
-        for domain_file in root_folder.getFiles():
-            if domain_file.getContentType() == "Program":
-                name = domain_file.getName()
-                try:
-                    program = self._project.openProgram("/", name, False)
-                    handle = self._init_program_handle(program, name)
-                    self.programs[name] = handle
-                    logger.info(f"Loaded existing program: {name}")
-                except Exception as e:
-                    logger.warning(f"Failed to load {name}: {e}")
+        for project_path in self.project_dir.iterdir():
+            if not project_path.is_dir():
+                continue
+
+            unit_id = project_path.name
+            # Check if it's a valid Ghidra project (has .gpr file)
+            if not (project_path / f"{unit_id}.gpr").exists():
+                continue
+
+            try:
+                project = self._get_or_create_project_for_binary(unit_id)
+                self._projects[unit_id] = project
+
+                # Load programs from this project
+                root_folder = project.getRootFolder()
+                for domain_file in root_folder.getFiles():
+                    if domain_file.getContentType() == "Program":
+                        prog_name = domain_file.getName()
+                        try:
+                            program = project.openProgram("/", prog_name, False)
+                            handle = self._init_program_handle(program, prog_name)
+                            self.programs[prog_name] = handle
+                            logger.info(f"Loaded: {prog_name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to load {prog_name}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to load project {unit_id}: {e}")
 
     def _init_program_handle(
         self,
@@ -168,46 +237,58 @@ class GhidraBackend:
 
     def import_binary(
         self,
-        path: Path,
-        profile: AnalysisProfile | None = None,
+        path: Path | str,
+        profile: AnalysisProfile | str | None = None,
         analyze: bool = True,
     ) -> ProgramHandle:
         """Import and optionally analyze a binary."""
         if not self._started:
             self.start()
 
-        if not self._project:
-            raise RuntimeError("Project not initialized")
+        # Convert string to Path if needed
+        if isinstance(path, str):
+            path = Path(path)
 
+        # Convert string to enum if needed
+        if isinstance(profile, str):
+            profile = AnalysisProfile(profile)
         profile = profile or self.default_profile
         path = path.resolve()
 
-        # Generate unique name
-        with open(path, "rb") as f:
-            data = f.read()
-        unit_id = compute_unit_id(data)
-        prog_name = f"{path.name}-{unit_id[:6]}"
+        # Generate unique ID using streaming hash (memory-efficient)
+        unit_id = compute_unit_id_streaming(path)
 
         # Check if already imported
-        if prog_name in self.programs:
-            logger.info(f"Program already imported: {prog_name}")
-            return self.programs[prog_name]
+        for handle in self.programs.values():
+            if handle.unit_id == unit_id:
+                logger.info("Program already imported (unit_id match): %s", handle.name)
+                return handle
 
-        # Check if in project
-        root_folder = self._project.getRootFolder()
+        prog_name = f"{path.name}-{unit_id[:8]}"
+
+        # Get or create project for this binary
+        if unit_id not in self._projects:
+            project = self._get_or_create_project_for_binary(unit_id)
+            self._projects[unit_id] = project
+        else:
+            project = self._projects[unit_id]
+
+        # Check if program exists in this binary's project
+        root_folder = project.getRootFolder()
         if root_folder.getFile(prog_name):
             logger.info(f"Opening existing program: {prog_name}")
-            program = self._project.openProgram("/", prog_name, False)
+            program = project.openProgram("/", prog_name, False)
         else:
             logger.info(f"Importing: {prog_name}")
-            program = self._project.importProgram(path)
+            program = project.importProgram(path)
             if not program:
                 raise ImportError(f"Failed to import: {path}")
             program.name = prog_name
-            self._project.saveAs(program, "/", prog_name, True)
+            project.saveAs(program, "/", prog_name, True)
 
         handle = self._init_program_handle(program, prog_name, profile)
         handle.analyzed = False
+        handle.file_path = path
         self.programs[prog_name] = handle
 
         if analyze:
@@ -218,13 +299,16 @@ class GhidraBackend:
     def analyze_program(
         self,
         name: str,
-        profile: AnalysisProfile | None = None,
+        profile: AnalysisProfile | str | None = None,
     ) -> None:
         """Analyze a program with the specified profile."""
         if name not in self.programs:
             raise ValueError(f"Program not found: {name}")
 
         handle = self.programs[name]
+        # Convert string to enum if needed
+        if isinstance(profile, str):
+            profile = AnalysisProfile(profile)
         profile = profile or handle.profile
 
         logger.info(f"Analyzing {name} with profile={profile.value}")
@@ -243,8 +327,9 @@ class GhidraBackend:
                 GhidraProgramUtilities.markProgramAnalyzed(handle.program)
         finally:
             GhidraScriptUtil.releaseBundleHostReference()
-            if self._project:
-                self._project.save(handle.program)
+            # Save to the binary's project
+            if handle.unit_id in self._projects:
+                self._projects[handle.unit_id].save(handle.program)
 
         handle.analyzed = True
         handle.profile = profile
@@ -292,22 +377,34 @@ class GhidraBackend:
             elif matches:
                 raise ValueError(f"Ambiguous name '{name}'. Matches: {matches}")
             else:
-                raise ValueError(f"Program not found: {name}. Available: {list(self.programs.keys())}")
+                available = list(self.programs.keys())
+                raise ValueError(f"Program not found: {name}. Available: {available}")
         return self.programs[name]
 
     def delete_program(self, name: str) -> bool:
-        """Delete a program from the project."""
+        """Delete a program from its project."""
         if name not in self.programs:
             return False
 
         handle = self.programs[name]
-        if self._project:
+        unit_id = handle.unit_id
+
+        if unit_id in self._projects:
+            project = self._projects[unit_id]
             try:
                 df = handle.program.getDomainFile()
-                self._project.close(handle.program)
+                project.close(handle.program)
                 df.delete()
                 del self.programs[name]
                 logger.info(f"Deleted: {name}")
+
+                # If this was the last program in the project, close it
+                remaining = [p for p in self.programs.values() if p.unit_id == unit_id]
+                if not remaining:
+                    project.close()
+                    del self._projects[unit_id]
+                    logger.debug(f"Closed empty project: {unit_id}")
+
                 return True
             except Exception as e:
                 logger.error(f"Failed to delete {name}: {e}")
@@ -319,17 +416,22 @@ class GhidraBackend:
         return list(self.programs.keys())
 
     def close(self) -> None:
-        """Close all programs and the project."""
+        """Close all programs and projects."""
+        # Close all programs
         for name, handle in list(self.programs.items()):
             try:
-                if self._project:
-                    self._project.close(handle.program)
+                if handle.unit_id in self._projects:
+                    self._projects[handle.unit_id].close(handle.program)
             except Exception as e:
                 logger.warning(f"Error closing {name}: {e}")
 
-        if self._project:
-            self._project.close()
-            self._project = None
+        # Close all projects
+        for unit_id, project in list(self._projects.items()):
+            try:
+                project.close()
+            except Exception as e:
+                logger.warning(f"Error closing project {unit_id}: {e}")
 
         self.programs.clear()
+        self._projects.clear()
         logger.info("Backend closed")
