@@ -51,9 +51,9 @@ When running pyghidra-lite as an MCP server:
 Instead, please report them via:
 
 1. **GitHub Security Advisories** (preferred):
-   https://github.com/zackees/pyghidra-lite/security/advisories/new
+   https://github.com/johnzfitch/pyghidra-lite/security/advisories/new
 
-2. **Email**: zackees@gmail.com
+2. **Email**: zack@internetuniverse.org
 
 Include:
 - Description of the vulnerability
@@ -110,4 +110,4 @@ Security updates will be:
 - Tagged with `[security]` prefix
 
 Subscribe to releases for notifications:
-https://github.com/zackees/pyghidra-lite/releases
+https://github.com/johnzfitch/pyghidra-lite/releases

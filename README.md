@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/pyghidra-lite)](https://pypi.org/project/pyghidra-lite/)
 [![Python Version](https://img.shields.io/pypi/pyversions/pyghidra-lite)](https://pypi.org/project/pyghidra-lite/)
-[![License](https://img.shields.io/github/license/zackees/pyghidra-lite)](https://github.com/zackees/pyghidra-lite/blob/master/LICENSE)
+[![License](https://img.shields.io/github/license/johnzfitch/pyghidra-lite)](https://github.com/johnzfitch/pyghidra-lite/blob/master/LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io/specification/2025-11-25)
 
 Lightweight MCP server for Ghidra-based reverse engineering. Focused toolset with smart backend features.
@@ -11,7 +11,7 @@ Lightweight MCP server for Ghidra-based reverse engineering. Focused toolset wit
 
 - 📦 [PyPI Package](https://pypi.org/project/pyghidra-lite/)
 - 📚 [MCP Release Guide](MCP_RELEASE.md)
-- 🐛 [Issue Tracker](https://github.com/zackees/pyghidra-lite/issues)
+- 🐛 [Issue Tracker](https://github.com/johnzfitch/pyghidra-lite/issues)
 - 🤝 [Contributing](CONTRIBUTING.md)
 - 🔒 [Security Policy](SECURITY.md)
 
@@ -44,7 +44,7 @@ uv pip install -e .
 
 **Out of the box (stdio transport, automatic session isolation):**
 
-Add to `~/.claude/mcp_config.json`:
+Add to `.mcp.json` in your project root (or `~/.claude.json` for global):
 
 ```json
 {
@@ -173,14 +173,17 @@ Pass `compact=false` to request full metadata.
 | `list_imports` | Imports with capability tags |
 | `list_exports` | Exported symbols |
 
-### Analysis (5)
+### Analysis (8)
 | Tool | Description |
 |------|-------------|
 | `get_function_info` | Function metadata and callers/callees |
 | `disassemble` | Assembly for a function |
 | `decompile` | Pseudo-C with callees and strings |
+| `batch_decompile` | Decompile multiple functions efficiently |
 | `get_xrefs` | Who calls/uses this |
 | `get_callees` | What this function calls |
+| `call_graph` | Call graph with configurable depth |
+| `memory_map` | Memory layout with permissions |
 
 ### Search (2)
 | Tool | Description |

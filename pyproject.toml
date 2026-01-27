@@ -6,10 +6,10 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [
-    { name = "Zack Freedman", email = "zackees@gmail.com" }
+    { name = "Zack Freedman", email = "zack@internetuniverse.org" }
 ]
 maintainers = [
-    { name = "Zack Freedman", email = "zackees@gmail.com" }
+    { name = "Zack Freedman", email = "zack@internetuniverse.org" }
 ]
 keywords = ["ghidra", "reverse-engineering", "mcp", "ios", "macho", "elf", "game-hacking"]
 classifiers = [
@@ -37,11 +37,11 @@ emulation = ["capstone>=5.0.0", "unicorn>=2.0.0"]
 dev = ["pytest>=7.0.0", "ruff>=0.1.0", "mypy>=1.0.0"]
 
 [project.urls]
-Homepage = "https://github.com/zackees/pyghidra-lite"
-Repository = "https://github.com/zackees/pyghidra-lite"
-Issues = "https://github.com/zackees/pyghidra-lite/issues"
-Changelog = "https://github.com/zackees/pyghidra-lite/blob/master/CHANGELOG.md"
-Documentation = "https://github.com/zackees/pyghidra-lite/blob/master/MCP_RELEASE.md"
+Homepage = "https://github.com/johnzfitch/pyghidra-lite"
+Repository = "https://github.com/johnzfitch/pyghidra-lite"
+Issues = "https://github.com/johnzfitch/pyghidra-lite/issues"
+Changelog = "https://github.com/johnzfitch/pyghidra-lite/blob/master/CHANGELOG.md"
+Documentation = "https://github.com/johnzfitch/pyghidra-lite/blob/master/MCP_RELEASE.md"
 
 [project.scripts]
 pyghidra-lite = "pyghidra_lite.server:main"

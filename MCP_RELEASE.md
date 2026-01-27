@@ -34,7 +34,7 @@ pip install pyghidra-lite
 ### Install from Source
 
 ```bash
-git clone https://github.com/zackees/pyghidra-lite
+git clone https://github.com/johnzfitch/pyghidra-lite
 cd pyghidra-lite
 uv pip install -e .
 ```
@@ -59,9 +59,9 @@ pyghidra-lite --profile deep --allow-any-path
 
 ### MCP Configuration
 
-#### Claude Desktop
+#### Claude Code CLI
 
-Add to `~/.config/claude/config.json`:
+Add to `.mcp.json` in your project root (or `~/.claude.json` for global):
 
 ```json
 {
@@ -245,4 +245,4 @@ MIT License - See LICENSE file
 
 ## Contributing
 
-Issues and pull requests welcome at https://github.com/zackees/pyghidra-lite
+Issues and pull requests welcome at https://github.com/johnzfitch/pyghidra-lite

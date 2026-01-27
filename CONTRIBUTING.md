@@ -7,7 +7,7 @@ Thank you for considering contributing to pyghidra-lite! This document provides 
 ### Reporting Bugs
 
 Found a bug? Please open an issue at:
-https://github.com/zackees/pyghidra-lite/issues
+https://github.com/johnzfitch/pyghidra-lite/issues
 
 Include:
 - Python version
@@ -61,7 +61,7 @@ Feature requests are welcome! Please:
 
 ```bash
 # Clone repository
-git clone https://github.com/zackees/pyghidra-lite
+git clone https://github.com/johnzfitch/pyghidra-lite
 cd pyghidra-lite
 
 # Create virtual environment
@@ -147,7 +147,7 @@ Maintainers only:
 ## Questions?
 
 Open an issue or discussion at:
-https://github.com/zackees/pyghidra-lite/issues
+https://github.com/johnzfitch/pyghidra-lite/issues
 
 ## License
 

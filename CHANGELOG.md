@@ -29,4 +29,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-binary project isolation
 - Environment variable configuration support
 
-[0.1.0]: https://github.com/zackees/pyghidra-lite/releases/tag/v0.1.0
+[0.1.0]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.1.0
