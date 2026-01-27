@@ -4,12 +4,13 @@ Lightweight MCP server for Ghidra-based reverse engineering. Focused toolset wit
 
 ## Design Philosophy
 
-1. **Small tool surface**: 17 focused tools that agents actually use
+1. **Focused tool surface**: Core tools plus capability-specific extensions
 2. **Rich metadata**: Functions include `refs_in`, `refs_out`, `has_strings`, `is_library` for prioritization
 3. **Stable IDs**: Content-addressed `unit_id` and `stable_id` survive renames
 4. **Analysis profiles**: `fast`/`default`/`deep` tradeoff without changing tools
-5. **Container support**: APK/IPA/AppImage auto-extraction
-6. **Central project**: All binaries in `~/.local/share/pyghidra-lite/projects` (not per-cwd)
+5. **Container detection**: APK/IPA/AppImage detection hooks (extraction TODO)
+6. **Per-binary projects**: Each binary gets its own Ghidra project for multi-agent parallelism
+7. **Persistent analysis**: Shared cache persists across agent suspend/resume cycles
 
 ## Requirements
 
@@ -28,27 +29,53 @@ uv pip install -e .
 
 ### As MCP Server (Claude Code)
 
-Add to `~/.claude/.mcp.json`:
+**Out of the box (stdio transport, automatic session isolation):**
+
+Add to `~/.claude/mcp_config.json`:
 
 ```json
 {
   "mcpServers": {
     "pyghidra-lite": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/pyghidra-lite", "pyghidra-lite", "--transport", "stdio"]
+      "command": "pyghidra-lite",
+      "args": ["--allow-any-path"]
     }
   }
 }
 ```
 
-Or with a binary pre-loaded:
+Each agent automatically gets its own isolated session. No conflicts, no manual setup required!
+
+**With path restrictions (recommended for production):**
+
+```json
+{
+  "mcpServers": {
+    "pyghidra-lite": {
+      "command": "pyghidra-lite",
+      "args": [
+        "--allow-path", "/home/user/binaries",
+        "--allow-path", "/opt/apps"
+      ]
+    }
+  }
+}
+```
+
+**With development installation:**
 
 ```json
 {
   "mcpServers": {
     "pyghidra-lite": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/pyghidra-lite", "pyghidra-lite", "--profile", "fast", "/path/to/binary"]
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/pyghidra-lite",
+        "pyghidra-lite",
+        "--allow-any-path"
+      ]
     }
   }
 }
@@ -58,16 +85,65 @@ Or with a binary pre-loaded:
 
 ```bash
 # Start server (binaries imported via MCP tools)
-uv run pyghidra-lite
+uv run pyghidra-lite --allow-path /path/to/binaries
 
 # Pre-load binaries with fast profile
-uv run pyghidra-lite --profile fast /path/to/app.apk
+uv run pyghidra-lite --profile fast --allow-path /path/to/binaries /path/to/app.apk
 
 # Use custom project location
-uv run pyghidra-lite --project-dir /tmp/ghidra-projects --project-name myproject
+uv run pyghidra-lite --project-dir /tmp/ghidra-projects --project-name myproject --allow-path /path/to/binaries
 ```
 
+### Multi-Agent Usage
+
+pyghidra-lite works out of the box with multiple agents using **per-binary projects**:
+
+```
+~/.local/share/pyghidra-lite/
+└── projects/
+    ├── abc123def456/    # Binary 1's project
+    │   ├── abc123def456.gpr
+    │   └── abc123def456.rep/
+    └── 789ghi012jkl/    # Binary 2's project
+        ├── 789ghi012jkl.gpr
+        └── 789ghi012jkl.rep/
+```
+
+**Benefits:**
+- ✅ **No configuration needed** - just add to MCP config
+- ✅ **Persistent analysis** - work survives agent suspend/resume
+- ✅ **Shared cache** - all agents share analysis results
+- ✅ **Parallel analysis** - different binaries analyzed simultaneously
+- ✅ **Minimal disk usage** - each binary analyzed once, shared by all
+- ⚠️ **Same-binary locking** - only locks when 2+ agents work on identical binary
+
+**When locks occur:**
+- Two agents analyzing the exact same binary (same content hash) simultaneously
+- **Does NOT lock** when agents work on different binaries
+- Rare in practice - agents typically work on different files or at different times
+
+**SSE Transport (Optional):**
+
+SSE transport is available but not required. Both stdio and SSE use the same shared project structure:
+
+```bash
+# Optional: Start SSE server for reduced process overhead
+pyghidra-lite --transport sse --port 8001 --allow-any-path
+```
+
+SSE benefits: Single server process instead of one per agent, slightly less memory usage.
+
+## Import Policy (Multi-client)
+
+`import_binary` is allowlisted by default for multi-client safety.
+
+- Allow specific roots: `--allow-path /path/to/binaries` (repeatable) or `PYGHIDRA_LITE_ALLOWED_PATHS` (pathsep-separated).
+- Allow any path (unsafe): `--allow-any-path` or `PYGHIDRA_LITE_ALLOW_ANY_PATH=1`.
+
 ## Tools
+
+Token-efficient defaults: `list_functions`, `list_exports`, `swift_functions`, and `elf_symbols` return compact output by default.
+Pass `compact=false` to request full metadata.
 
 ### Import (3)
 | Tool | Description |
@@ -76,27 +152,26 @@ uv run pyghidra-lite --project-dir /tmp/ghidra-projects --project-name myproject
 | `delete_binary` | Remove from project |
 | `reanalyze` | Re-run with different profile |
 
-### Discovery (6)
+### Discovery (4)
 | Tool | Description |
 |------|-------------|
 | `list_binaries` | List all binaries with status |
-| `get_info` | Binary metadata (arch, format, counts) |
-| `get_status` | Analysis progress |
 | `list_functions` | Functions with metadata (sortable by refs) |
 | `list_imports` | Imports with capability tags |
 | `list_exports` | Exported symbols |
 
-### Analysis (3)
+### Analysis (5)
 | Tool | Description |
 |------|-------------|
+| `get_function_info` | Function metadata and callers/callees |
+| `disassemble` | Assembly for a function |
 | `decompile` | Pseudo-C with callees and strings |
 | `get_xrefs` | Who calls/uses this |
 | `get_callees` | What this function calls |
 
-### Search (3)
+### Search (2)
 | Tool | Description |
 |------|-------------|
-| `search_functions` | Function name search |
 | `search_strings` | Strings with xrefs |
 | `search_symbols` | Symbol name search |
 
@@ -105,6 +180,43 @@ uv run pyghidra-lite --project-dir /tmp/ghidra-projects --project-name myproject
 |------|-------------|
 | `read_bytes` | Raw memory |
 | `read_string` | Null-terminated string |
+
+### ELF (4)
+| Tool | Description |
+|------|-------------|
+| `elf_info` | ELF structure summary |
+| `elf_sections` | ELF sections |
+| `elf_symbols` | ELF symbols |
+| `elf_got_plt` | GOT/PLT entries |
+
+### Mach-O (3)
+| Tool | Description |
+|------|-------------|
+| `macho_info` | Mach-O structure summary |
+| `macho_segments` | Segments and sections |
+| `macho_dylibs` | Linked dylibs |
+
+### Swift (4)
+| Tool | Description |
+|------|-------------|
+| `swift_functions` | Swift functions (demangled) |
+| `swift_types` | Swift types from metadata |
+| `swift_decompile` | Swift decompile with demangled callees |
+| `demangle` | Swift symbol demangling |
+
+### Objective-C (3)
+| Tool | Description |
+|------|-------------|
+| `objc_classes` | Objective-C classes |
+| `objc_methods` | Objective-C methods |
+| `objc_decompile` | Objective-C method decompile |
+
+### Hermes (3)
+| Tool | Description |
+|------|-------------|
+| `hermes_info` | Hermes bundle summary |
+| `hermes_components` | React component names |
+| `hermes_endpoints` | API endpoints/URLs |
 
 ## Analysis Profiles
 
@@ -122,16 +234,10 @@ import_binary("/path/to/app.apk", profile="fast")
 reanalyze("libnative.so", profile="deep")
 ```
 
-## Container Support
+## Container Detection
 
-```python
-# APK auto-extracts to multiple units
-import_binary("/path/to/app.apk")
-# Returns: ContainerInfo with units=[libfoo.so, libbar.so, classes.dex, ...]
-
-# IPA extracts main binary + frameworks
-import_binary("/path/to/App.ipa")
-```
+Container extraction is not yet implemented. `import_binary` currently expects a direct
+binary path; container detection helpers are in place for future extraction work.
 
 ## Function Metadata
 
@@ -182,17 +288,39 @@ Provenance(
 
 ## Project Structure
 
-Unlike pyghidra-mcp which creates projects per working directory, pyghidra-lite uses a central location:
+All agents share a common per-binary project structure:
 
 ```
 ~/.local/share/pyghidra-lite/
 └── projects/
-    └── pyghidra_lite/
-        ├── pyghidra_lite.gpr
-        └── pyghidra_lite.rep/
+    ├── abc123def456/              # Binary 1 (unit_id = SHA256 hash)
+    │   ├── abc123def456.gpr       # Ghidra project file
+    │   └── abc123def456.rep/      # Analysis repository
+    └── 789ghi012jkl/              # Binary 2 (unit_id)
+        ├── 789ghi012jkl.gpr
+        └── 789ghi012jkl.rep/
 ```
 
-This means:
-- Binaries are shared across sessions
-- No more scattered `pyghidra_mcp_projects/` directories
-- Persistent analysis results
+**Key features:**
+- **Content-addressed**: Binary identified by SHA256 hash of contents
+- **Shared analysis**: All agents see the same analysis results
+- **Persistent**: Analysis survives agent restarts and suspend/resume
+- **Per-binary locking**: Each binary has independent lock
+- **No duplication**: Same binary analyzed once, shared by all
+
+**When is analysis reused?**
+- Same binary file (identical content) → always reuses existing analysis
+- Different binary → gets its own project, analyzes independently
+- Binary modified → new hash, new analysis (old analysis preserved)
+
+**Cleanup:**
+
+To remove old analysis:
+
+```bash
+# Remove all analyzed binaries
+rm -rf ~/.local/share/pyghidra-lite/projects
+
+# Remove specific binary (find by partial hash)
+rm -rf ~/.local/share/pyghidra-lite/projects/abc123*
+```

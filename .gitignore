@@ -38,3 +38,21 @@ ENV/
 *.gpr
 *.rep/
 pyghidra_mcp_projects/
+
+# Local dev config
+.mise.toml
+.tool-versions
+.envrc
+.direnv/
+
+# Editor/IDE
+*.sublime-*
+.nova/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local data
+*.lock
+!uv.lock
