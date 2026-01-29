@@ -1,10 +1,13 @@
 """pyghidra-lite MCP server - capability-based toolset with auto-detection."""
 
+import asyncio
 import logging
 import os
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +35,37 @@ from pyghidra_lite.tools import GhidraTools
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# Thread pool for running blocking Ghidra operations
+_import_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ghidra-import")
+
+
+# =============================================================================
+# PROGRESS TRACKING
+# =============================================================================
+
+@dataclass
+class ProgressTracker:
+    """Thread-safe progress tracker for long-running operations."""
+    progress: int = 0
+    total: int = 100
+    message: str = ""
+    phase: str = "starting"
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def update(self, progress: int, message: str = "", phase: str = "") -> None:
+        """Update progress (called from worker thread)."""
+        with self._lock:
+            self.progress = progress
+            if message:
+                self.message = message
+            if phase:
+                self.phase = phase
+
+    def get(self) -> tuple[int, int, str]:
+        """Get current progress (called from async context)."""
+        with self._lock:
+            return self.progress, self.total, self.message or self.phase
 
 
 # =============================================================================
@@ -388,8 +422,37 @@ mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
 # CORE TOOLS (Always available)
 # =============================================================================
 
+def _do_import_blocking(
+    p: Path,
+    profile_enum: AnalysisProfile,
+    analyze: bool,
+    tracker: ProgressTracker,
+) -> tuple:
+    """Blocking import operation (runs in thread pool)."""
+    tracker.update(10, "Loading file")
+
+    with _backend_lock:
+        backend = get_backend()
+        tracker.update(20, "Importing to Ghidra")
+
+        # Import without analysis first so we can report progress
+        handle = backend.import_binary(p, profile_enum, analyze=False)
+        tracker.update(40, "Import complete")
+
+        if analyze:
+            tracker.update(50, "Analyzing")
+            backend.analyze_program(handle.name, profile_enum)
+            tracker.update(85, "Analysis complete")
+
+        tracker.update(90, "Detecting capabilities")
+        caps = _ensure_capabilities(handle)
+        tracker.update(100, "Complete")
+
+        return handle, caps
+
+
 @mcp.tool()
-def import_binary(
+async def import_binary(
     path: str,
     ctx: Context,
     profile: str = "default",
@@ -427,38 +490,66 @@ def import_binary(
         header = f.read(16)
 
     kind = detect_binary_kind(p, header)
+    file_size_mb = p.stat().st_size / (1024 * 1024)
 
-    logger.info(f"Importing {p.name} ({kind}) with profile={profile_enum.value}")
+    logger.info(f"Importing {p.name} ({kind}, {file_size_mb:.1f}MB) with profile={profile_enum.value}")
+
+    # Progress tracking
+    tracker = ProgressTracker(message="Starting")
+    loop = asyncio.get_event_loop()
+
+    # Run blocking import in thread pool
+    import_future = loop.run_in_executor(
+        _import_executor,
+        lambda: _do_import_blocking(p, profile_enum, analyze, tracker)
+    )
+
+    # Report progress: every 10% change OR every 60s
+    last_reported_bucket = -1
+    last_report_time = time.monotonic()
 
     try:
-        with _backend_lock:
-            backend = get_backend()
-            handle = backend.import_binary(p, profile_enum, analyze=analyze)
+        while not import_future.done():
+            now = time.monotonic()
+            progress, total, message = tracker.get()
+            bucket = progress // 10
+            time_since_update = now - last_report_time
 
-            # Detect capabilities
-            caps = _ensure_capabilities(handle)
+            # Report if 10% change OR 60s elapsed
+            if bucket != last_reported_bucket or time_since_update >= 60:
+                await ctx.report_progress(progress, total, message)
+                last_reported_bucket = bucket
+                last_report_time = now
 
-            result = {
-                "name": handle.name,
-                "unit_id": handle.unit_id,
-                "kind": kind,
-                "analyzed": handle.analyzed,
-                "capabilities": {
-                    "macho": caps.is_macho,
-                    "elf": caps.is_elf,
-                    "pe": caps.is_pe,
-                    "swift": caps.has_swift,
-                    "objc": caps.has_objc,
-                    "hermes": caps.has_hermes,
-                    "swift_module": caps.swift_module,
-                },
-            }
+            await asyncio.sleep(0.5)
 
-            # Only include tool list if requested (saves tokens)
-            if list_tools:
-                result["available_tools"] = _available_tools(caps)
+        # Get result (raises if import failed)
+        handle, caps = await asyncio.wrap_future(import_future)
 
-            return result
+        # Final progress report
+        await ctx.report_progress(100, 100, "Complete")
+
+        result = {
+            "name": handle.name,
+            "unit_id": handle.unit_id,
+            "kind": kind,
+            "analyzed": handle.analyzed,
+            "capabilities": {
+                "macho": caps.is_macho,
+                "elf": caps.is_elf,
+                "pe": caps.is_pe,
+                "swift": caps.has_swift,
+                "objc": caps.has_objc,
+                "hermes": caps.has_hermes,
+                "swift_module": caps.swift_module,
+            },
+        }
+
+        # Only include tool list if requested (saves tokens)
+        if list_tools:
+            result["available_tools"] = _available_tools(caps)
+
+        return result
     except Exception as e:
         logger.error(f"Import failed: {e}")
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Import failed: {e}")) from e
