@@ -4,6 +4,9 @@
 [![Python Version](https://img.shields.io/pypi/pyversions/pyghidra-lite)](https://pypi.org/project/pyghidra-lite/)
 [![License](https://img.shields.io/github/license/johnzfitch/pyghidra-lite)](https://github.com/johnzfitch/pyghidra-lite/blob/master/LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io/specification/2025-11-25)
+[![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.johnzfitch/pyghidra--lite-green)](https://registry.modelcontextprotocol.io)
+
+<!-- mcp-name: io.github.johnzfitch/pyghidra-lite -->
 
 Lightweight MCP server for Ghidra-based reverse engineering. Focused toolset with smart backend features.
 

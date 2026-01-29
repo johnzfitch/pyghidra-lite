@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.johnzfitch/pyghidra-lite",
+  "description": "Token-efficient Ghidra RE: decompilation, Swift/ObjC, ELF/Mach-O, async progress",
+  "repository": {
+    "url": "https://github.com/johnzfitch/pyghidra-lite",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "pyghidra-lite",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "python",
+      "environmentVariables": [
+        {
+          "name": "GHIDRA_INSTALL_DIR",
+          "description": "Path to Ghidra installation directory",
+          "isRequired": true
+        }
+      ]
+    }
+  ]
+}
