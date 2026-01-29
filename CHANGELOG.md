@@ -5,6 +5,20 @@ All notable changes to pyghidra-lite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-01-29
+
+### Added
+- Async progress reporting for `import_binary` (updates every 10% or 60s)
+- MCP Registry listing (`io.github.johnzfitch/pyghidra-lite`)
+- AUR package (`python-pyghidra-lite`)
+
+### Changed
+- `import_binary` now runs in thread pool to avoid blocking
+- Improved documentation with clearer Quick Start guide
+
+### Removed
+- Unused emulation dependencies (capstone, unicorn)
+
 ## [0.1.0] - 2026-01-27
 
 ### Added
@@ -17,16 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Three analysis profiles: fast, default, deep
 - Multi-agent support with per-binary project isolation
 - Path-based security with allowlist controls
-- Token optimization features (compact modes, opt-in tool lists)
-- Comprehensive MCP compliance (stdio and SSE transports)
+- Token optimization features (compact modes, opt-in metadata)
 
 ### Fixed
 - Transaction management in reanalyze tool
-- String truncation to prevent token bombs (500 char limit)
+- String truncation to prevent token overflow (500 char limit)
 
 ### Security
 - Path allowlist prevents unauthorized file access
 - Per-binary project isolation
-- Environment variable configuration support
 
+[0.1.1]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.1.1
 [0.1.0]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.1.0

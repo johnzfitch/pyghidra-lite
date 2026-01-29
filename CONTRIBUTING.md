@@ -130,12 +130,12 @@ When adding MCP tools:
 
 Maintainers only:
 
-1. Update version in `pyproject.toml`
-2. Update CHANGELOG.md
-3. Create git tag: `git tag v0.x.0`
-4. Push: `git push --tags`
-5. Build: `python -m build`
-6. Publish: `twine upload dist/*`
+1. Update version in `pyproject.toml` and `aur/PKGBUILD`
+2. Update `CHANGELOG.md`
+3. Commit and push to master
+4. Create GitHub release: `gh release create v0.x.0`
+5. PyPI publish happens automatically via GitHub Actions
+6. Update AUR: `cd aur && makepkg --printsrcinfo > .SRCINFO && git push aur master`
 
 ## Code of Conduct
 
