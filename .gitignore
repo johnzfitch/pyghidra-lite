@@ -60,3 +60,6 @@ Thumbs.db
 # Temporary handoff/optimization docs
 HANDOFF.md
 TOKEN_OPTIMIZATIONS.md
+
+# MCP publisher tokens
+.mcpregistry_*
