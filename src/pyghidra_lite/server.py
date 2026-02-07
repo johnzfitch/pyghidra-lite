@@ -96,7 +96,7 @@ class ServerConfig:
     """Configuration for backend initialization and import policy."""
     project_name: str = "pyghidra_lite"
     project_dir: Path | None = None
-    default_profile: AnalysisProfile = AnalysisProfile.DEFAULT
+    default_profile: AnalysisProfile = AnalysisProfile.FAST
     allow_any_path: bool = False
     allowed_paths: list[Path] = field(default_factory=list)
     shared: bool = False  # True for SSE (shared server), False for stdio (isolated)
@@ -455,7 +455,7 @@ def _do_import_blocking(
 async def import_binary(
     path: str,
     ctx: Context,
-    profile: str = "default",
+    profile: str = "fast",
     analyze: bool = True,
     list_tools: bool = False,
 ) -> dict:
@@ -463,7 +463,7 @@ async def import_binary(
 
     Args:
         path: Path to binary file.
-        profile: Analysis depth - "fast", "default", or "deep".
+        profile: Analysis depth - "fast" (default), "default", or "deep".
         analyze: Run analysis (set False for large binaries to avoid timeout).
         list_tools: Include available_tools list (default False, saves tokens).
 
@@ -1491,11 +1491,17 @@ def reanalyze(binary: str, ctx: Context, profile: str = "deep", list_tools: bool
 
 @click.command()
 @click.version_option(__version__, "-v", "--version")
-@click.option("-t", "--transport", type=click.Choice(["stdio", "sse"]), default="stdio")
+@click.option(
+    "-t",
+    "--transport",
+    type=click.Choice(["stdio", "sse"]),
+    default="stdio",
+    help="Transport: stdio only (sse disabled)",
+)
 @click.option("-p", "--port", type=int, default=8000)
 @click.option("--host", type=str, default="127.0.0.1")
-@click.option("--profile", type=click.Choice(["fast", "default", "deep"]), default="default",
-              help="Default analysis profile")
+@click.option("--profile", type=click.Choice(["fast", "default", "deep"]), default="fast",
+              help="Default analysis profile (fast recommended for MCP timeout limits)")
 @click.option("--project-name", type=str, default="pyghidra_lite",
               help="Ghidra project name")
 @click.option("--project-dir", type=click.Path(path_type=Path), default=None,
@@ -1526,6 +1532,9 @@ def main(
 ):
     """pyghidra-lite: Lightweight RE MCP server with capability detection."""
     global _backend
+
+    if transport != "stdio":
+        raise click.ClickException("SSE transport is disabled. Use --transport stdio.")
 
     logger.info(f"pyghidra-lite v{__version__} (profile={profile}, transport={transport})")
 
@@ -1561,10 +1570,7 @@ def main(
     logger.info(f"Ready. {len(_backend.programs)} programs loaded.")
 
     try:
-        if transport == "stdio":
-            mcp.run(transport="stdio")
-        else:
-            mcp.run(transport="sse", host=host, port=port)
+        mcp.run(transport="stdio")
     finally:
         if _backend:
             _backend.close()

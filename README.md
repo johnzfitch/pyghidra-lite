@@ -198,15 +198,17 @@ pip install -e .
 
 | Profile | Use Case |
 |---------|----------|
-| `fast` | Quick triage, skip expensive analysis |
-| `default` | Balanced (recommended) |
+| `fast` | Quick triage, disables 20 slow analyzers (default) |
+| `default` | Balanced, full Ghidra analysis |
 | `deep` | Thorough analysis for obfuscated code |
 
-```python
-# Import with fast profile
-import_binary("/path/to/binary", profile="fast")
+The server defaults to `fast` to stay within MCP timeout limits. Use `reanalyze` to run deeper analysis when needed:
 
-# Re-analyze with deep profile
+```python
+# Default import uses fast profile
+import_binary("/path/to/binary")
+
+# Re-analyze with deep profile when you need more detail
 reanalyze("binary-name", profile="deep")
 ```
 

@@ -350,10 +350,35 @@ class GhidraBackend:
         options = prog.getOptions(Program.ANALYSIS_PROPERTIES)
 
         if profile == AnalysisProfile.FAST:
-            # Disable slow analyzers
-            self._set_option(options, "Decompiler Parameter ID", False)
-            self._set_option(options, "Stack", False)
-            logger.debug("Applied FAST profile")
+            # Disable all expensive analyzers for quick triage (<60s).
+            # Keeps: entry point, subroutine refs, basic blocks, ASCII strings,
+            # symbol table, imports/exports — enough for function listing,
+            # string search, and on-demand decompilation.
+            slow_analyzers = [
+                "Decompiler Parameter ID",
+                "Stack",
+                "Non-Returning Functions - Discovered",
+                "Aggressive Instruction Finder",
+                "Function Start Search",
+                "DWARF",
+                "PDB Universal",
+                "PDB MSDIA",
+                "Embedded Media",
+                "Scalar Operand References",
+                "Data Reference",
+                "GCC Exception Handlers",
+                "Windows x86 PE Exception Handling",
+                "Apply Data Archives",
+                "Shared Return Calls",
+                "Condense Filler Bytes",
+                "Function Start Search After Code",
+                "Function Start Search After Data",
+                "Demangler GNU",
+                "Demangler Microsoft",
+            ]
+            for name in slow_analyzers:
+                self._set_option(options, name, False)
+            logger.debug("Applied FAST profile: disabled %d slow analyzers", len(slow_analyzers))
         elif profile == AnalysisProfile.DEEP:
             # Enable thorough analysis
             self._set_option(options, "Decompiler Parameter ID", True)

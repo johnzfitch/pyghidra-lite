@@ -63,3 +63,11 @@ TOKEN_OPTIMIZATIONS.md
 
 # MCP publisher tokens
 .mcpregistry_*
+
+# Local MCP config (contains personal paths)
+.mcp.json
+
+# Runtime artifacts
+server.log
+server.pid
+firebase-debug.log
