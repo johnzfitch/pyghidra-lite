@@ -253,7 +253,7 @@ class GhidraBackend:
                         prog_name = domain_file.getName()
                         try:
                             program = project.openProgram("/", prog_name, False)
-                            handle = self._init_program_handle(program, prog_name)
+                            handle = self._init_program_handle(program, prog_name, unit_id=unit_id)
                             self.programs[prog_name] = handle
                             logger.info(f"Loaded: {prog_name}")
                         except Exception as e:
@@ -266,6 +266,7 @@ class GhidraBackend:
         program: "Program",
         name: str,
         profile: AnalysisProfile | None = None,
+        unit_id: str | None = None,
     ) -> ProgramHandle:
         """Initialize a ProgramHandle for a loaded program."""
         from ghidra.app.decompiler import DecompileOptions, DecompInterface
@@ -282,12 +283,16 @@ class GhidraBackend:
         # Get metadata
         metadata = dict(program.getMetadata())
 
-        # Compute unit_id from executable
-        unit_id = "unknown"
+        # Derive unit_id if not provided
+        if not unit_id:
+            # Try project directory name (the canonical source for per-binary projects)
+            locator = program.getDomainFile().getProjectLocator()
+            if locator:
+                unit_id = Path(str(locator.getProjectDir())).name
+            else:
+                unit_id = "unknown"
+
         exe_path = metadata.get("Executable Location")
-        if exe_path and Path(exe_path).exists():
-            with open(exe_path, "rb") as f:
-                unit_id = compute_unit_id(f.read())
 
         return ProgramHandle(
             name=name,
@@ -339,9 +344,11 @@ class GhidraBackend:
         else:
             project = self._projects[unit_id]
 
-        # Check if program exists in this binary's project
+        # Check if program already exists in this binary's project
         root_folder = project.getRootFolder()
-        if root_folder.getFile(prog_name):
+        program_existed = root_folder.getFile(prog_name) is not None
+
+        if program_existed:
             logger.info(f"Opening existing program: {prog_name}")
             program = project.openProgram("/", prog_name, False)
         else:
@@ -352,12 +359,12 @@ class GhidraBackend:
             program.name = prog_name
             project.saveAs(program, "/", prog_name, True)
 
-        handle = self._init_program_handle(program, prog_name, profile)
-        handle.analyzed = False
+        handle = self._init_program_handle(program, prog_name, profile, unit_id=unit_id)
+        handle.analyzed = program_existed
         handle.file_path = path
         self.programs[prog_name] = handle
 
-        if analyze:
+        if analyze and not program_existed:
             self.analyze_program(prog_name, profile)
 
         return handle

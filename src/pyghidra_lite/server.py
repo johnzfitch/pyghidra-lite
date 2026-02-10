@@ -19,7 +19,14 @@ from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
 
 from pyghidra_lite import __version__
-from pyghidra_lite.backend import GhidraBackend
+import json
+import signal
+
+from pyghidra_lite.backend import (
+    DEFAULT_PROJECT_DIR,
+    GhidraBackend,
+    compute_unit_id_streaming,
+)
 from pyghidra_lite.models import (
     AnalysisProfile,
     BytesResult,
@@ -89,6 +96,10 @@ class BinaryCapabilities:
 _backend: GhidraBackend | None = None
 _capabilities: dict[str, BinaryCapabilities] = {}
 _backend_lock = threading.RLock()
+
+# Async job tracking for analyze_binary
+_active_jobs: dict[str, dict] = {}  # unit_id → job dict
+_worker_semaphore: asyncio.Semaphore | None = None  # initialized in serve, default 4
 
 
 @dataclass
@@ -179,7 +190,13 @@ def get_backend() -> GhidraBackend:
     return _backend
 
 
-def _init_backend() -> GhidraBackend:
+def _require_backend():
+    """Raise McpError if backend not initialized."""
+    if _backend is None:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message="Backend not initialized"))
+
+
+def _init_backend(eager_load: bool = False) -> GhidraBackend:
     """Initialize the backend if needed."""
     global _backend
     if _backend is None:
@@ -191,7 +208,7 @@ def _init_backend() -> GhidraBackend:
             shared=config.shared,
             ghidra_dir=config.ghidra_dir,
         )
-        _backend.start()
+        _backend.start(eager_load=eager_load)
     return _backend
 
 
@@ -221,10 +238,10 @@ def _get_handle(binary: str):
 
 def _ensure_capabilities(handle) -> BinaryCapabilities:
     with _backend_lock:
-        caps = _capabilities.get(handle.name)
+        caps = _capabilities.get(handle.unit_id)
         if not caps:
             caps = detect_capabilities(handle)
-            _capabilities[handle.name] = caps
+            _capabilities[handle.unit_id] = caps
         return caps
 
 
@@ -294,18 +311,13 @@ async def _warn_if_limit_reached(
 
 
 def get_capabilities(binary: str) -> BinaryCapabilities:
-    """Get capabilities for a binary."""
+    """Get capabilities for a binary, looked up by unit_id or name."""
     with _backend_lock:
+        # Direct lookup by unit_id
         if binary in _capabilities:
             return _capabilities[binary]
 
-        # Try partial match
-        matches = [k for k in _capabilities if binary in k]
-        if len(matches) == 1:
-            return _capabilities[matches[0]]
-        if matches:
-            raise ValueError(f"Ambiguous binary '{binary}'. Matches: {matches}")
-
+        # Resolve name → handle → unit_id
         handle = _get_handle(binary)
         return _ensure_capabilities(handle)
 
@@ -412,9 +424,31 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
     global _backend
     with _backend_lock:
         _init_backend()
+
+    # Start filesystem watcher for hot-loading completed analyses
+    observer = None
+    projects_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        loop = asyncio.get_event_loop()
+        observer = start_project_watcher(_backend, projects_dir, loop)
+        logger.info(f"Filesystem watcher started on {projects_dir}")
+    except Exception as e:
+        logger.warning(f"Failed to start filesystem watcher: {e}")
+
+    # Recover any in-progress jobs from previous server run
+    await _recover_in_progress_jobs()
+
+    # Start background stale job monitor
+    stale_task = asyncio.create_task(_stale_job_monitor(interval=30))
+
     try:
         yield
     finally:
+        stale_task.cancel()
+        if observer:
+            observer.stop()
+            observer.join(timeout=2)
         with _backend_lock:
             if _backend:
                 _backend.close()
@@ -423,6 +457,318 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
 
 
 mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
+
+
+# =============================================================================
+# ASYNC ANALYSIS HELPERS
+# =============================================================================
+
+def _read_status_file(unit_id: str) -> dict:
+    """Read .analysis_status for a unit_id, returning {} on any failure."""
+    status_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / unit_id / ".analysis_status"
+    if not status_file.exists():
+        return {}
+    try:
+        return json.loads(status_file.read_text())
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {}
+
+
+def _write_status_file(unit_id: str, data: dict):
+    """Atomic write of .analysis_status for a unit_id."""
+    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    status_file = project_dir / ".analysis_status"
+    tmp = status_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=None))
+    tmp.rename(status_file)
+
+
+def _format_capabilities(caps: BinaryCapabilities) -> list[str]:
+    """Convert BinaryCapabilities to a flat list of strings."""
+    result = []
+    if caps.is_elf: result.append("elf")
+    if caps.is_macho: result.append("macho")
+    if caps.is_pe: result.append("pe")
+    if caps.has_swift: result.append("swift")
+    if caps.has_objc: result.append("objc")
+    if caps.has_hermes: result.append("hermes")
+    return result
+
+
+_TIME_CONSTANTS = {
+    "fast":    {"per_mb": 5,  "base": 5},
+    "default": {"per_mb": 15, "base": 10},
+    "deep":    {"per_mb": 45, "base": 15},
+}
+
+
+def _estimate_analysis_time(binary_size_bytes: int, profile: str) -> int:
+    """Rough wall-clock estimate in seconds. Includes ~5s JVM startup."""
+    mb = binary_size_bytes / (1024 * 1024)
+    c = _TIME_CONSTANTS.get(profile, _TIME_CONSTANTS["default"])
+    return int(max(c["base"], mb * c["per_mb"] + 5))
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a process is still running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
+    """Acquire semaphore slot, spawn import subprocess, track completion."""
+    global _worker_semaphore
+    if _worker_semaphore is None:
+        _worker_semaphore = asyncio.Semaphore(4)
+
+    async with _worker_semaphore:
+        job["status"] = "analyzing"
+
+        # Auto-size JVM heap based on binary size
+        binary_mb = path.stat().st_size / (1024 * 1024)
+        heap_mb = max(2048, min(8192, int(binary_mb * 4)))
+
+        cmd = [
+            sys.executable, "-m", "pyghidra_lite.server",
+            "import", str(path),
+            "--profile", profile,
+            "--status-file",
+            "--project-dir", str(_server_config.project_dir or DEFAULT_PROJECT_DIR),
+            "--jvm-heap", f"{heap_mb}m",
+        ]
+
+        if _server_config.ghidra_dir:
+            cmd.extend(["--ghidra-dir", str(_server_config.ghidra_dir)])
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            job["pid"] = proc.pid
+
+            returncode = await proc.wait()
+
+            if returncode == 0:
+                job["status"] = "complete"
+            else:
+                stderr = (await proc.stderr.read()).decode()
+                job["status"] = "error"
+                job["error"] = stderr[-500:]
+
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+
+
+def _hot_load_blocking(unit_id: str) -> None:
+    """Load a completed project into the running backend (blocking, runs in thread pool)."""
+    with _backend_lock:
+        if _backend is None:
+            return
+        # Already loaded (race guard)
+        if any(h.unit_id == unit_id for h in _backend.programs.values()):
+            return
+
+        project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
+        if not project_dir.exists():
+            return
+
+        try:
+            project = _backend._get_or_create_project_for_binary(unit_id)
+            _backend._projects[unit_id] = project
+
+            root_folder = project.getRootFolder()
+            for domain_file in root_folder.getFiles():
+                if str(domain_file.getContentType()) == "Program":
+                    prog_name = domain_file.getName()
+                    program = project.openProgram("/", prog_name, False)
+                    handle = _backend._init_program_handle(
+                        program, prog_name, unit_id=unit_id
+                    )
+                    handle.analyzed = True
+                    _backend.programs[prog_name] = handle
+                    _ensure_capabilities(handle)
+                    logger.info(f"Hot-loaded {prog_name} (unit_id={unit_id})")
+                    break  # One program per project
+        except Exception as e:
+            logger.error(f"Failed to hot-load {unit_id}: {e}")
+
+
+async def _hot_load(unit_id: str) -> None:
+    """Async wrapper: hot-load a completed project into the backend."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_import_executor, _hot_load_blocking, unit_id)
+
+    # Notify MCP client that tool list may have changed
+    # (new capabilities = new format-specific tools available)
+    try:
+        await mcp.server.send_notification("notifications/tools/list_changed", {})
+    except Exception:
+        pass  # Client may not support this notification
+
+
+# =============================================================================
+# FILESYSTEM WATCHER (Hot-loading)
+# =============================================================================
+
+class ProjectWatcher:
+    """Watch projects dir for completed analyses, hot-load into backend.
+
+    Uses watchdog's FileSystemEventHandler to detect .analysis_status writes.
+    When a status file transitions to "complete", schedules a hot-load on
+    the async event loop.
+    """
+
+    def __init__(self, backend, projects_dir: Path, loop: asyncio.AbstractEventLoop):
+        self.backend = backend
+        self.projects_dir = projects_dir
+        self.loop = loop
+
+    def on_moved(self, event):
+        """Catch atomic rename: .tmp -> .analysis_status."""
+        dest = Path(event.dest_path)
+        if dest.name == ".analysis_status":
+            self._check_and_load(dest)
+
+    def on_modified(self, event):
+        """Catch direct writes to .analysis_status."""
+        path = Path(event.src_path)
+        if path.name != ".analysis_status":
+            return
+        self._check_and_load(path)
+
+    def _check_and_load(self, status_path: Path):
+        try:
+            status = json.loads(status_path.read_text())
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            return
+
+        if status.get("status") != "complete":
+            return
+
+        unit_id = status_path.parent.name
+        if self.backend and any(
+            h.unit_id == unit_id for h in self.backend.programs.values()
+        ):
+            return  # Already loaded
+
+        self.loop.call_soon_threadsafe(
+            asyncio.ensure_future,
+            self._async_hot_load(unit_id)
+        )
+
+    async def _async_hot_load(self, unit_id: str):
+        try:
+            await _hot_load(unit_id)
+            logger.info(f"Watcher hot-loaded {unit_id}")
+        except Exception as e:
+            logger.error(f"Watcher failed to hot-load {unit_id}: {e}")
+
+
+def start_project_watcher(
+    backend, projects_dir: Path, loop: asyncio.AbstractEventLoop
+):
+    """Start a filesystem watcher on the projects directory.
+
+    Returns the Observer instance (call .stop() on shutdown).
+    """
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+
+    handler = ProjectWatcher(backend, projects_dir, loop)
+
+    # Wrap as a proper FileSystemEventHandler
+    class _Handler(FileSystemEventHandler):
+        def on_moved(self, event):
+            handler.on_moved(event)
+        def on_modified(self, event):
+            handler.on_modified(event)
+
+    observer = Observer()
+    observer.schedule(_Handler(), str(projects_dir), recursive=True)
+    observer.daemon = True
+    observer.start()
+    return observer
+
+
+# =============================================================================
+# CRASH RECOVERY & STALE JOB DETECTION (Phase 5)
+# =============================================================================
+
+async def _recover_in_progress_jobs():
+    """Recover from server restart: detect running/stale workers from previous run."""
+    projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    if not projects_path.exists():
+        return
+
+    for entry in projects_path.iterdir():
+        if not entry.is_dir():
+            continue
+        status_file = entry / ".analysis_status"
+        if not status_file.exists():
+            continue
+
+        uid = entry.name
+        if _backend and any(h.unit_id == uid for h in _backend.programs.values()):
+            continue  # Already loaded by eager_load
+
+        try:
+            status = json.loads(status_file.read_text())
+        except json.JSONDecodeError:
+            continue
+
+        if status.get("status") == "complete":
+            continue  # Will be handled by eager_load or watcher
+
+        pid = status.get("pid")
+        alive = pid and _pid_alive(pid)
+
+        if status.get("status") == "analyzing" and alive:
+            # Worker still running from before restart -- track it
+            _active_jobs[uid] = {
+                "unit_id": uid,
+                "binary_name": status.get("binary_name", uid),
+                "status": "analyzing",
+                "pid": pid,
+                "recovered": True,
+            }
+            logger.info(f"Recovered in-progress job {uid} (pid={pid})")
+
+        elif status.get("status") in ("analyzing", "queued"):
+            # Worker died -- mark failed
+            status["status"] = "error"
+            status["error"] = f"Worker process {pid} died (server restarted)"
+            _write_status_file(uid, status)
+            logger.warning(f"Marked stale job {uid} as error (pid={pid})")
+
+
+async def _stale_job_monitor(interval: int = 30):
+    """Periodically check for crashed workers."""
+    while True:
+        await asyncio.sleep(interval)
+        for uid, job in list(_active_jobs.items()):
+            if job.get("status") != "analyzing":
+                continue
+            pid = job.get("pid")
+            if pid and not _pid_alive(pid):
+                status_data = _read_status_file(uid)
+                # Check if it actually completed (status file might say "complete")
+                if status_data.get("status") == "complete":
+                    job["status"] = "complete"
+                    continue
+                logger.warning(f"Stale job {uid}: pid {pid} dead")
+                _write_status_file(uid, {
+                    "status": "error",
+                    "error": f"Worker process {pid} died unexpectedly",
+                    "phase": "unknown",
+                })
+                _active_jobs.pop(uid, None)
 
 
 # =============================================================================
@@ -466,17 +812,17 @@ async def import_binary(
     analyze: bool = True,
     list_tools: bool = False,
 ) -> dict:
-    """Import a binary for analysis. Returns capabilities detected.
+    """[Deprecated: use analyze_binary for non-blocking analysis]
+    Import and analyze a binary file. Blocks until analysis completes.
+
+    For large binaries this may time out. Prefer analyze_binary() which returns
+    immediately and runs analysis in an isolated subprocess.
 
     Args:
         path: Path to binary file.
         profile: Analysis depth - "fast" (default), "default", or "deep".
         analyze: Run analysis (set False for large binaries to avoid timeout).
         list_tools: Include available_tools list (default False, saves tokens).
-
-    Returns:
-        Binary info with detected capabilities (swift, objc, macho, etc.)
-        Use capability-specific tools based on what's detected.
     """
     try:
         p = _resolve_import_path(path)
@@ -540,16 +886,7 @@ async def import_binary(
             "name": handle.name,
             "unit_id": handle.unit_id,
             "kind": kind,
-            "analyzed": handle.analyzed,
-            "capabilities": {
-                "macho": caps.is_macho,
-                "elf": caps.is_elf,
-                "pe": caps.is_pe,
-                "swift": caps.has_swift,
-                "objc": caps.has_objc,
-                "hermes": caps.has_hermes,
-                "swift_module": caps.swift_module,
-            },
+            "capabilities": _format_capabilities(caps),
         }
 
         # Only include tool list if requested (saves tokens)
@@ -563,8 +900,218 @@ async def import_binary(
 
 
 @mcp.tool()
+async def analyze_binary(
+    paths: list[str],
+    ctx: Context,
+    profile: str = "default",
+) -> list[dict]:
+    """Start async analysis of one or more binaries. Returns immediately with job status.
+
+    Unlike import_binary (which blocks until complete), this spawns isolated subprocess
+    workers and returns in <1 second. Poll with analysis_status() for progress.
+
+    Args:
+        paths: List of file paths to analyze.
+        profile: Analysis depth - "fast", "default", or "deep".
+    """
+    _require_backend()
+    config = _server_config
+
+    try:
+        profile_enum = AnalysisProfile(profile)
+    except ValueError as exc:
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message=f"Invalid profile '{profile}'. Use: fast, default, deep"
+        )) from exc
+
+    results = []
+    for p in paths:
+        try:
+            path = _resolve_import_path(p)
+        except ValueError as exc:
+            results.append({"path": p, "status": "error", "error": str(exc)})
+            continue
+
+        if not path.exists():
+            results.append({"path": p, "status": "error", "error": f"Not found: {path}"})
+            continue
+
+        unit_id = compute_unit_id_streaming(path)
+        project_dir = Path(config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
+
+        # Case 1: Already loaded in memory
+        if unit_id in {h.unit_id for h in _backend.programs.values()}:
+            handle = next(h for h in _backend.programs.values() if h.unit_id == unit_id)
+            caps = _ensure_capabilities(handle)
+            results.append({
+                "unit_id": unit_id,
+                "binary_name": path.name,
+                "status": "ready",
+                "functions": handle.program.getFunctionManager().getFunctionCount(),
+                "capabilities": _format_capabilities(caps),
+            })
+            continue
+
+        # Case 2: Completed on disk but not loaded
+        gpr = project_dir / f"{unit_id}.gpr"
+        status_file = project_dir / ".analysis_status"
+        if gpr.exists() and status_file.exists():
+            try:
+                status = json.loads(status_file.read_text())
+                if status.get("status") == "complete":
+                    results.append({
+                        "unit_id": unit_id,
+                        "binary_name": path.name,
+                        "status": "ready",
+                        "functions": status.get("functions"),
+                        "capabilities": status.get("capabilities", []),
+                        "note": "on_disk, will load on first query",
+                    })
+                    continue
+            except (json.JSONDecodeError, FileNotFoundError):
+                pass
+
+        # Case 3: Already in progress
+        if unit_id in _active_jobs:
+            job = _active_jobs[unit_id]
+            results.append({
+                "unit_id": unit_id,
+                "binary_name": path.name,
+                "status": job.get("status", "unknown"),
+                "eta_sec": job.get("eta_sec"),
+            })
+            continue
+
+        # Case 4: New analysis — spawn worker subprocess
+        estimated = _estimate_analysis_time(path.stat().st_size, profile)
+        job = {
+            "unit_id": unit_id,
+            "binary_name": path.name,
+            "status": "queued",
+            "eta_sec": estimated,
+            "profile": profile,
+            "pid": None,
+        }
+        _active_jobs[unit_id] = job
+        asyncio.create_task(_run_worker(path, unit_id, profile, job))
+
+        results.append({
+            "unit_id": unit_id,
+            "binary_name": path.name,
+            "status": "queued",
+            "eta_sec": estimated,
+        })
+
+    return results
+
+
+@mcp.tool()
+async def analysis_status(
+    ctx: Context,
+    unit_ids: list[str] | None = None,
+) -> list[dict]:
+    """Check status of analysis jobs. Returns progress, phase, and completion info.
+
+    On completion, the binary becomes available for querying via other tools.
+
+    Args:
+        unit_ids: Unit IDs to check. If omitted, returns status for all active jobs.
+    """
+    _require_backend()
+
+    ids = unit_ids or list(_active_jobs.keys())
+    if not ids:
+        return [{"status": "no_active_jobs"}]
+
+    # Fields the LLM agent actually needs from the status file
+    _STATUS_KEYS = {"status", "phase", "progress", "functions", "capabilities",
+                    "error", "binary_name", "done", "total"}
+
+    results = []
+    for uid in ids:
+        # Already loaded in memory
+        if uid in {h.unit_id for h in _backend.programs.values()}:
+            handle = next(h for h in _backend.programs.values() if h.unit_id == uid)
+            caps = _ensure_capabilities(handle)
+            results.append({
+                "unit_id": uid,
+                "binary_name": handle.name,
+                "status": "ready",
+                "functions": handle.program.getFunctionManager().getFunctionCount(),
+                "capabilities": _format_capabilities(caps),
+            })
+            _active_jobs.pop(uid, None)
+            continue
+
+        # Read status file from disk
+        raw = _read_status_file(uid)
+        if not raw:
+            results.append({"unit_id": uid, "status": "not_found"})
+            continue
+
+        # Auto hot-load on completion
+        hot_loaded = False
+        hot_load_error = None
+        if raw.get("status") == "complete":
+            try:
+                await _hot_load(uid)
+                hot_loaded = True
+            except Exception as e:
+                hot_load_error = str(e)
+
+        # Clean up terminal jobs from active tracking
+        if raw.get("status") in ("complete", "error", "cancelled"):
+            _active_jobs.pop(uid, None)
+
+        # Return only agent-relevant fields
+        entry = {"unit_id": uid}
+        for k in _STATUS_KEYS:
+            if k in raw:
+                entry[k] = raw[k]
+        if hot_loaded:
+            entry["hot_loaded"] = True
+        if hot_load_error:
+            entry["hot_load_error"] = hot_load_error
+        results.append(entry)
+
+    return results
+
+
+@mcp.tool()
+async def cancel_analysis(unit_id: str, ctx: Context) -> dict:
+    """Kill the worker subprocess for a given analysis job.
+
+    Args:
+        unit_id: The unit_id of the analysis to cancel.
+    """
+    _require_backend()
+
+    if unit_id not in _active_jobs:
+        return {"unit_id": unit_id, "status": "not_found"}
+
+    job = _active_jobs[unit_id]
+    pid = job.get("pid")
+
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            await asyncio.sleep(5)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        except ProcessLookupError:
+            pass
+
+    _active_jobs.pop(unit_id, None)
+    _write_status_file(unit_id, {"status": "cancelled"})
+    return {"unit_id": unit_id, "status": "cancelled"}
+
+
+@mcp.tool()
 def list_binaries(ctx: Context, list_tools: bool = False) -> list[dict]:
-    """List all loaded binaries with their capabilities.
+    """List all binaries - ready, analyzing, queued, or on-disk from previous runs.
 
     Args:
         list_tools: Include available_tools list per binary (default False, saves tokens).
@@ -572,26 +1119,55 @@ def list_binaries(ctx: Context, list_tools: bool = False) -> list[dict]:
     def op():
         backend = get_backend()
         results = []
+        seen_uids = set()
+
+        # 1. Currently loaded in memory
         for name in backend.list_programs():
             handle = backend.get_program(name)
+            seen_uids.add(handle.unit_id)
             caps = _ensure_capabilities(handle)
             result = {
                 "name": handle.name,
                 "unit_id": handle.unit_id,
-                "analyzed": handle.analyzed,
-                "capabilities": {
-                    "macho": caps.is_macho,
-                    "elf": caps.is_elf,
-                    "pe": caps.is_pe,
-                    "swift": caps.has_swift,
-                    "objc": caps.has_objc,
-                    "hermes": caps.has_hermes,
-                    "swift_module": caps.swift_module,
-                },
+                "status": "ready",
+                "profile": handle.profile.value if handle.profile else None,
+                "capabilities": _format_capabilities(caps),
             }
             if list_tools:
                 result["available_tools"] = _available_tools(caps)
             results.append(result)
+
+        # 2. In-progress analyses (not yet loaded)
+        for unit_id, job in _active_jobs.items():
+            if unit_id not in seen_uids:
+                seen_uids.add(unit_id)
+                results.append({
+                    "unit_id": unit_id,
+                    "name": job.get("binary_name", unit_id),
+                    "status": job.get("status", "unknown"),
+                    "profile": job.get("profile"),
+                    "eta_sec": job.get("eta_sec"),
+                })
+
+        # 3. On-disk projects not yet loaded (from previous runs, CLI imports)
+        projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+        if projects_path.exists():
+            for entry in projects_path.iterdir():
+                uid = entry.name
+                if uid in seen_uids or not entry.is_dir():
+                    continue
+                if not list(entry.glob("*.gpr")):
+                    continue
+                seen_uids.add(uid)
+                status_data = _read_status_file(uid)
+                results.append({
+                    "unit_id": uid,
+                    "name": status_data.get("binary_name", uid),
+                    "status": status_data.get("status", "on_disk"),
+                    "functions": status_data.get("functions"),
+                    "capabilities": status_data.get("capabilities", []),
+                })
+
         return results
 
     with _backend_lock:
@@ -1434,8 +2010,8 @@ def delete_binary(binary: str, ctx: Context) -> str:
     def op():
         backend = get_backend()
         handle = backend.get_program(binary)
-        if handle.name in _capabilities:
-            del _capabilities[handle.name]
+        if handle.unit_id in _capabilities:
+            del _capabilities[handle.unit_id]
         if backend.delete_program(handle.name):
             return f"Deleted {handle.name}"
         raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Failed to delete {handle.name}"))
@@ -1468,21 +2044,12 @@ def reanalyze(binary: str, ctx: Context, profile: str = "deep", list_tools: bool
 
         # Re-detect capabilities after deeper analysis
         caps = detect_capabilities(handle)
-        _capabilities[handle.name] = caps
+        _capabilities[handle.unit_id] = caps
 
         result = {
             "name": handle.name,
-            "analyzed": True,
             "profile": profile,
-            "capabilities": {
-                "macho": caps.is_macho,
-                "elf": caps.is_elf,
-                "pe": caps.is_pe,
-                "swift": caps.has_swift,
-                "objc": caps.has_objc,
-                "hermes": caps.has_hermes,
-                "swift_module": caps.swift_module,
-            },
+            "capabilities": _format_capabilities(caps),
         }
         if list_tools:
             result["available_tools"] = _available_tools(caps)
@@ -1496,8 +2063,29 @@ def reanalyze(binary: str, ctx: Context, profile: str = "deep", list_tools: bool
 # CLI
 # =============================================================================
 
-@click.command()
+class DefaultGroup(click.Group):
+    """Routes unrecognized first args to the 'serve' subcommand for backward compat.
+
+    This ensures existing MCP configs (e.g. `pyghidra-lite --allow-any-path`)
+    continue to work without requiring `pyghidra-lite serve --allow-any-path`.
+    """
+
+    # Group-level flags that should NOT be routed to serve
+    _group_flags = frozenset({"-v", "--version", "--help", "-h"})
+
+    def parse_args(self, ctx, args):
+        if args and args[0] not in self.commands and args[0] not in self._group_flags:
+            args = ["serve"] + args
+        return super().parse_args(ctx, args)
+
+
+@click.group(cls=DefaultGroup)
 @click.version_option(__version__, "-v", "--version")
+def cli():
+    """pyghidra-lite: Lightweight reverse engineering via MCP."""
+
+
+@cli.command("serve")
 @click.option(
     "-t",
     "--transport",
@@ -1527,8 +2115,10 @@ def reanalyze(binary: str, ctx: Context, profile: str = "deep", list_tools: bool
     is_flag=True,
     help="Allow importing binaries from any path (unsafe).",
 )
+@click.option("--max-workers", type=int, default=4,
+              help="Max concurrent analysis workers (default 4).")
 @click.argument("binaries", nargs=-1, type=click.Path(exists=True, path_type=Path))
-def main(
+def serve_cmd(
     transport: str,
     port: int,
     host: str,
@@ -1538,19 +2128,20 @@ def main(
     ghidra_dir: Path | None,
     allow_paths: tuple[Path, ...],
     allow_any_path: bool,
+    max_workers: int,
     binaries: tuple[Path, ...],
 ):
-    """pyghidra-lite: Lightweight RE MCP server with capability detection."""
-    global _backend
+    """Start the MCP server (default when no subcommand given)."""
+    global _backend, _worker_semaphore
 
     if transport != "stdio":
         raise click.ClickException("SSE transport is disabled. Use --transport stdio.")
 
+    _worker_semaphore = asyncio.Semaphore(max_workers)
+
     logger.info(f"pyghidra-lite v{__version__} (profile={profile}, transport={transport})")
 
     profile_enum = AnalysisProfile(profile)
-    # Always use shared mode - per-binary projects provide sufficient isolation
-    # Analysis persists across agent suspend/resume cycles
     configure_server(
         project_name=project_name,
         project_dir=project_dir,
@@ -1561,7 +2152,13 @@ def main(
         shared=True,
     )
     with _backend_lock:
-        _backend = _init_backend()
+        _backend = _init_backend(eager_load=True)
+
+    # Detect capabilities for all pre-loaded (eager-loaded) binaries
+    for prog_name in _backend.list_programs():
+        handle = _backend.get_program(prog_name)
+        _ensure_capabilities(handle)
+        logger.info(f"Pre-loaded {handle.name} (unit_id={handle.unit_id}, analyzed={handle.analyzed})")
 
     # Import binaries from command line
     for binary_path in binaries:
@@ -1580,11 +2177,215 @@ def main(
 
     logger.info(f"Ready. {len(_backend.programs)} programs loaded.")
 
+    # mcp.run() triggers server_lifespan which starts watcher, recovery, and stale monitor
     try:
         mcp.run(transport="stdio")
     finally:
         if _backend:
             _backend.close()
+
+
+@cli.command("import")
+@click.argument("binaries", nargs=-1, type=click.Path(exists=True))
+@click.option("--profile", default="default",
+              type=click.Choice(["fast", "default", "deep"]),
+              help="Analysis profile (default recommended for offline import)")
+@click.option("--ghidra-dir", type=click.Path(path_type=Path), default=None,
+              envvar="GHIDRA_INSTALL_DIR",
+              help="Ghidra installation directory")
+@click.option("--project-dir", type=click.Path(path_type=Path),
+              default=DEFAULT_PROJECT_DIR, envvar="PYGHIDRA_LITE_PROJECT_DIR",
+              help="Project directory")
+@click.option("--status-file", is_flag=True,
+              help="Write progress to .analysis_status (for subprocess workers)")
+@click.option("--jvm-heap", default=None,
+              help="JVM max heap (e.g. '4g'). Auto-sized if not set.")
+def import_cmd(binaries, profile, ghidra_dir, project_dir, status_file, jvm_heap):
+    """Import and analyze binaries offline. No MCP server started."""
+    if not binaries:
+        click.echo("No binaries specified.", err=True)
+        raise SystemExit(1)
+
+    if jvm_heap:
+        os.environ["_JAVA_OPTIONS"] = f"-Xmx{jvm_heap}"
+
+    profile_enum = AnalysisProfile(profile)
+
+    backend = GhidraBackend(
+        project_dir=project_dir,
+        default_profile=profile_enum,
+        shared=True,
+        ghidra_dir=ghidra_dir,
+    )
+    backend.start(eager_load=False)
+
+    for binary_path in binaries:
+        path = Path(binary_path).resolve()
+        unit_id = compute_unit_id_streaming(path)
+        project_dir_path = Path(project_dir) / unit_id
+
+        listener = None
+        if status_file:
+            status_path = project_dir_path / ".analysis_status"
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            listener = AnalysisProgressListener(
+                status_path, path.name, profile, path.stat().st_size
+            )
+
+        try:
+            if listener:
+                listener.set_phase("importing")
+
+            handle = backend.import_binary(path, profile_enum, analyze=True)
+
+            caps = detect_capabilities(handle)
+            cap_list = []
+            if caps.is_elf: cap_list.append("ELF")
+            if caps.is_macho: cap_list.append("Mach-O")
+            if caps.has_swift: cap_list.append("Swift")
+            if caps.has_objc: cap_list.append("ObjC")
+            if caps.has_hermes: cap_list.append("Hermes")
+
+            func_count = handle.program.getFunctionManager().getFunctionCount()
+
+            if handle.analyzed and not listener:
+                # Re-opened existing project, analysis was skipped
+                click.echo(f"  {path.name}: already analyzed "
+                           f"(unit_id={unit_id}, {func_count} functions)")
+            else:
+                if listener:
+                    listener.complete(func_count, cap_list)
+                click.echo(f"  {path.name}: {func_count} functions, "
+                           f"[{', '.join(cap_list) or 'generic'}] "
+                           f"(unit_id={unit_id}, profile={profile})")
+
+        except Exception as e:
+            if listener:
+                listener.error(str(e), "import")
+            click.echo(f"  {path.name}: ERROR - {e}", err=True)
+
+    backend.close()
+
+
+@cli.command("list")
+@click.option("--project-dir", type=click.Path(path_type=Path),
+              default=DEFAULT_PROJECT_DIR, envvar="PYGHIDRA_LITE_PROJECT_DIR",
+              help="Project directory")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def list_cmd(project_dir, as_json):
+    """List cached/analyzed binaries. No Ghidra needed."""
+    projects_path = Path(project_dir)
+    if not projects_path.exists():
+        click.echo("No projects directory found.")
+        return
+
+    entries = []
+    for entry in sorted(projects_path.iterdir()):
+        if not entry.is_dir():
+            continue
+        gpr_files = list(entry.glob("*.gpr"))
+        if not gpr_files:
+            continue
+
+        size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+        status_file = entry / ".analysis_status"
+
+        status_data = {}
+        if status_file.exists():
+            try:
+                status_data = json.loads(status_file.read_text())
+            except json.JSONDecodeError:
+                status_data = {"status": "corrupt_status"}
+
+        info = {
+            "unit_id": entry.name,
+            "size_mb": round(size / 1024 / 1024, 1),
+            "status": status_data.get("status", "ready"),
+            "binary_name": status_data.get("binary_name", "unknown"),
+            "functions": status_data.get("functions"),
+            "capabilities": status_data.get("capabilities", []),
+            "profile": status_data.get("profile"),
+        }
+        entries.append(info)
+
+    if as_json:
+        click.echo(json.dumps(entries, indent=2))
+    else:
+        if not entries:
+            click.echo("No analyzed binaries found.")
+            return
+        for e in entries:
+            caps = ", ".join(e["capabilities"]) if e["capabilities"] else "-"
+            funcs = f"{e['functions']} funcs" if e["functions"] else ""
+            click.echo(f"  {e['unit_id']}  {e['size_mb']:>6.1f}MB  "
+                       f"[{e['status']}]  {e['binary_name']}  {funcs}  {caps}")
+
+
+class AnalysisProgressListener:
+    """Writes analysis progress to a JSON status file for subprocess worker consumption."""
+
+    def __init__(self, status_path: Path, binary_name: str,
+                 profile: str, binary_size: int):
+        self.status_path = status_path
+        self.binary_name = binary_name
+        self.profile = profile
+        self.binary_size = binary_size
+        self.started = time.time()
+        self._write({"status": "analyzing", "phase": "startup", "progress": 0.0})
+
+    def set_phase(self, phase: str, progress: float | None = None):
+        self._write({
+            "status": "analyzing",
+            "phase": phase,
+            "progress": progress,
+            "elapsed_seconds": int(time.time() - self.started),
+        })
+
+    def set_progress(self, current: int, total: int, phase: str | None = None):
+        self._write({
+            "status": "analyzing",
+            "phase": phase or "analysis",
+            "progress": round(current / max(total, 1), 3),
+            "done": current,
+            "total": total,
+            "elapsed_seconds": int(time.time() - self.started),
+        })
+
+    def complete(self, functions: int, capabilities: list[str]):
+        self._write({
+            "status": "complete",
+            "functions": functions,
+            "capabilities": capabilities,
+            "duration_seconds": int(time.time() - self.started),
+        })
+
+    def error(self, error: str, phase: str):
+        self._write({
+            "status": "error",
+            "error": str(error)[:500],
+            "phase": phase,
+            "duration_seconds": int(time.time() - self.started),
+        })
+
+    def _write(self, data: dict):
+        from datetime import datetime, timezone
+        data.update({
+            "pid": os.getpid(),
+            "binary_name": self.binary_name,
+            "binary_size_bytes": self.binary_size,
+            "profile": self.profile,
+            "started_at": datetime.fromtimestamp(
+                self.started, tz=timezone.utc
+            ).isoformat(),
+        })
+        tmp = self.status_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=None))
+        tmp.rename(self.status_path)
+
+
+def main():
+    """Entry point for pyproject.toml console_scripts."""
+    cli()
 
 
 if __name__ == "__main__":
