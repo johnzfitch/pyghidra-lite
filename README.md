@@ -18,8 +18,9 @@ Token-efficient MCP server for Ghidra-based reverse engineering. Analyze ELF, Ma
 yay -S ghidra
 
 # Or download from https://ghidra-sre.org
-export GHIDRA_INSTALL_DIR=/path/to/ghidra
 ```
+
+Ghidra at `/opt/ghidra` or `~/ghidra` is found automatically. Set `GHIDRA_INSTALL_DIR` only for non-standard paths.
 
 **2. Install pyghidra-lite**
 
@@ -82,6 +83,22 @@ pip install -e .
     "pyghidra-lite": {
       "command": "pyghidra-lite",
       "args": ["--allow-path", "/home/user/binaries"]
+    }
+  }
+}
+```
+
+### With explicit Ghidra path
+
+```json
+{
+  "mcpServers": {
+    "pyghidra-lite": {
+      "command": "pyghidra-lite",
+      "args": [
+        "--ghidra-dir", "/path/to/ghidra",
+        "--allow-path", "/home/user/binaries"
+      ]
     }
   }
 }

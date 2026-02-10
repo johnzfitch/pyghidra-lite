@@ -37,7 +37,7 @@ pyghidra-lite --transport sse --port 8001 --allow-path /path/to/binaries
 
 | Variable | Description |
 |----------|-------------|
-| `GHIDRA_INSTALL_DIR` | Path to Ghidra installation (required) |
+| `GHIDRA_INSTALL_DIR` | Path to Ghidra installation (optional, auto-detected) |
 | `PYGHIDRA_LITE_ALLOWED_PATHS` | Colon-separated allowed paths |
 | `PYGHIDRA_LITE_ALLOW_ANY_PATH` | Set to `1` to allow any path |
 
@@ -47,6 +47,7 @@ pyghidra-lite --transport sse --port 8001 --allow-path /path/to/binaries
 pyghidra-lite [OPTIONS] [BINARIES...]
 
 Options:
+  --ghidra-dir DIR       Ghidra installation directory (overrides env var)
   --allow-path PATH      Allow imports from PATH (repeatable)
   --allow-any-path       Allow imports from any path
   --transport TYPE       Transport: stdio (default) or sse
@@ -58,6 +59,17 @@ Options:
   --version              Show version
   --help                 Show help
 ```
+
+## Ghidra Detection
+
+The server locates Ghidra using this resolution order:
+
+1. `--ghidra-dir` CLI flag (highest priority)
+2. `GHIDRA_INSTALL_DIR` environment variable
+3. Common installation paths: `/opt/ghidra`, `/usr/share/ghidra`, `/usr/local/share/ghidra`, `~/ghidra`
+4. Versioned installs in `/opt/`, `/usr/local/share/`, `~/` (e.g. `ghidra_11.3.1`)
+
+A directory is valid if it contains `Ghidra/application.properties`.
 
 ## Tool Categories
 

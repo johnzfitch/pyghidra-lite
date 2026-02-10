@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,60 @@ logger = logging.getLogger(__name__)
 
 # Standard project location
 DEFAULT_PROJECT_DIR = Path.home() / ".local" / "share" / "pyghidra-lite" / "projects"
+
+# Common Ghidra install locations to search (in priority order)
+_GHIDRA_SEARCH_PATHS = [
+    "/opt/ghidra",
+    "/usr/share/ghidra",
+    "/usr/local/share/ghidra",
+    Path.home() / "ghidra",
+]
+
+
+def find_ghidra_install(hint: Path | str | None = None) -> Path | None:
+    """Find a valid Ghidra installation directory.
+
+    Resolution order:
+        1. Explicit hint (--ghidra-dir CLI flag)
+        2. GHIDRA_INSTALL_DIR environment variable
+        3. Common installation paths
+
+    A directory is valid if it contains Ghidra/application.properties.
+    """
+    def _is_valid(p: Path) -> bool:
+        return (p / "Ghidra" / "application.properties").is_file()
+
+    # 1. Explicit hint
+    if hint:
+        p = Path(hint).expanduser().resolve()
+        if _is_valid(p):
+            return p
+        logger.warning("Provided Ghidra path is not valid: %s", p)
+        return None
+
+    # 2. Environment variable
+    if env_dir := os.environ.get("GHIDRA_INSTALL_DIR"):
+        p = Path(env_dir).expanduser().resolve()
+        if _is_valid(p):
+            return p
+        logger.warning("GHIDRA_INSTALL_DIR=%s is not a valid Ghidra installation", env_dir)
+
+    # 3. Common paths
+    for candidate in _GHIDRA_SEARCH_PATHS:
+        p = Path(candidate).expanduser().resolve()
+        if _is_valid(p):
+            logger.info("Auto-detected Ghidra at %s", p)
+            return p
+
+    # 4. Glob for versioned installs in common parent dirs
+    for parent in [Path("/opt"), Path("/usr/local/share"), Path.home()]:
+        if parent.is_dir():
+            for child in sorted(parent.iterdir(), reverse=True):
+                if child.name.startswith("ghidra") and _is_valid(child):
+                    logger.info("Auto-detected Ghidra at %s", child)
+                    return child
+
+    return None
 
 
 def compute_unit_id(data: bytes) -> str:
@@ -96,11 +151,13 @@ class GhidraBackend:
         project_dir: Path | None = None,
         default_profile: AnalysisProfile = AnalysisProfile.DEFAULT,
         shared: bool = False,
+        ghidra_dir: Path | None = None,
     ):
         self.project_name = project_name
         self.project_dir = project_dir or DEFAULT_PROJECT_DIR
         self.default_profile = default_profile
         self.shared = shared
+        self.ghidra_dir = ghidra_dir
 
         # Generate session ID for isolated mode (stdio transport)
         if not shared:
@@ -123,8 +180,17 @@ class GhidraBackend:
         if self._started:
             return
 
-        logger.info("Starting PyGhidra...")
-        pyghidra.start(verbose=False)
+        install_dir = find_ghidra_install(self.ghidra_dir)
+        if install_dir is None:
+            raise RuntimeError(
+                "Ghidra installation not found. Provide it via one of:\n"
+                "  1. --ghidra-dir /path/to/ghidra  (CLI flag)\n"
+                "  2. GHIDRA_INSTALL_DIR=/path/to/ghidra  (environment variable)\n"
+                "  3. Install Ghidra to /opt/ghidra or ~/ghidra"
+            )
+
+        logger.info("Starting PyGhidra (install_dir=%s)...", install_dir)
+        pyghidra.start(verbose=False, install_dir=install_dir)
         self._started = True
 
         # Only scan existing projects if explicitly requested

@@ -1,6 +1,6 @@
 # Maintainer: Zack Fitch <zack@internetuniverse.org>
 pkgname=python-pyghidra-lite
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Token-efficient MCP server for Ghidra-based reverse engineering"
 arch=('any')
@@ -21,7 +21,7 @@ makedepends=(
     'python-hatchling'
 )
 source=("https://files.pythonhosted.org/packages/source/p/pyghidra-lite/pyghidra_lite-${pkgver}.tar.gz")
-sha256sums=('7b1ed447c81b96fa7fb9286c8eb6ccff78d0de59dabb7b39d4a831fa778ea1f8')
+sha256sums=('SKIP')
 
 build() {
     cd "pyghidra_lite-${pkgver}"

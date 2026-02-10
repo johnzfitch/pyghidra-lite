@@ -97,6 +97,7 @@ class ServerConfig:
     project_name: str = "pyghidra_lite"
     project_dir: Path | None = None
     default_profile: AnalysisProfile = AnalysisProfile.FAST
+    ghidra_dir: Path | None = None
     allow_any_path: bool = False
     allowed_paths: list[Path] = field(default_factory=list)
     shared: bool = False  # True for SSE (shared server), False for stdio (isolated)
@@ -125,6 +126,8 @@ def _load_config_from_env() -> ServerConfig:
         config.project_name = project_name
     if project_dir := os.getenv("PYGHIDRA_LITE_PROJECT_DIR"):
         config.project_dir = Path(project_dir)
+    if ghidra_dir := os.getenv("GHIDRA_INSTALL_DIR"):
+        config.ghidra_dir = Path(ghidra_dir)
     if default_profile := os.getenv("PYGHIDRA_LITE_DEFAULT_PROFILE"):
         try:
             config.default_profile = AnalysisProfile(default_profile)
@@ -145,6 +148,7 @@ def configure_server(
     project_name: str | None = None,
     project_dir: Path | None = None,
     default_profile: AnalysisProfile | None = None,
+    ghidra_dir: Path | None = None,
     allow_any_path: bool | None = None,
     allowed_paths: list[Path] | None = None,
     shared: bool | None = None,
@@ -157,6 +161,8 @@ def configure_server(
         _server_config.project_dir = project_dir
     if default_profile is not None:
         _server_config.default_profile = default_profile
+    if ghidra_dir is not None:
+        _server_config.ghidra_dir = ghidra_dir
     if allow_any_path is not None:
         _server_config.allow_any_path = allow_any_path
     if allowed_paths:
@@ -183,6 +189,7 @@ def _init_backend() -> GhidraBackend:
             project_dir=config.project_dir,
             default_profile=config.default_profile,
             shared=config.shared,
+            ghidra_dir=config.ghidra_dir,
         )
         _backend.start()
     return _backend
@@ -1506,6 +1513,8 @@ def reanalyze(binary: str, ctx: Context, profile: str = "deep", list_tools: bool
               help="Ghidra project name")
 @click.option("--project-dir", type=click.Path(path_type=Path), default=None,
               help="Project directory")
+@click.option("--ghidra-dir", type=click.Path(path_type=Path), default=None,
+              help="Ghidra installation directory (overrides GHIDRA_INSTALL_DIR env var)")
 @click.option(
     "--allow-path",
     "allow_paths",
@@ -1526,6 +1535,7 @@ def main(
     profile: str,
     project_name: str,
     project_dir: Path | None,
+    ghidra_dir: Path | None,
     allow_paths: tuple[Path, ...],
     allow_any_path: bool,
     binaries: tuple[Path, ...],
@@ -1545,6 +1555,7 @@ def main(
         project_name=project_name,
         project_dir=project_dir,
         default_profile=profile_enum,
+        ghidra_dir=ghidra_dir,
         allow_any_path=allow_any_path,
         allowed_paths=list(allow_paths),
         shared=True,

@@ -6,12 +6,12 @@
     "url": "https://github.com/johnzfitch/pyghidra-lite",
     "source": "github"
   },
-  "version": "0.1.1",
+  "version": "0.2.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "pyghidra-lite",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "transport": {
         "type": "stdio"
       },
@@ -20,7 +20,7 @@
         {
           "name": "GHIDRA_INSTALL_DIR",
           "description": "Path to Ghidra installation directory",
-          "isRequired": true
+          "isRequired": false
         }
       ]
     }
