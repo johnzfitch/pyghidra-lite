@@ -16,6 +16,6 @@ pkgbase = python-pyghidra-lite
 	depends = python-jpype1
 	depends = ghidra
 	source = https://files.pythonhosted.org/packages/source/p/pyghidra-lite/pyghidra_lite-0.2.0.tar.gz
-	sha256sums = 7b1ed447c81b96fa7fb9286c8eb6ccff78d0de59dabb7b39d4a831fa778ea1f8
+	sha256sums = 8fa85c5abeea132caf2f43f39872dc865f067e5bacac9979afca04d31d41681d
 
 pkgname = python-pyghidra-lite

@@ -21,7 +21,7 @@ makedepends=(
     'python-hatchling'
 )
 source=("https://files.pythonhosted.org/packages/source/p/pyghidra-lite/pyghidra_lite-${pkgver}.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('8fa85c5abeea132caf2f43f39872dc865f067e5bacac9979afca04d31d41681d')
 
 build() {
     cd "pyghidra_lite-${pkgver}"
