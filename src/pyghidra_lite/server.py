@@ -99,6 +99,7 @@ _backend_lock = threading.RLock()
 
 # Async job tracking for analyze_binary
 _active_jobs: dict[str, dict] = {}  # unit_id → job dict
+_active_jobs_lock: asyncio.Lock | None = None  # initialized in serve
 _worker_semaphore: asyncio.Semaphore | None = None  # initialized in serve, default 4
 
 
@@ -511,12 +512,20 @@ def _estimate_analysis_time(binary_size_bytes: int, profile: str) -> int:
 
 
 def _pid_alive(pid: int) -> bool:
-    """Check if a process is still running."""
+    """Check if a process is still running.
+
+    Returns False only if the process is confirmed dead (ProcessLookupError).
+    PermissionError means the process exists but is owned by another user - treat as alive.
+    """
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        # Process exists but we lack permission - assume it's alive
+        logger.debug(f"Cannot verify pid {pid} (permission denied), assuming alive")
+        return True
 
 
 async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
@@ -646,13 +655,26 @@ class ProjectWatcher:
     def _check_and_load(self, status_path: Path):
         try:
             status = json.loads(status_path.read_text())
-        except (json.JSONDecodeError, FileNotFoundError, OSError):
+        except (json.JSONDecodeError, FileNotFoundError, OSError) as e:
+            logger.debug(f"Ignoring invalid status file {status_path}: {e}")
             return
 
         if status.get("status") != "complete":
             return
 
+        # Validate status_path is within projects_dir (security: prevent path traversal)
+        try:
+            _ = status_path.resolve().relative_to(self.projects_dir.resolve())
+        except ValueError:
+            logger.warning(f"Status file outside projects_dir: {status_path}")
+            return
+
         unit_id = status_path.parent.name
+        # Validate unit_id format (should be 16-char hex hash, or 40-char for SHA256)
+        if not unit_id or not all(c in '0123456789abcdef' for c in unit_id.lower()):
+            logger.warning(f"Invalid unit_id format in watcher: {unit_id}")
+            return
+
         if self.backend and any(
             h.unit_id == unit_id for h in self.backend.programs.values()
         ):
@@ -941,8 +963,13 @@ async def analyze_binary(
         project_dir = Path(config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
 
         # Case 1: Already loaded in memory
-        if unit_id in {h.unit_id for h in _backend.programs.values()}:
-            handle = next(h for h in _backend.programs.values() if h.unit_id == unit_id)
+        handle = None
+        for h in _backend.programs.values():
+            if h.unit_id == unit_id:
+                handle = h
+                break
+
+        if handle:
             caps = _ensure_capabilities(handle)
             results.append({
                 "unit_id": unit_id,
@@ -1031,8 +1058,13 @@ async def analysis_status(
     results = []
     for uid in ids:
         # Already loaded in memory
-        if uid in {h.unit_id for h in _backend.programs.values()}:
-            handle = next(h for h in _backend.programs.values() if h.unit_id == uid)
+        handle = None
+        for h in _backend.programs.values():
+            if h.unit_id == uid:
+                handle = h
+                break
+
+        if handle:
             caps = _ensure_capabilities(handle)
             results.append({
                 "unit_id": uid,
@@ -1096,13 +1128,19 @@ async def cancel_analysis(unit_id: str, ctx: Context) -> dict:
     if pid:
         try:
             os.kill(pid, signal.SIGTERM)
-            await asyncio.sleep(5)
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            # Wait up to 5 seconds for graceful termination
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                if not _pid_alive(pid):
+                    break
+            else:
+                # Process still alive after 5s - force kill
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         except ProcessLookupError:
-            pass
+            pass  # Already dead
 
     _active_jobs.pop(unit_id, None)
     _write_status_file(unit_id, {"status": "cancelled"})
@@ -2132,12 +2170,13 @@ def serve_cmd(
     binaries: tuple[Path, ...],
 ):
     """Start the MCP server (default when no subcommand given)."""
-    global _backend, _worker_semaphore
+    global _backend, _worker_semaphore, _active_jobs_lock
 
     if transport != "stdio":
         raise click.ClickException("SSE transport is disabled. Use --transport stdio.")
 
     _worker_semaphore = asyncio.Semaphore(max_workers)
+    _active_jobs_lock = asyncio.Lock()
 
     logger.info(f"pyghidra-lite v{__version__} (profile={profile}, transport={transport})")
 
