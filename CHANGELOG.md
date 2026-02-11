@@ -5,6 +5,31 @@ All notable changes to pyghidra-lite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-02-10
+
+### Added
+- **Async binary analysis**: `analyze_binary` MCP tool returns in <1s, runs analysis in isolated subprocess workers
+- **Analysis polling**: `analysis_status` MCP tool for progress tracking with auto-hot-loading on completion
+- **Job cancellation**: `cancel_analysis` MCP tool to kill in-progress analysis workers
+- **CLI subcommands**: `pyghidra-lite import` (offline batch analysis), `pyghidra-lite list` (inspect cached projects), `pyghidra-lite serve` (MCP server, backward-compatible default)
+- **Filesystem watcher**: hot-loads completed analyses into running server via watchdog
+- **Crash recovery**: detects stale/dead workers on startup, periodic background monitor
+- **Time estimation**: per-profile analysis time estimates with self-calibration logging
+- **Worker isolation**: subprocess workers with auto-sized JVM heap (2-8GB based on binary size)
+- `--max-workers` flag to control concurrent analysis workers (default 4)
+- `--jvm-heap` flag on import subcommand for manual heap control
+- `--status-file` flag for subprocess worker progress reporting
+- `list_binaries` now shows in-progress jobs and on-disk projects from previous runs
+
+### Changed
+- `_capabilities` dict now keyed by `unit_id` instead of program name (fixes name collision bugs)
+- `_init_program_handle` accepts optional `unit_id` parameter (avoids wasteful recomputation)
+- `import_binary` detects previously-analyzed projects and skips redundant re-analysis
+- `import_binary` MCP tool marked as deprecated in favor of `analyze_binary`
+
+### Dependencies
+- Added `watchdog>=3.0.0` for filesystem event monitoring
+
 ## [0.2.0] - 2026-02-09
 
 ### Added
@@ -51,6 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Path allowlist prevents unauthorized file access
 - Per-binary project isolation
 
+[0.3.0]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.3.0
 [0.2.0]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.2.0
 [0.1.1]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.1.1
 [0.1.0]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.1.0

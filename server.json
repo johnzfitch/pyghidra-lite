@@ -6,12 +6,12 @@
     "url": "https://github.com/johnzfitch/pyghidra-lite",
     "source": "github"
   },
-  "version": "0.2.0",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "pyghidra-lite",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "transport": {
         "type": "stdio"
       },

@@ -1,6 +1,6 @@
 # Maintainer: Zack Fitch <zack@internetuniverse.org>
 pkgname=python-pyghidra-lite
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Token-efficient MCP server for Ghidra-based reverse engineering"
 arch=('any')
@@ -13,6 +13,7 @@ depends=(
     'python-pydantic'
     'python-click'
     'python-jpype1'
+    'python-watchdog'
     'ghidra'
 )
 makedepends=(

@@ -2352,12 +2352,21 @@ class AnalysisProgressListener:
         })
 
     def complete(self, functions: int, capabilities: list[str]):
+        actual = int(time.time() - self.started)
         self._write({
             "status": "complete",
             "functions": functions,
             "capabilities": capabilities,
-            "duration_seconds": int(time.time() - self.started),
+            "duration_seconds": actual,
         })
+        # Self-calibration: log estimation accuracy for future tuning
+        estimated = _estimate_analysis_time(self.binary_size, self.profile)
+        ratio = actual / max(estimated, 1)
+        logger.info(
+            f"Estimation accuracy: {ratio:.2f}x "
+            f"(actual={actual}s est={estimated}s "
+            f"size={self.binary_size / 1024 / 1024:.1f}MB profile={self.profile})"
+        )
 
     def error(self, error: str, phase: str):
         self._write({

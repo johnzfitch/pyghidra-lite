@@ -1,6 +1,6 @@
 pkgbase = python-pyghidra-lite
 	pkgdesc = Token-efficient MCP server for Ghidra-based reverse engineering
-	pkgver = 0.2.0
+	pkgver = 0.3.0
 	pkgrel = 1
 	url = https://github.com/johnzfitch/pyghidra-lite
 	arch = any
@@ -14,8 +14,9 @@ pkgbase = python-pyghidra-lite
 	depends = python-pydantic
 	depends = python-click
 	depends = python-jpype1
+	depends = python-watchdog
 	depends = ghidra
-	source = https://files.pythonhosted.org/packages/source/p/pyghidra-lite/pyghidra_lite-0.2.0.tar.gz
+	source = https://files.pythonhosted.org/packages/source/p/pyghidra-lite/pyghidra_lite-0.3.0.tar.gz
 	sha256sums = 8fa85c5abeea132caf2f43f39872dc865f067e5bacac9979afca04d31d41681d
 
 pkgname = python-pyghidra-lite
