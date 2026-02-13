@@ -222,10 +222,19 @@ class GhidraBackend:
         except Exception as e:
             if "LockException" in str(type(e).__name__) or "Unable to lock" in str(e):
                 lock_file = project_path / f"{unit_id}.lock"
-                raise RuntimeError(
-                    f"Binary {unit_id} is locked by another process.\n"
-                    f"Either stop the other process or delete: {lock_file}"
-                ) from e
+                logger.warning(f"Stale lock detected for {unit_id}, removing: {lock_file}")
+                lock_file.unlink(missing_ok=True)
+                try:
+                    if locator.exists():
+                        return GhidraProject.openProject(project_str, unit_id, True)
+                    else:
+                        return GhidraProject.createProject(project_str, unit_id, False)
+                except Exception as retry_e:
+                    raise RuntimeError(
+                        f"Binary {unit_id} still locked after removing stale lock.\n"
+                        f"Original: {e}\nRetry: {retry_e}\n"
+                        f"Try manually deleting: {lock_file}"
+                    ) from retry_e
             raise
 
     def _scan_existing_projects(self) -> None:
