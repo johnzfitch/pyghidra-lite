@@ -498,6 +498,12 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
     except Exception as e:
         logger.warning(f"Failed to start filesystem watcher: {e}")
 
+    # Clean stale Ghidra lock files from previous sessions
+    for lock in projects_dir.glob("*/*.lock"):
+        lock.unlink(missing_ok=True)
+    for lock in projects_dir.glob("*/*.lock~"):
+        lock.unlink(missing_ok=True)
+
     # Recover any in-progress jobs from previous server run
     await _recover_in_progress_jobs()
 
