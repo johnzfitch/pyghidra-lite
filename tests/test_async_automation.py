@@ -128,10 +128,20 @@ class TestPhase1CLI:
         params = {p.name for p in server.import_cmd.params}
         assert "status_file" in params
 
+    def test_import_cmd_has_runtime_home(self):
+        """import should accept --runtime-home."""
+        params = {p.name for p in server.import_cmd.params}
+        assert "runtime_home" in params
+
     def test_serve_cmd_has_max_workers(self):
         """serve should accept --max-workers."""
         params = {p.name for p in server.serve_cmd.params}
         assert "max_workers" in params
+
+    def test_serve_cmd_has_runtime_home(self):
+        """serve should accept --runtime-home."""
+        params = {p.name for p in server.serve_cmd.params}
+        assert "runtime_home" in params
 
     def test_list_cmd_empty(self, tmp_path):
         """list on empty dir should report no binaries."""

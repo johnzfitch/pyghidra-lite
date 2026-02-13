@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import shlex
 import sys
 import threading
 import time
@@ -110,6 +111,7 @@ class ServerConfig:
     project_dir: Path | None = None
     default_profile: AnalysisProfile = AnalysisProfile.FAST
     ghidra_dir: Path | None = None
+    runtime_home: Path | None = None
     allow_any_path: bool = False
     allowed_paths: list[Path] = field(default_factory=list)
     shared: bool = False  # True for SSE (shared server), False for stdio (isolated)
@@ -132,6 +134,50 @@ def _parse_bool(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _split_jvm_options(value: str) -> list[str]:
+    """Best-effort split for JVM option environment variables."""
+    raw = value.strip()
+    if not raw:
+        return []
+    try:
+        return shlex.split(raw)
+    except ValueError:
+        return raw.split()
+
+
+def _upsert_jvm_option(env_var: str, prefix: str, option: str) -> None:
+    """Insert or replace a JVM option in an env var while preserving other flags."""
+    options = _split_jvm_options(os.environ.get(env_var, ""))
+    options = [existing for existing in options if not existing.startswith(prefix)]
+    options.append(option)
+    os.environ[env_var] = " ".join(options)
+
+
+def _ensure_runtime_environment(project_dir: Path | None, runtime_home: Path | None) -> Path:
+    """Ensure Ghidra runtime state is kept in a writable, process-local location."""
+    base = runtime_home or ((project_dir or DEFAULT_PROJECT_DIR) / ".runtime-home")
+    resolved_home = base.expanduser().resolve()
+    resolved_home.mkdir(parents=True, exist_ok=True)
+
+    config_home = resolved_home / ".config"
+    cache_home = resolved_home / ".cache"
+    config_home.mkdir(parents=True, exist_ok=True)
+    cache_home.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("XDG_CONFIG_HOME", str(config_home))
+    os.environ.setdefault("XDG_CACHE_HOME", str(cache_home))
+
+    user_home_opt = f"-Duser.home={resolved_home}"
+    for env_var in ("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS"):
+        options = _split_jvm_options(os.environ.get(env_var, ""))
+        if any(opt.startswith("-Duser.home=") for opt in options):
+            continue
+        options.append(user_home_opt)
+        os.environ[env_var] = " ".join(options)
+
+    return resolved_home
+
+
 def _load_config_from_env() -> ServerConfig:
     config = ServerConfig()
     if project_name := os.getenv("PYGHIDRA_LITE_PROJECT_NAME"):
@@ -140,6 +186,8 @@ def _load_config_from_env() -> ServerConfig:
         config.project_dir = Path(project_dir)
     if ghidra_dir := os.getenv("GHIDRA_INSTALL_DIR"):
         config.ghidra_dir = Path(ghidra_dir)
+    if runtime_home := os.getenv("PYGHIDRA_LITE_RUNTIME_HOME"):
+        config.runtime_home = Path(runtime_home)
     if default_profile := os.getenv("PYGHIDRA_LITE_DEFAULT_PROFILE"):
         try:
             config.default_profile = AnalysisProfile(default_profile)
@@ -161,6 +209,7 @@ def configure_server(
     project_dir: Path | None = None,
     default_profile: AnalysisProfile | None = None,
     ghidra_dir: Path | None = None,
+    runtime_home: Path | None = None,
     allow_any_path: bool | None = None,
     allowed_paths: list[Path] | None = None,
     shared: bool | None = None,
@@ -175,6 +224,8 @@ def configure_server(
         _server_config.default_profile = default_profile
     if ghidra_dir is not None:
         _server_config.ghidra_dir = ghidra_dir
+    if runtime_home is not None:
+        _server_config.runtime_home = runtime_home
     if allow_any_path is not None:
         _server_config.allow_any_path = allow_any_path
     if allowed_paths:
@@ -202,6 +253,9 @@ def _init_backend(eager_load: bool = False) -> GhidraBackend:
     global _backend
     if _backend is None:
         config = _server_config
+        resolved_runtime_home = _ensure_runtime_environment(config.project_dir, config.runtime_home)
+        config.runtime_home = resolved_runtime_home
+        logger.info("Using runtime home: %s", resolved_runtime_home)
         _backend = GhidraBackend(
             project_name=config.project_name,
             project_dir=config.project_dir,
@@ -215,7 +269,8 @@ def _init_backend(eager_load: bool = False) -> GhidraBackend:
 
 def _resolve_import_path(path: str) -> Path:
     """Resolve and enforce allowlist policy for imports."""
-    resolved = Path(path).expanduser().resolve()
+    requested = Path(path).expanduser()
+    resolved = requested.resolve()
     config = _server_config
     if config.allow_any_path:
         return resolved
@@ -229,6 +284,12 @@ def _resolve_import_path(path: str) -> Path:
         except ValueError:
             continue
     roots = ", ".join(str(root) for root in allowed_roots)
+    if requested != resolved:
+        raise ValueError(
+            f"Path not allowed: requested={requested}, resolves_to={resolved}. "
+            f"Allowed: {roots}. If this is an intentional symlink, add an allow root "
+            f"for the resolved target with --allow-path."
+        )
     raise ValueError(f"Path not allowed: {resolved}. Allowed: {roots}")
 
 
@@ -552,21 +613,28 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
 
         if _server_config.ghidra_dir:
             cmd.extend(["--ghidra-dir", str(_server_config.ghidra_dir)])
+        if _server_config.runtime_home:
+            cmd.extend(["--runtime-home", str(_server_config.runtime_home)])
 
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
             job["pid"] = proc.pid
 
-            returncode = await proc.wait()
+            _stdout, stderr_bytes = await proc.communicate()
+            returncode = proc.returncode if proc.returncode is not None else -1
 
             if returncode == 0:
                 job["status"] = "complete"
             else:
-                stderr = (await proc.stderr.read()).decode()
+                stderr = (stderr_bytes or b"").decode(errors="replace")
+                if not stderr:
+                    # Fallback: worker may have recorded error in status file.
+                    status_data = _read_status_file(unit_id)
+                    stderr = str(status_data.get("error", "Worker exited with non-zero status"))
                 job["status"] = "error"
                 job["error"] = stderr[-500:]
 
@@ -638,6 +706,7 @@ class ProjectWatcher:
         self.backend = backend
         self.projects_dir = projects_dir
         self.loop = loop
+        self._pending_hot_loads: set[str] = set()
 
     def on_moved(self, event):
         """Catch atomic rename: .tmp -> .analysis_status."""
@@ -653,8 +722,18 @@ class ProjectWatcher:
         self._check_and_load(path)
 
     def _check_and_load(self, status_path: Path):
+        # Validate status_path is within projects_dir before any read
+        # (prevents following symlinks outside projects root).
         try:
-            status = json.loads(status_path.read_text())
+            resolved_status = status_path.resolve()
+            resolved_root = self.projects_dir.resolve()
+            _ = resolved_status.relative_to(resolved_root)
+        except (ValueError, FileNotFoundError, OSError):
+            logger.warning(f"Status file outside projects_dir: {status_path}")
+            return
+
+        try:
+            status = json.loads(resolved_status.read_text())
         except (json.JSONDecodeError, FileNotFoundError, OSError) as e:
             logger.debug(f"Ignoring invalid status file {status_path}: {e}")
             return
@@ -662,28 +741,39 @@ class ProjectWatcher:
         if status.get("status") != "complete":
             return
 
-        # Validate status_path is within projects_dir (security: prevent path traversal)
-        try:
-            _ = status_path.resolve().relative_to(self.projects_dir.resolve())
-        except ValueError:
-            logger.warning(f"Status file outside projects_dir: {status_path}")
-            return
-
-        unit_id = status_path.parent.name
+        unit_id = resolved_status.parent.name
         # Validate unit_id format (should be 16-char hex hash, or 40-char for SHA256)
         if not unit_id or not all(c in '0123456789abcdef' for c in unit_id.lower()):
             logger.warning(f"Invalid unit_id format in watcher: {unit_id}")
             return
 
-        if self.backend and any(
-            h.unit_id == unit_id for h in self.backend.programs.values()
-        ):
-            return  # Already loaded
+        with _backend_lock:
+            if self.backend and any(
+                h.unit_id == unit_id for h in list(self.backend.programs.values())
+            ):
+                return  # Already loaded
 
-        self.loop.call_soon_threadsafe(
-            asyncio.ensure_future,
-            self._async_hot_load(unit_id)
-        )
+        if unit_id in self._pending_hot_loads:
+            return
+
+        self._pending_hot_loads.add(unit_id)
+        try:
+            # Schedule callback first; create coroutine/task on event loop thread.
+            self.loop.call_soon_threadsafe(self._schedule_hot_load, unit_id)
+        except RuntimeError as e:
+            self._pending_hot_loads.discard(unit_id)
+            logger.debug(f"Failed to schedule hot-load for {unit_id}: {e}")
+
+    def _schedule_hot_load(self, unit_id: str) -> None:
+        if self.loop.is_closed():
+            self._pending_hot_loads.discard(unit_id)
+            return
+        try:
+            task = asyncio.create_task(self._async_hot_load(unit_id))
+            task.add_done_callback(lambda _t: self._pending_hot_loads.discard(unit_id))
+        except RuntimeError as e:
+            self._pending_hot_loads.discard(unit_id)
+            logger.debug(f"Failed to create hot-load task for {unit_id}: {e}")
 
     async def _async_hot_load(self, unit_id: str):
         try:
@@ -691,6 +781,8 @@ class ProjectWatcher:
             logger.info(f"Watcher hot-loaded {unit_id}")
         except Exception as e:
             logger.error(f"Watcher failed to hot-load {unit_id}: {e}")
+        finally:
+            self._pending_hot_loads.discard(unit_id)
 
 
 def start_project_watcher(
@@ -737,8 +829,9 @@ async def _recover_in_progress_jobs():
             continue
 
         uid = entry.name
-        if _backend and any(h.unit_id == uid for h in _backend.programs.values()):
-            continue  # Already loaded by eager_load
+        with _backend_lock:
+            if _backend and any(h.unit_id == uid for h in list(_backend.programs.values())):
+                continue  # Already loaded by eager_load
 
         try:
             status = json.loads(status_file.read_text())
@@ -964,7 +1057,9 @@ async def analyze_binary(
 
         # Case 1: Already loaded in memory
         handle = None
-        for h in _backend.programs.values():
+        with _backend_lock:
+            loaded_handles = list(_backend.programs.values()) if _backend else []
+        for h in loaded_handles:
             if h.unit_id == unit_id:
                 handle = h
                 break
@@ -1059,7 +1154,9 @@ async def analysis_status(
     for uid in ids:
         # Already loaded in memory
         handle = None
-        for h in _backend.programs.values():
+        with _backend_lock:
+            loaded_handles = list(_backend.programs.values()) if _backend else []
+        for h in loaded_handles:
             if h.unit_id == uid:
                 handle = h
                 break
@@ -1079,7 +1176,18 @@ async def analysis_status(
         # Read status file from disk
         raw = _read_status_file(uid)
         if not raw:
-            results.append({"unit_id": uid, "status": "not_found"})
+            # If worker has been queued but has not yet written status to disk,
+            # fall back to in-memory job state for immediate polling feedback.
+            job = _active_jobs.get(uid)
+            if job:
+                results.append({
+                    "unit_id": uid,
+                    "binary_name": job.get("binary_name", uid),
+                    "status": job.get("status", "unknown"),
+                    "eta_sec": job.get("eta_sec"),
+                })
+            else:
+                results.append({"unit_id": uid, "status": "not_found"})
             continue
 
         # Auto hot-load on completion
@@ -2142,6 +2250,13 @@ def cli():
 @click.option("--ghidra-dir", type=click.Path(path_type=Path), default=None,
               help="Ghidra installation directory (overrides GHIDRA_INSTALL_DIR env var)")
 @click.option(
+    "--runtime-home",
+    type=click.Path(path_type=Path),
+    default=None,
+    envvar="PYGHIDRA_LITE_RUNTIME_HOME",
+    help="Directory used for Ghidra runtime state (JAVA user.home and XDG fallback).",
+)
+@click.option(
     "--allow-path",
     "allow_paths",
     type=click.Path(path_type=Path),
@@ -2155,6 +2270,11 @@ def cli():
 )
 @click.option("--max-workers", type=int, default=4,
               help="Max concurrent analysis workers (default 4).")
+@click.option(
+    "--eager-load/--no-eager-load",
+    default=False,
+    help="Load all cached projects at startup (slower startup, higher memory).",
+)
 @click.argument("binaries", nargs=-1, type=click.Path(exists=True, path_type=Path))
 def serve_cmd(
     transport: str,
@@ -2164,9 +2284,11 @@ def serve_cmd(
     project_name: str,
     project_dir: Path | None,
     ghidra_dir: Path | None,
+    runtime_home: Path | None,
     allow_paths: tuple[Path, ...],
     allow_any_path: bool,
     max_workers: int,
+    eager_load: bool,
     binaries: tuple[Path, ...],
 ):
     """Start the MCP server (default when no subcommand given)."""
@@ -2186,12 +2308,13 @@ def serve_cmd(
         project_dir=project_dir,
         default_profile=profile_enum,
         ghidra_dir=ghidra_dir,
+        runtime_home=runtime_home,
         allow_any_path=allow_any_path,
         allowed_paths=list(allow_paths),
         shared=True,
     )
     with _backend_lock:
-        _backend = _init_backend(eager_load=True)
+        _backend = _init_backend(eager_load=eager_load)
 
     # Detect capabilities for all pre-loaded (eager-loaded) binaries
     for prog_name in _backend.list_programs():
@@ -2235,18 +2358,28 @@ def serve_cmd(
 @click.option("--project-dir", type=click.Path(path_type=Path),
               default=DEFAULT_PROJECT_DIR, envvar="PYGHIDRA_LITE_PROJECT_DIR",
               help="Project directory")
+@click.option(
+    "--runtime-home",
+    type=click.Path(path_type=Path),
+    default=None,
+    envvar="PYGHIDRA_LITE_RUNTIME_HOME",
+    help="Directory used for Ghidra runtime state (JAVA user.home and XDG fallback).",
+)
 @click.option("--status-file", is_flag=True,
               help="Write progress to .analysis_status (for subprocess workers)")
 @click.option("--jvm-heap", default=None,
               help="JVM max heap (e.g. '4g'). Auto-sized if not set.")
-def import_cmd(binaries, profile, ghidra_dir, project_dir, status_file, jvm_heap):
+def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, status_file, jvm_heap):
     """Import and analyze binaries offline. No MCP server started."""
     if not binaries:
         click.echo("No binaries specified.", err=True)
         raise SystemExit(1)
 
+    resolved_runtime_home = _ensure_runtime_environment(project_dir, runtime_home)
+    logger.info("Using runtime home: %s", resolved_runtime_home)
+
     if jvm_heap:
-        os.environ["_JAVA_OPTIONS"] = f"-Xmx{jvm_heap}"
+        _upsert_jvm_option("_JAVA_OPTIONS", "-Xmx", f"-Xmx{jvm_heap}")
 
     profile_enum = AnalysisProfile(profile)
 
