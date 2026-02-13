@@ -896,27 +896,35 @@ def _do_import_blocking(
     analyze: bool,
     tracker: ProgressTracker,
 ) -> tuple:
-    """Blocking import operation (runs in thread pool)."""
+    """Blocking import operation (runs in thread pool).
+
+    Lock scope is minimised: we hold _backend_lock only for the fast
+    import_binary() call (which mutates backend.programs), then release
+    it before the potentially long-running analyzeAll() so other MCP
+    tool calls aren't blocked for the entire analysis duration.
+    """
     tracker.update(10, "Loading file")
 
+    # Hold lock only for the import (mutates shared state)
     with _backend_lock:
         backend = get_backend()
         tracker.update(20, "Importing to Ghidra")
-
-        # Import without analysis first so we can report progress
         handle = backend.import_binary(p, profile_enum, analyze=False)
-        tracker.update(40, "Import complete")
 
-        if analyze:
-            tracker.update(50, "Analyzing")
-            backend.analyze_program(handle.name, profile_enum)
-            tracker.update(85, "Analysis complete")
+    tracker.update(40, "Import complete")
 
-        tracker.update(90, "Detecting capabilities")
-        caps = _ensure_capabilities(handle)
-        tracker.update(100, "Complete")
+    # Analysis runs outside the lock — analyzeAll() operates on a
+    # per-program transaction and doesn't need the global lock.
+    if analyze:
+        tracker.update(50, "Analyzing")
+        backend.analyze_program(handle.name, profile_enum)
+        tracker.update(85, "Analysis complete")
 
-        return handle, caps
+    tracker.update(90, "Detecting capabilities")
+    caps = _ensure_capabilities(handle)
+    tracker.update(100, "Complete")
+
+    return handle, caps
 
 
 @mcp.tool()
