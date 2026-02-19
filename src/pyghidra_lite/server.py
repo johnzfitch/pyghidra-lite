@@ -4,6 +4,8 @@ import asyncio
 import logging
 import os
 import shlex
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -27,6 +29,7 @@ from pyghidra_lite.backend import (
     DEFAULT_PROJECT_DIR,
     GhidraBackend,
     compute_unit_id_streaming,
+    find_ghidra_install,
 )
 from pyghidra_lite.models import (
     AnalysisProfile,
@@ -246,6 +249,49 @@ def _require_backend():
     """Raise McpError if backend not initialized."""
     if _backend is None:
         raise McpError(ErrorData(code=INTERNAL_ERROR, message="Backend not initialized"))
+
+
+def _check_prerequisites(ghidra_dir: str | None) -> None:
+    """Verify Java 21+ and Ghidra are available before starting the backend."""
+    # Check Java is on PATH
+    java_path = shutil.which("java")
+    if not java_path:
+        raise click.ClickException(
+            "Java not found. Ghidra requires JDK 21+. "
+            "Install: brew install openjdk@21 (macOS) / apt install openjdk-21-jdk (Ubuntu)"
+        )
+
+    # Parse java version from stderr
+    try:
+        result = subprocess.run(
+            ["java", "-version"], capture_output=True, text=True, timeout=10
+        )
+        version_output = result.stderr + result.stdout
+    except Exception as exc:
+        raise click.ClickException(f"Failed to run 'java -version': {exc}")
+
+    import re
+    match = re.search(r'"(\d+)', version_output)
+    if not match:
+        raise click.ClickException(
+            f"Could not parse Java version from: {version_output.strip()}"
+        )
+    major = int(match.group(1))
+    if major < 21:
+        raise click.ClickException(
+            f"Java {major} found, but Ghidra requires JDK 21+. "
+            "Install: brew install openjdk@21 (macOS) / apt install openjdk-21-jdk (Ubuntu)"
+        )
+
+    # Check Ghidra installation
+    ghidra_path = find_ghidra_install(ghidra_dir)
+    if ghidra_path is None:
+        raise click.ClickException(
+            "Ghidra installation not found. Set GHIDRA_INSTALL_DIR or install Ghidra to "
+            "/opt/ghidra or ~/ghidra. Download from https://ghidra-sre.org"
+        )
+
+    logger.info(f"Prerequisites OK: Java {major}, Ghidra at {ghidra_path}")
 
 
 def _init_backend(eager_load: bool = False) -> GhidraBackend:
@@ -2327,6 +2373,7 @@ def serve_cmd(
         allowed_paths=list(allow_paths),
         shared=True,
     )
+    _check_prerequisites(ghidra_dir)
     with _backend_lock:
         _backend = _init_backend(eager_load=eager_load)
 
