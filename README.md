@@ -84,7 +84,42 @@ pip install -e .
 
 ## MCP Configuration
 
-### Basic (allow specific paths)
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "pyghidra-lite": {
+      "command": "uvx",
+      "args": ["pyghidra-lite", "serve", "--allow-path", "~"]
+    }
+  }
+}
+```
+
+`uvx` auto-installs pyghidra-lite from PyPI on first run. Ghidra is auto-detected; set `GHIDRA_INSTALL_DIR` in `env` if needed:
+
+```json
+{
+  "mcpServers": {
+    "pyghidra-lite": {
+      "command": "uvx",
+      "args": ["pyghidra-lite", "serve", "--allow-path", "~"],
+      "env": {
+        "GHIDRA_INSTALL_DIR": "/path/to/ghidra"
+      }
+    }
+  }
+}
+```
+
+### Claude Code
+
+Create `.mcp.json` in your project (or `~/.claude.json` for global):
+
+#### Basic (allow specific paths)
 
 ```json
 {
@@ -97,7 +132,7 @@ pip install -e .
 }
 ```
 
-### With explicit Ghidra path
+#### With explicit Ghidra path
 
 ```json
 {
@@ -114,7 +149,7 @@ pip install -e .
 }
 ```
 
-### Multiple paths
+#### Multiple paths
 
 ```json
 {
@@ -131,7 +166,7 @@ pip install -e .
 }
 ```
 
-### Allow any path (development only)
+#### Allow any path (development only)
 
 ```json
 {
