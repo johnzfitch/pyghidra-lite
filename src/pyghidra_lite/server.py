@@ -101,6 +101,9 @@ _backend: GhidraBackend | None = None
 _capabilities: dict[str, BinaryCapabilities] = {}
 _backend_lock = threading.RLock()
 
+# Binaries above this threshold are auto-delegated to async analysis in import_binary
+_LARGE_BINARY_MB = 10
+
 # Async job tracking for analyze_binary
 _active_jobs: dict[str, dict] = {}  # unit_id → job dict
 _active_jobs_lock: asyncio.Lock | None = None  # initialized in serve
@@ -987,16 +990,17 @@ async def import_binary(
     analyze: bool = True,
     list_tools: bool = False,
 ) -> dict:
-    """[Deprecated: use analyze_binary for non-blocking analysis]
-    Import and analyze a binary file. Blocks until analysis completes.
+    """Import and analyze a binary file.
 
-    For large binaries this may time out. Prefer analyze_binary() which returns
-    immediately and runs analysis in an isolated subprocess.
+    For binaries under 10MB, blocks until analysis completes and returns results.
+    For binaries 10MB and above, automatically delegates to async analysis:
+    returns immediately with a unit_id and eta_sec so the agent can poll
+    analysis_status() without hitting MCP timeouts.
 
     Args:
         path: Path to binary file.
         profile: Analysis depth - "fast" (default), "default", or "deep".
-        analyze: Run analysis (set False for large binaries to avoid timeout).
+        analyze: Run analysis (set False to import without analyzing).
         list_tools: Include available_tools list (default False, saves tokens).
     """
     try:
@@ -1019,6 +1023,84 @@ async def import_binary(
 
     kind = detect_binary_kind(p, header)
     file_size_mb = p.stat().st_size / (1024 * 1024)
+
+    # Auto-delegate large binaries to async analysis to avoid MCP timeouts.
+    if analyze and file_size_mb >= _LARGE_BINARY_MB:
+        _require_backend()
+        unit_id = compute_unit_id_streaming(p)
+
+        # Already loaded in memory?
+        with _backend_lock:
+            loaded_handles = list(_backend.programs.values()) if _backend else []
+        for h in loaded_handles:
+            if h.unit_id == unit_id:
+                caps = _ensure_capabilities(h)
+                return {
+                    "unit_id": unit_id,
+                    "binary_name": p.name,
+                    "kind": kind,
+                    "status": "ready",
+                    "functions": h.program.getFunctionManager().getFunctionCount(),
+                    "capabilities": _format_capabilities(caps),
+                }
+
+        # Already in progress?
+        if unit_id in _active_jobs:
+            job = _active_jobs[unit_id]
+            return {
+                "unit_id": unit_id,
+                "binary_name": p.name,
+                "status": job.get("status", "analyzing"),
+                "eta_sec": job.get("eta_sec"),
+                "message": (
+                    f"Analysis in progress ({file_size_mb:.0f}MB). "
+                    f"Poll with analysis_status(unit_ids=['{unit_id}'])"
+                ),
+            }
+
+        # Check disk: already analyzed by a previous import run?
+        project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+        gpr = project_dir / unit_id / f"{unit_id}.gpr"
+        status_file = project_dir / unit_id / ".analysis_status"
+        if gpr.exists() and status_file.exists():
+            try:
+                status_data = json.loads(status_file.read_text())
+                if status_data.get("status") == "complete":
+                    return {
+                        "unit_id": unit_id,
+                        "binary_name": p.name,
+                        "kind": kind,
+                        "status": "ready",
+                        "functions": status_data.get("functions"),
+                        "capabilities": status_data.get("capabilities", []),
+                        "note": "on_disk, will load on first query",
+                    }
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Spawn async worker subprocess.
+        estimated = _estimate_analysis_time(p.stat().st_size, profile)
+        job: dict = {
+            "unit_id": unit_id,
+            "binary_name": p.name,
+            "status": "queued",
+            "eta_sec": estimated,
+            "profile": profile,
+            "pid": None,
+        }
+        _active_jobs[unit_id] = job
+        asyncio.create_task(_run_worker(p, unit_id, profile, job))
+        return {
+            "unit_id": unit_id,
+            "binary_name": p.name,
+            "kind": kind,
+            "status": "queued",
+            "eta_sec": estimated,
+            "message": (
+                f"Binary is {file_size_mb:.0f}MB; analysis runs in background. "
+                f"Poll with analysis_status(unit_ids=['{unit_id}'])"
+            ),
+        }
 
     logger.info(f"Importing {p.name} ({kind}, {file_size_mb:.1f}MB) with profile={profile_enum.value}")
 
@@ -2426,11 +2508,9 @@ def serve_cmd(
     envvar="PYGHIDRA_LITE_RUNTIME_HOME",
     help="Directory used for Ghidra runtime state (JAVA user.home and XDG fallback).",
 )
-@click.option("--status-file", is_flag=True,
-              help="Write progress to .analysis_status (for subprocess workers)")
 @click.option("--jvm-heap", default=None,
               help="JVM max heap (e.g. '4g'). Auto-sized if not set.")
-def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, status_file, jvm_heap):
+def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_heap):
     """Import and analyze binaries offline. No MCP server started."""
     if not binaries:
         click.echo("No binaries specified.", err=True)
@@ -2457,19 +2537,23 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, status_
         unit_id = compute_unit_id_streaming(path)
         project_dir_path = Path(project_dir) / unit_id
 
-        listener = None
-        if status_file:
-            status_path = project_dir_path / ".analysis_status"
-            status_path.parent.mkdir(parents=True, exist_ok=True)
-            listener = AnalysisProgressListener(
-                status_path, path.name, profile, path.stat().st_size
-            )
+        # Always write .analysis_status so MCP analyze_binary can recognise
+        # pre-analyzed binaries on disk and skip re-analysis.
+        status_path = project_dir_path / ".analysis_status"
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        listener = AnalysisProgressListener(
+            status_path, path.name, profile, path.stat().st_size
+        )
 
         try:
-            if listener:
-                listener.set_phase("importing")
+            listener.set_phase("importing")
 
-            handle = backend.import_binary(path, profile_enum, analyze=True)
+            def _on_progress(func_count: int) -> None:
+                listener.set_progress(func_count, func_count + 1000, "analyzing")
+
+            handle = backend.import_binary(
+                path, profile_enum, analyze=True, on_progress=_on_progress
+            )
 
             caps = detect_capabilities(handle)
             cap_list = []
@@ -2480,21 +2564,18 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, status_
             if caps.has_hermes: cap_list.append("Hermes")
 
             func_count = handle.program.getFunctionManager().getFunctionCount()
+            listener.complete(func_count, cap_list)
 
-            if handle.analyzed and not listener:
-                # Re-opened existing project, analysis was skipped
+            if handle.was_preexisting:
                 click.echo(f"  {path.name}: already analyzed "
                            f"(unit_id={unit_id}, {func_count} functions)")
             else:
-                if listener:
-                    listener.complete(func_count, cap_list)
                 click.echo(f"  {path.name}: {func_count} functions, "
                            f"[{', '.join(cap_list) or 'generic'}] "
                            f"(unit_id={unit_id}, profile={profile})")
 
         except Exception as e:
-            if listener:
-                listener.error(str(e), "import")
+            listener.error(str(e), "import")
             click.echo(f"  {path.name}: ERROR - {e}", err=True)
 
     backend.close()

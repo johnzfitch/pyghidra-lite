@@ -123,10 +123,12 @@ class TestPhase1CLI:
         params = {p.name for p in server.import_cmd.params}
         assert "jvm_heap" in params
 
-    def test_import_cmd_has_status_file(self):
-        """import should accept --status-file."""
+    def test_import_cmd_always_writes_status(self):
+        """import always writes .analysis_status; --status-file flag is gone."""
         params = {p.name for p in server.import_cmd.params}
-        assert "status_file" in params
+        assert "status_file" not in params, (
+            "--status-file was removed: status is always written"
+        )
 
     def test_import_cmd_has_runtime_home(self):
         """import should accept --runtime-home."""
@@ -547,11 +549,11 @@ class TestMCPToolRegistration:
         tools = server.mcp._tool_manager._tools
         assert "cancel_analysis" in tools
 
-    def test_import_binary_deprecated(self):
-        """import_binary docstring should mention deprecated."""
+    def test_import_binary_auto_delegates(self):
+        """import_binary docstring should describe large-file async delegation."""
         tools = server.mcp._tool_manager._tools
         doc = tools["import_binary"].fn.__doc__ or ""
-        assert "deprecated" in doc.lower() or "Deprecated" in doc
+        assert "async" in doc.lower() or "analysis_status" in doc.lower()
 
     def test_total_tool_count(self):
         """Should have 39 total tools (36 original + 3 new)."""

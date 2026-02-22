@@ -3,7 +3,9 @@
 import hashlib
 import logging
 import os
+import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -116,6 +118,7 @@ class ProgramHandle:
     profile: AnalysisProfile
     file_path: Path | None = None
     analyzed: bool = False
+    was_preexisting: bool = False  # True if the Ghidra project already existed on disk
     metadata: dict = field(default_factory=dict)
 
     def get_provenance(self) -> Provenance:
@@ -320,6 +323,7 @@ class GhidraBackend:
         path: Path | str,
         profile: AnalysisProfile | str | None = None,
         analyze: bool = True,
+        on_progress: Callable[[int], None] | None = None,
     ) -> ProgramHandle:
         """Import and optionally analyze a binary."""
         if not self._started:
@@ -370,11 +374,12 @@ class GhidraBackend:
 
         handle = self._init_program_handle(program, prog_name, profile, unit_id=unit_id)
         handle.analyzed = program_existed
+        handle.was_preexisting = program_existed
         handle.file_path = path
         self.programs[prog_name] = handle
 
         if analyze and not program_existed:
-            self.analyze_program(prog_name, profile)
+            self.analyze_program(prog_name, profile, on_progress=on_progress)
 
         return handle
 
@@ -382,6 +387,7 @@ class GhidraBackend:
         self,
         name: str,
         profile: AnalysisProfile | str | None = None,
+        on_progress: Callable[[int], None] | None = None,
     ) -> None:
         """Analyze a program with the specified profile."""
         if name not in self.programs:
@@ -399,6 +405,25 @@ class GhidraBackend:
         from ghidra.app.script import GhidraScriptUtil
         from ghidra.program.util import GhidraProgramUtilities
 
+        # Background thread: sample function count every 10s during analyzeAll.
+        # This is the only practical way to get intermediate progress out of
+        # Ghidra's blocking analyzeAll() without a native TaskMonitor proxy.
+        _stop_sampling = threading.Event()
+
+        def _sample_progress() -> None:
+            while not _stop_sampling.wait(10):
+                try:
+                    count = handle.program.getFunctionManager().getFunctionCount()
+                    if on_progress is not None:
+                        on_progress(count)
+                    logger.debug(f"Analysis progress: {count} functions discovered ({name})")
+                except Exception:
+                    break
+
+        sampler = threading.Thread(target=_sample_progress, daemon=True,
+                                   name=f"progress-{name[:16]}")
+        sampler.start()
+
         # Start transaction for program modifications
         tx_id = handle.program.startTransaction("Analysis")
         tx_success = False
@@ -413,6 +438,8 @@ class GhidraBackend:
 
             tx_success = True
         finally:
+            _stop_sampling.set()
+            sampler.join(timeout=5)
             # End transaction (commit if successful, rollback if failed)
             handle.program.endTransaction(tx_id, tx_success)
             GhidraScriptUtil.releaseBundleHostReference()
