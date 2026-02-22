@@ -11,13 +11,22 @@ Token-efficient MCP server for Ghidra-based reverse engineering. Analyze ELF, Ma
 
 ## Quick Start
 
-**1. Install Ghidra** (11.x required)
+**1. Prerequisites**
+
+JDK 21+ and Ghidra 11.x are required.
 
 ```bash
-# Arch Linux
-yay -S ghidra
+# macOS
+brew install openjdk@21
+brew install --cask ghidra
 
-# Or download from https://ghidra-sre.org
+# Ubuntu/Debian
+sudo apt install openjdk-21-jdk
+# Download Ghidra from https://ghidra-sre.org
+
+# Arch Linux
+sudo pacman -S jdk21-openjdk
+yay -S ghidra
 ```
 
 Ghidra at `/opt/ghidra` or `~/ghidra` is found automatically. Set `GHIDRA_INSTALL_DIR` only for non-standard paths.
@@ -37,7 +46,7 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
   "mcpServers": {
     "pyghidra-lite": {
       "command": "pyghidra-lite",
-      "args": ["--allow-path", "/path/to/binaries"]
+      "args": ["serve", "--allow-path", "/path/to/binaries"]
     }
   }
 }
@@ -75,20 +84,55 @@ pip install -e .
 
 ## MCP Configuration
 
-### Basic (allow specific paths)
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "pyghidra-lite": {
+      "command": "uvx",
+      "args": ["pyghidra-lite", "serve", "--allow-path", "~"]
+    }
+  }
+}
+```
+
+`uvx` auto-installs pyghidra-lite from PyPI on first run. Ghidra is auto-detected; set `GHIDRA_INSTALL_DIR` in `env` if needed:
+
+```json
+{
+  "mcpServers": {
+    "pyghidra-lite": {
+      "command": "uvx",
+      "args": ["pyghidra-lite", "serve", "--allow-path", "~"],
+      "env": {
+        "GHIDRA_INSTALL_DIR": "/path/to/ghidra"
+      }
+    }
+  }
+}
+```
+
+### Claude Code
+
+Create `.mcp.json` in your project (or `~/.claude.json` for global):
+
+#### Basic (allow specific paths)
 
 ```json
 {
   "mcpServers": {
     "pyghidra-lite": {
       "command": "pyghidra-lite",
-      "args": ["--allow-path", "/home/user/binaries"]
+      "args": ["serve", "--allow-path", "/home/user/binaries"]
     }
   }
 }
 ```
 
-### With explicit Ghidra path
+#### With explicit Ghidra path
 
 ```json
 {
@@ -96,6 +140,7 @@ pip install -e .
     "pyghidra-lite": {
       "command": "pyghidra-lite",
       "args": [
+        "serve",
         "--ghidra-dir", "/path/to/ghidra",
         "--allow-path", "/home/user/binaries"
       ]
@@ -104,7 +149,7 @@ pip install -e .
 }
 ```
 
-### Multiple paths
+#### Multiple paths
 
 ```json
 {
@@ -112,6 +157,7 @@ pip install -e .
     "pyghidra-lite": {
       "command": "pyghidra-lite",
       "args": [
+        "serve",
         "--allow-path", "/home/user/binaries",
         "--allow-path", "/opt/targets"
       ]
@@ -120,14 +166,14 @@ pip install -e .
 }
 ```
 
-### Allow any path (development only)
+#### Allow any path (development only)
 
 ```json
 {
   "mcpServers": {
     "pyghidra-lite": {
       "command": "pyghidra-lite",
-      "args": ["--allow-any-path"]
+      "args": ["serve", "--allow-any-path"]
     }
   }
 }

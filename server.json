@@ -13,7 +13,8 @@
       "identifier": "pyghidra-lite",
       "version": "0.3.0",
       "transport": {
-        "type": "stdio"
+        "type": "stdio",
+        "args": ["serve"]
       },
       "runtimeHint": "python",
       "environmentVariables": [
