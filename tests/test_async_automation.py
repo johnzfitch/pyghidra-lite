@@ -574,7 +574,9 @@ class TestWorkerConfig:
         import inspect
         source = inspect.getsource(server._run_worker)
         assert "--jvm-heap" in source
-        assert "--status-file" in source
+        assert "--status-file" not in source, (
+            "--status-file was removed from import_cmd; _run_worker must not pass it"
+        )
         assert "--project-dir" in source
         assert "--profile" in source
 

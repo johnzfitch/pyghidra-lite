@@ -661,7 +661,6 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
             sys.executable, "-m", "pyghidra_lite.server",
             "import", str(path),
             "--profile", profile,
-            "--status-file",
             "--project-dir", str(_server_config.project_dir or DEFAULT_PROJECT_DIR),
             "--jvm-heap", f"{heap_mb}m",
         ]
@@ -1033,7 +1032,7 @@ async def import_binary(
         with _backend_lock:
             loaded_handles = list(_backend.programs.values()) if _backend else []
         for h in loaded_handles:
-            if h.unit_id == unit_id:
+            if h.unit_id == unit_id and h.analyzed:
                 caps = _ensure_capabilities(h)
                 return {
                     "unit_id": unit_id,
