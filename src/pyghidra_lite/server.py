@@ -11,9 +11,11 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import re
 
 import click
 from mcp.server import Server
@@ -108,6 +110,9 @@ _LARGE_BINARY_MB = 10
 _active_jobs: dict[str, dict] = {}  # unit_id → job dict
 _active_jobs_lock: asyncio.Lock | None = None  # initialized in serve
 _worker_semaphore: asyncio.Semaphore | None = None  # initialized in serve, default 4
+
+# Valid unit_id format: 16 lowercase hex chars (64-bit xxHash)
+_UNIT_ID_RE = re.compile(r'^[0-9a-f]{16}$')
 
 
 @dataclass
@@ -685,7 +690,7 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
                 job["status"] = "complete"
             else:
                 stderr = (stderr_bytes or b"").decode(errors="replace")
-                if not stderr:
+                if not stderr.strip():
                     # Fallback: worker may have recorded error in status file.
                     status_data = _read_status_file(unit_id)
                     stderr = str(status_data.get("error", "Worker exited with non-zero status"))
@@ -695,6 +700,9 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
         except Exception as e:
             job["status"] = "error"
             job["error"] = str(e)
+
+        # Deferred pop: keep terminal status available for 5 min so callers can poll.
+        asyncio.get_event_loop().call_later(300, _active_jobs.pop, unit_id, None)
 
 
 def _hot_load_blocking(unit_id: str) -> None:
@@ -900,13 +908,15 @@ async def _recover_in_progress_jobs():
 
         if status.get("status") == "analyzing" and alive:
             # Worker still running from before restart -- track it
-            _active_jobs[uid] = {
+            entry = {
                 "unit_id": uid,
                 "binary_name": status.get("binary_name", uid),
                 "status": "analyzing",
                 "pid": pid,
                 "recovered": True,
             }
+            async with (_active_jobs_lock or nullcontext()):
+                _active_jobs[uid] = entry
             logger.info(f"Recovered in-progress job {uid} (pid={pid})")
 
         elif status.get("status") in ("analyzing", "queued"):
@@ -921,23 +931,24 @@ async def _stale_job_monitor(interval: int = 30):
     """Periodically check for crashed workers."""
     while True:
         await asyncio.sleep(interval)
-        for uid, job in list(_active_jobs.items()):
-            if job.get("status") != "analyzing":
-                continue
-            pid = job.get("pid")
-            if pid and not _pid_alive(pid):
-                status_data = _read_status_file(uid)
-                # Check if it actually completed (status file might say "complete")
-                if status_data.get("status") == "complete":
-                    job["status"] = "complete"
+        async with (_active_jobs_lock or nullcontext()):
+            for uid, job in list(_active_jobs.items()):
+                if job.get("status") != "analyzing":
                     continue
-                logger.warning(f"Stale job {uid}: pid {pid} dead")
-                _write_status_file(uid, {
-                    "status": "error",
-                    "error": f"Worker process {pid} died unexpectedly",
-                    "phase": "unknown",
-                })
-                _active_jobs.pop(uid, None)
+                pid = job.get("pid")
+                if pid and not _pid_alive(pid):
+                    status_data = _read_status_file(uid)
+                    # Check if it actually completed (status file might say "complete")
+                    if status_data.get("status") == "complete":
+                        job["status"] = "complete"
+                        continue
+                    logger.warning(f"Stale job {uid}: pid {pid} dead")
+                    _write_status_file(uid, {
+                        "status": "error",
+                        "error": f"Worker process {pid} died unexpectedly",
+                        "phase": "unknown",
+                    })
+                    _active_jobs.pop(uid, None)
 
 
 # =============================================================================
@@ -1043,63 +1054,66 @@ async def import_binary(
                     "capabilities": _format_capabilities(caps),
                 }
 
-        # Already in progress?
-        if unit_id in _active_jobs:
-            job = _active_jobs[unit_id]
-            return {
-                "unit_id": unit_id,
-                "binary_name": p.name,
-                "status": job.get("status", "analyzing"),
-                "eta_sec": job.get("eta_sec"),
-                "message": (
-                    f"Analysis in progress ({file_size_mb:.0f}MB). "
-                    f"Poll with analysis_status(unit_ids=['{unit_id}'])"
-                ),
-            }
-
-        # Check disk: already analyzed by a previous import run?
-        project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
-        gpr = project_dir / unit_id / f"{unit_id}.gpr"
-        status_file = project_dir / unit_id / ".analysis_status"
-        if gpr.exists() and status_file.exists():
-            try:
-                status_data = json.loads(status_file.read_text())
-                if status_data.get("status") == "complete":
+        async with (_active_jobs_lock or nullcontext()):
+            # Already in progress?
+            if unit_id in _active_jobs:
+                job = _active_jobs[unit_id]
+                if job.get("status") not in ("complete", "error"):
                     return {
                         "unit_id": unit_id,
                         "binary_name": p.name,
-                        "kind": kind,
-                        "status": "ready",
-                        "functions": status_data.get("functions"),
-                        "capabilities": status_data.get("capabilities", []),
-                        "note": "on_disk, will load on first query",
+                        "status": job.get("status", "analyzing"),
+                        "eta_sec": job.get("eta_sec"),
+                        "message": (
+                            f"Analysis in progress ({file_size_mb:.0f}MB). "
+                            f"Poll with analysis_status(unit_ids=['{unit_id}'])"
+                        ),
                     }
-            except (json.JSONDecodeError, OSError):
-                pass
+                # Terminal state stale entry: fall through and re-queue.
 
-        # Spawn async worker subprocess.
-        estimated = _estimate_analysis_time(p.stat().st_size, profile)
-        job: dict = {
-            "unit_id": unit_id,
-            "binary_name": p.name,
-            "status": "queued",
-            "eta_sec": estimated,
-            "profile": profile,
-            "pid": None,
-        }
-        _active_jobs[unit_id] = job
-        asyncio.create_task(_run_worker(p, unit_id, profile, job))
-        return {
-            "unit_id": unit_id,
-            "binary_name": p.name,
-            "kind": kind,
-            "status": "queued",
-            "eta_sec": estimated,
-            "message": (
-                f"Binary is {file_size_mb:.0f}MB; analysis runs in background. "
-                f"Poll with analysis_status(unit_ids=['{unit_id}'])"
-            ),
-        }
+            # Check disk: already analyzed by a previous import run?
+            project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+            gpr = project_dir / unit_id / f"{unit_id}.gpr"
+            status_file = project_dir / unit_id / ".analysis_status"
+            if gpr.exists() and status_file.exists():
+                try:
+                    status_data = json.loads(status_file.read_text())
+                    if status_data.get("status") == "complete":
+                        return {
+                            "unit_id": unit_id,
+                            "binary_name": p.name,
+                            "kind": kind,
+                            "status": "ready",
+                            "functions": status_data.get("functions"),
+                            "capabilities": status_data.get("capabilities", []),
+                            "note": "on_disk, will load on first query",
+                        }
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            # Spawn async worker subprocess.
+            estimated = _estimate_analysis_time(p.stat().st_size, profile)
+            job: dict = {
+                "unit_id": unit_id,
+                "binary_name": p.name,
+                "status": "queued",
+                "eta_sec": estimated,
+                "profile": profile,
+                "pid": None,
+            }
+            _active_jobs[unit_id] = job
+            asyncio.create_task(_run_worker(p, unit_id, profile, job))
+            return {
+                "unit_id": unit_id,
+                "binary_name": p.name,
+                "kind": kind,
+                "status": "queued",
+                "eta_sec": estimated,
+                "message": (
+                    f"Binary is {file_size_mb:.0f}MB; analysis runs in background. "
+                    f"Poll with analysis_status(unit_ids=['{unit_id}'])"
+                ),
+            }
 
     logger.info(f"Importing {p.name} ({kind}, {file_size_mb:.1f}MB) with profile={profile_enum.value}")
 
@@ -1235,29 +1249,30 @@ async def analyze_binary(
             except (json.JSONDecodeError, FileNotFoundError):
                 pass
 
-        # Case 3: Already in progress
-        if unit_id in _active_jobs:
-            job = _active_jobs[unit_id]
-            results.append({
+        async with (_active_jobs_lock or nullcontext()):
+            # Case 3: Already in progress
+            if unit_id in _active_jobs:
+                job = _active_jobs[unit_id]
+                results.append({
+                    "unit_id": unit_id,
+                    "binary_name": path.name,
+                    "status": job.get("status", "unknown"),
+                    "eta_sec": job.get("eta_sec"),
+                })
+                continue
+
+            # Case 4: New analysis — spawn worker subprocess
+            estimated = _estimate_analysis_time(path.stat().st_size, profile)
+            job = {
                 "unit_id": unit_id,
                 "binary_name": path.name,
-                "status": job.get("status", "unknown"),
-                "eta_sec": job.get("eta_sec"),
-            })
-            continue
-
-        # Case 4: New analysis — spawn worker subprocess
-        estimated = _estimate_analysis_time(path.stat().st_size, profile)
-        job = {
-            "unit_id": unit_id,
-            "binary_name": path.name,
-            "status": "queued",
-            "eta_sec": estimated,
-            "profile": profile,
-            "pid": None,
-        }
-        _active_jobs[unit_id] = job
-        asyncio.create_task(_run_worker(path, unit_id, profile, job))
+                "status": "queued",
+                "eta_sec": estimated,
+                "profile": profile,
+                "pid": None,
+            }
+            _active_jobs[unit_id] = job
+            asyncio.create_task(_run_worker(path, unit_id, profile, job))
 
         results.append({
             "unit_id": unit_id,
@@ -1283,15 +1298,22 @@ async def analysis_status(
     """
     _require_backend()
 
-    ids = unit_ids or list(_active_jobs.keys())
-    if not ids:
+    results = []
+    if unit_ids:
+        for uid in unit_ids:
+            if not _UNIT_ID_RE.match(uid):
+                results.append({"unit_id": uid, "status": "invalid_id"})
+        unit_ids = [uid for uid in unit_ids if _UNIT_ID_RE.match(uid)]
+
+    async with (_active_jobs_lock or nullcontext()):
+        ids = unit_ids or list(_active_jobs.keys())
+    if not ids and not results:
         return [{"status": "no_active_jobs"}]
 
     # Fields the LLM agent actually needs from the status file
     _STATUS_KEYS = {"status", "phase", "progress", "functions", "capabilities",
                     "error", "binary_name", "done", "total"}
 
-    results = []
     for uid in ids:
         # Already loaded in memory
         handle = None
@@ -1311,7 +1333,8 @@ async def analysis_status(
                 "functions": handle.program.getFunctionManager().getFunctionCount(),
                 "capabilities": _format_capabilities(caps),
             })
-            _active_jobs.pop(uid, None)
+            async with (_active_jobs_lock or nullcontext()):
+                _active_jobs.pop(uid, None)
             continue
 
         # Read status file from disk
@@ -1319,7 +1342,8 @@ async def analysis_status(
         if not raw:
             # If worker has been queued but has not yet written status to disk,
             # fall back to in-memory job state for immediate polling feedback.
-            job = _active_jobs.get(uid)
+            async with (_active_jobs_lock or nullcontext()):
+                job = _active_jobs.get(uid)
             if job:
                 results.append({
                     "unit_id": uid,
@@ -1343,7 +1367,8 @@ async def analysis_status(
 
         # Clean up terminal jobs from active tracking
         if raw.get("status") in ("complete", "error", "cancelled"):
-            _active_jobs.pop(uid, None)
+            async with (_active_jobs_lock or nullcontext()):
+                _active_jobs.pop(uid, None)
 
         # Return only agent-relevant fields
         entry = {"unit_id": uid}
@@ -1368,11 +1393,14 @@ async def cancel_analysis(unit_id: str, ctx: Context) -> dict:
     """
     _require_backend()
 
-    if unit_id not in _active_jobs:
-        return {"unit_id": unit_id, "status": "not_found"}
+    if not _UNIT_ID_RE.match(unit_id):
+        return {"unit_id": unit_id, "status": "invalid_id"}
 
-    job = _active_jobs[unit_id]
-    pid = job.get("pid")
+    async with (_active_jobs_lock or nullcontext()):
+        if unit_id not in _active_jobs:
+            return {"unit_id": unit_id, "status": "not_found"}
+        job = _active_jobs[unit_id]
+        pid = job.get("pid")
 
     if pid:
         try:
@@ -1391,7 +1419,8 @@ async def cancel_analysis(unit_id: str, ctx: Context) -> dict:
         except ProcessLookupError:
             pass  # Already dead
 
-    _active_jobs.pop(unit_id, None)
+    async with (_active_jobs_lock or nullcontext()):
+        _active_jobs.pop(unit_id, None)
     _write_status_file(unit_id, {"status": "cancelled"})
     return {"unit_id": unit_id, "status": "cancelled"}
 
@@ -2548,7 +2577,8 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
             listener.set_phase("importing")
 
             def _on_progress(func_count: int) -> None:
-                listener.set_progress(func_count, func_count + 1000, "analyzing")
+                # Total unknown during analyzeAll; 0 signals "in progress, unknown total"
+                listener.set_progress(func_count, 0, "analyzing")
 
             handle = backend.import_binary(
                 path, profile_enum, analyze=True, on_progress=_on_progress
@@ -2563,7 +2593,9 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
             if caps.has_hermes: cap_list.append("Hermes")
 
             func_count = handle.program.getFunctionManager().getFunctionCount()
-            listener.complete(func_count, cap_list)
+            if not handle.was_preexisting:
+                listener.complete(func_count, cap_list)
+            # For was_preexisting: status file is already accurate from original run
 
             if handle.was_preexisting:
                 click.echo(f"  {path.name}: already analyzed "
@@ -2655,14 +2687,16 @@ class AnalysisProgressListener:
         })
 
     def set_progress(self, current: int, total: int, phase: str | None = None):
-        self._write({
+        data: dict = {
             "status": "analyzing",
             "phase": phase or "analysis",
-            "progress": round(current / max(total, 1), 3),
             "done": current,
             "total": total,
             "elapsed_seconds": int(time.time() - self.started),
-        })
+        }
+        if total > 0:
+            data["progress"] = round(current / total, 3)
+        self._write(data)
 
     def complete(self, functions: int, capabilities: list[str]):
         actual = int(time.time() - self.started)

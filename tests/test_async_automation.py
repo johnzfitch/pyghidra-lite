@@ -568,9 +568,8 @@ class TestMCPToolRegistration:
 class TestWorkerConfig:
 
     def test_run_worker_builds_correct_cmd(self):
-        """Verify _run_worker would construct a valid subprocess command."""
-        # We can't run the actual worker without Ghidra, but we can verify
-        # the command construction by inspecting the source
+        """Verify _run_worker would construct a valid subprocess command (source lint)."""
+        # Quick source-inspection guard: catches accidental flag reintroduction.
         import inspect
         source = inspect.getsource(server._run_worker)
         assert "--jvm-heap" in source
@@ -579,6 +578,38 @@ class TestWorkerConfig:
         )
         assert "--project-dir" in source
         assert "--profile" in source
+
+    def test_run_worker_cmd_via_mock(self, tmp_path, monkeypatch):
+        """_run_worker should pass --profile and --project-dir, never --status-file."""
+        captured_args: list = []
+
+        async def fake_exec(*args, **kwargs):
+            captured_args.extend(args)
+            raise RuntimeError("stop before blocking")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+        config = server.ServerConfig(project_dir=tmp_path)
+        monkeypatch.setattr(server, "_server_config", config)
+        monkeypatch.setattr(server, "_worker_semaphore", asyncio.Semaphore(4))
+
+        fake_path = tmp_path / "test.bin"
+        fake_path.write_bytes(b"\x00" * (1024 * 1024))  # 1 MB dummy binary
+
+        job: dict = {"status": "queued", "pid": None}
+        unit_id = "a" * 16
+
+        async def run():
+            await server._run_worker(fake_path, unit_id, "fast", job)
+
+        asyncio.run(run())
+
+        cmd = captured_args
+        assert "--profile" in cmd
+        assert "fast" in cmd
+        assert "--project-dir" in cmd
+        assert "--status-file" not in cmd, "--status-file must not be passed to worker"
+        assert "--jvm-heap" in cmd
 
     def test_heap_auto_sizing(self):
         """Verify heap sizing logic in _run_worker source."""

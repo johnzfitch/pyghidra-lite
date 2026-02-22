@@ -411,14 +411,25 @@ class GhidraBackend:
         _stop_sampling = threading.Event()
 
         def _sample_progress() -> None:
+            try:
+                import jpype
+                if not jpype.isThreadAttachedToJVM():
+                    jpype.attachThreadToJVM()
+            except Exception as exc:
+                logger.debug(f"Analysis progress: sampler could not attach to JVM ({exc})")
+                return
             while not _stop_sampling.wait(10):
                 try:
                     count = handle.program.getFunctionManager().getFunctionCount()
-                    if on_progress is not None:
-                        on_progress(count)
-                    logger.debug(f"Analysis progress: {count} functions discovered ({name})")
-                except Exception:
+                except Exception as exc:
+                    logger.debug(f"Analysis progress: sampler stopped ({exc})")
                     break
+                logger.debug(f"Analysis progress: {count} functions discovered ({name})")
+                if on_progress is not None:
+                    try:
+                        on_progress(count)
+                    except Exception as exc:
+                        logger.debug(f"Analysis progress: on_progress callback failed ({exc})")
 
         sampler = threading.Thread(target=_sample_progress, daemon=True,
                                    name=f"progress-{name[:16]}")
