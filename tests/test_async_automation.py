@@ -123,10 +123,12 @@ class TestPhase1CLI:
         params = {p.name for p in server.import_cmd.params}
         assert "jvm_heap" in params
 
-    def test_import_cmd_has_status_file(self):
-        """import should accept --status-file."""
+    def test_import_cmd_always_writes_status(self):
+        """import always writes .analysis_status; --status-file flag is gone."""
         params = {p.name for p in server.import_cmd.params}
-        assert "status_file" in params
+        assert "status_file" not in params, (
+            "--status-file was removed: status is always written"
+        )
 
     def test_import_cmd_has_runtime_home(self):
         """import should accept --runtime-home."""
@@ -547,11 +549,11 @@ class TestMCPToolRegistration:
         tools = server.mcp._tool_manager._tools
         assert "cancel_analysis" in tools
 
-    def test_import_binary_deprecated(self):
-        """import_binary docstring should mention deprecated."""
+    def test_import_binary_auto_delegates(self):
+        """import_binary docstring should describe large-file async delegation."""
         tools = server.mcp._tool_manager._tools
         doc = tools["import_binary"].fn.__doc__ or ""
-        assert "deprecated" in doc.lower() or "Deprecated" in doc
+        assert "async" in doc.lower() or "analysis_status" in doc.lower()
 
     def test_total_tool_count(self):
         """Should have 39 total tools (36 original + 3 new)."""
@@ -566,15 +568,48 @@ class TestMCPToolRegistration:
 class TestWorkerConfig:
 
     def test_run_worker_builds_correct_cmd(self):
-        """Verify _run_worker would construct a valid subprocess command."""
-        # We can't run the actual worker without Ghidra, but we can verify
-        # the command construction by inspecting the source
+        """Verify _run_worker would construct a valid subprocess command (source lint)."""
+        # Quick source-inspection guard: catches accidental flag reintroduction.
         import inspect
         source = inspect.getsource(server._run_worker)
         assert "--jvm-heap" in source
-        assert "--status-file" in source
+        assert "--status-file" not in source, (
+            "--status-file was removed from import_cmd; _run_worker must not pass it"
+        )
         assert "--project-dir" in source
         assert "--profile" in source
+
+    def test_run_worker_cmd_via_mock(self, tmp_path, monkeypatch):
+        """_run_worker should pass --profile and --project-dir, never --status-file."""
+        captured_args: list = []
+
+        async def fake_exec(*args, **kwargs):
+            captured_args.extend(args)
+            raise RuntimeError("stop before blocking")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+        config = server.ServerConfig(project_dir=tmp_path)
+        monkeypatch.setattr(server, "_server_config", config)
+        monkeypatch.setattr(server, "_worker_semaphore", asyncio.Semaphore(4))
+
+        fake_path = tmp_path / "test.bin"
+        fake_path.write_bytes(b"\x00" * (1024 * 1024))  # 1 MB dummy binary
+
+        job: dict = {"status": "queued", "pid": None}
+        unit_id = "a" * 16
+
+        async def run():
+            await server._run_worker(fake_path, unit_id, "fast", job)
+
+        asyncio.run(run())
+
+        cmd = captured_args
+        assert "--profile" in cmd
+        assert "fast" in cmd
+        assert "--project-dir" in cmd
+        assert "--status-file" not in cmd, "--status-file must not be passed to worker"
+        assert "--jvm-heap" in cmd
 
     def test_heap_auto_sizing(self):
         """Verify heap sizing logic in _run_worker source."""
