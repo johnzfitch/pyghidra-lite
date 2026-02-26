@@ -4,10 +4,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pyghidra_lite.backend import GhidraBackend, ProgramHandle
-from pyghidra_lite.macho import MachODylib, MachOInfo, MachOSection, MachOSegment, MachOTools
+from pyghidra_lite.formats import MachODylib, MachOInfo, MachOSection, MachOSegment, MachOTools
+from pyghidra_lite.lang import (
+    ObjCClass,
+    ObjCInfo,
+    ObjCMethod,
+    ObjCProtocol,
+    ObjCTools,
+    SwiftInfo,
+    SwiftSymbol,
+    SwiftTools,
+    SwiftType,
+)
 from pyghidra_lite.models import AnalysisProfile
-from pyghidra_lite.objc import ObjCClass, ObjCInfo, ObjCMethod, ObjCProtocol, ObjCTools
-from pyghidra_lite.swift import SwiftInfo, SwiftSymbol, SwiftTools, SwiftType
 from pyghidra_lite.tools import GhidraTools
 
 if TYPE_CHECKING:

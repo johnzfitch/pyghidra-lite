@@ -363,18 +363,34 @@ def _ensure_capabilities(handle) -> BinaryCapabilities:
 
 def _available_tools(caps: BinaryCapabilities) -> list[str]:
     tools = [
+        # Overview
+        "binary_info",
+        "triage_binary",
+        # Functions
         "list_functions",
         "get_function_info",
+        "function_context",
         "disassemble",
         "decompile",
+        "batch_decompile",
+        "call_graph",
+        # Search
+        "search_all",
         "search_strings",
         "search_symbols",
+        # Xrefs
+        "get_xrefs",
+        "batch_xrefs",
+        "get_callees",
+        # Imports / exports
         "list_imports",
         "list_exports",
-        "get_xrefs",
-        "get_callees",
+        # Memory / data
         "read_bytes",
         "read_string",
+        "memory_map",
+        "find_bytes",
+        "entropy_map",
     ]
 
     if caps.is_elf:
@@ -382,9 +398,9 @@ def _available_tools(caps: BinaryCapabilities) -> list[str]:
     if caps.is_macho:
         tools.extend(["macho_info", "macho_segments", "macho_dylibs"])
     if caps.has_swift:
-        tools.extend(["swift_functions", "swift_types", "swift_decompile", "demangle"])
+        tools.extend(["swift_info", "swift_functions", "swift_types", "swift_decompile", "demangle"])
     if caps.has_objc:
-        tools.extend(["objc_classes", "objc_methods", "objc_decompile"])
+        tools.extend(["objc_info", "objc_classes", "objc_methods", "objc_decompile"])
     if caps.has_hermes:
         tools.extend(["hermes_info", "hermes_components", "hermes_endpoints"])
 
@@ -481,7 +497,7 @@ def detect_capabilities(handle, deep: bool = False) -> BinaryCapabilities:
 
         # Get Swift module name if Swift detected
         if caps.has_swift:
-            from pyghidra_lite.swift import SwiftTools
+            from pyghidra_lite.lang import SwiftTools
             try:
                 swift_tools = SwiftTools(handle)
                 info = swift_tools.get_swift_info()
@@ -546,7 +562,7 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
     projects_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
     projects_dir.mkdir(parents=True, exist_ok=True)
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         observer = start_project_watcher(_backend, projects_dir, loop)
         logger.info(f"Filesystem watcher started on {projects_dir}")
     except Exception as e:
@@ -702,7 +718,7 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
             job["error"] = str(e)
 
         # Deferred pop: keep terminal status available for 5 min so callers can poll.
-        asyncio.get_event_loop().call_later(300, _active_jobs.pop, unit_id, None)
+        asyncio.get_running_loop().call_later(300, _active_jobs.pop, unit_id, None)
 
 
 def _hot_load_blocking(unit_id: str) -> None:
@@ -741,7 +757,7 @@ def _hot_load_blocking(unit_id: str) -> None:
 
 async def _hot_load(unit_id: str) -> None:
     """Async wrapper: hot-load a completed project into the backend."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(_import_executor, _hot_load_blocking, unit_id)
 
     # Notify MCP client that tool list may have changed
@@ -980,7 +996,8 @@ def _do_import_blocking(
 
     # Analysis runs outside the lock — analyzeAll() operates on a
     # per-program transaction and doesn't need the global lock.
-    if analyze:
+    # Skip if program was already analyzed (preexisting on disk or in memory).
+    if analyze and not handle.analyzed:
         tracker.update(50, "Analyzing")
         backend.analyze_program(handle.name, profile_enum)
         tracker.update(85, "Analysis complete")
@@ -1119,7 +1136,7 @@ async def import_binary(
 
     # Progress tracking
     tracker = ProgressTracker(message="Starting")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     # Run blocking import in thread pool
     import_future = loop.run_in_executor(
@@ -1157,7 +1174,10 @@ async def import_binary(
             "unit_id": handle.unit_id,
             "kind": kind,
             "capabilities": _format_capabilities(caps),
+            "status": "ready",
         }
+        if handle.was_preexisting:
+            result["note"] = "already_analyzed"
 
         # Only include tool list if requested (saves tokens)
         if list_tools:
@@ -1763,6 +1783,152 @@ def memory_map(binary: str, ctx: Context) -> list[dict]:
     )
 
 
+# =============================================================================
+# OVERVIEW & INSPECTION TOOLS (cherry-picked from PR #4, additive)
+# =============================================================================
+
+@mcp.tool()
+def binary_info(binary: str, ctx: Context) -> dict:
+    """One-shot binary overview: format, arch, sections, capabilities, function/symbol counts.
+
+    Replaces a common sequence of elf_info/macho_info + memory_map.
+    Call this first after import to orient on an unfamiliar binary.
+
+    Args:
+        binary: Binary name.
+    """
+    def op(handle):
+        caps = _ensure_capabilities(handle)
+        metadata = handle.metadata
+        fm = handle.program.getFunctionManager()
+        st = handle.program.getSymbolTable()
+        mem = handle.program.getMemory()
+
+        # Address size → bits
+        addr_size = metadata.get("Address Size", "")
+        bits = 64 if "64" in addr_size else (32 if "32" in addr_size else None)
+
+        # Entry point: prefer symbol table lookup (O(1) per name) over full function scan
+        entry = None
+        st = handle.program.getSymbolTable()
+        for name in ("main", "_main", "_start", "start", "entry"):
+            syms = list(st.getGlobalSymbols(name))
+            if syms:
+                entry = str(syms[0].getAddress())
+                break
+
+        # Sections with permissions
+        sections = []
+        for block in mem.getBlocks():
+            perms = ""
+            if block.isRead():
+                perms += "r"
+            if block.isWrite():
+                perms += "w"
+            if block.isExecute():
+                perms += "x"
+            sections.append({
+                "name": block.getName(),
+                "size": int(block.getSize()),
+                "permissions": perms or "---",
+            })
+
+        return {
+            "name": handle.name,
+            "unit_id": handle.unit_id,
+            "format": metadata.get("Executable Format", "unknown"),
+            "arch": metadata.get("Processor", "unknown"),
+            "bits": bits,
+            "endian": metadata.get("Endian", "").lower() or None,
+            "entry_point": entry,
+            "num_functions": fm.getFunctionCount(),
+            "num_symbols": st.getNumSymbols(),
+            "sections": sections,
+            "capabilities": _format_capabilities(caps),
+        }
+
+    return _with_handle("binary_info", binary, op)
+
+
+@mcp.tool()
+def find_bytes(
+    binary: str,
+    pattern: str,
+    ctx: Context,
+    limit: int = 20,
+) -> list[dict]:
+    """Search for a hex byte pattern across all memory regions.
+
+    Useful for finding magic numbers, crypto constants, or specific sequences.
+
+    Args:
+        binary: Binary name.
+        pattern: Hex bytes (e.g., "cafebabe" or "ca fe ba be"). Max 128 bytes.
+        limit: Max results (default 20).
+    """
+    return _with_handle(
+        "find_bytes",
+        binary,
+        lambda handle: GhidraTools(handle).find_bytes(pattern, limit=limit),
+    )
+
+
+@mcp.tool()
+def entropy_map(binary: str, ctx: Context) -> list[dict]:
+    """Per-section Shannon entropy to identify packed or encrypted regions.
+
+    Entropy > 7.0 suggests encryption or compression.
+    Entropy < 1.0 is mostly zeros or padding.
+
+    Args:
+        binary: Binary name.
+    """
+    return _with_handle(
+        "entropy_map",
+        binary,
+        lambda handle: GhidraTools(handle).entropy_map(),
+    )
+
+
+@mcp.tool()
+def diff_symbols(binary_a: str, binary_b: str, ctx: Context) -> dict:
+    """Compare symbol tables of two binaries. Useful for patch diffing.
+
+    Args:
+        binary_a: First binary name (e.g., original version).
+        binary_b: Second binary name (e.g., patched version).
+    """
+    def op():
+        import heapq
+
+        backend = get_backend()
+        handle_a = backend.get_program(binary_a)
+        handle_b = backend.get_program(binary_b)
+
+        def _get_symbols(handle) -> set[str]:
+            st = handle.program.getSymbolTable()
+            return {sym.getName() for sym in st.getAllSymbols(True)}
+
+        syms_a = _get_symbols(handle_a)
+        syms_b = _get_symbols(handle_b)
+
+        diff_added = syms_b - syms_a
+        diff_removed = syms_a - syms_b
+
+        return {
+            "binary_a": handle_a.name,
+            "binary_b": handle_b.name,
+            "added": heapq.nsmallest(100, diff_added),
+            "removed": heapq.nsmallest(100, diff_removed),
+            "num_added": len(diff_added),
+            "num_removed": len(diff_removed),
+            "num_common": len(syms_a & syms_b),
+        }
+
+    with _backend_lock:
+        return _guarded_tool_call("diff_symbols", op)
+
+
 @mcp.tool()
 def search_symbols(binary: str, query: str, ctx: Context, limit: int = 30) -> list[SymbolInfo]:
     """Search symbols by name.
@@ -1900,6 +2066,188 @@ def disassemble(binary: str, function: str, ctx: Context, limit: int = 100) -> l
 
 
 # =============================================================================
+# AGENT-EFFICIENCY TOOLS (multi-call patterns collapsed to single calls)
+# =============================================================================
+
+@mcp.tool()
+def triage_binary(binary: str, ctx: Context, limit: int = 15) -> dict:
+    """Full binary triage in one call. Best first-call after import.
+
+    Replaces: binary_info + list_functions + list_imports + search_strings + entropy_map.
+    Reduces first-investigation from 5+ calls to 1 call.
+
+    Returns format, top functions by reference count, top imports (suspicious first),
+    notable strings (URLs, keys, paths), high-entropy sections, and capabilities.
+
+    Args:
+        binary: Binary name.
+        limit: Max items per category (default 15, capped at 100).
+    """
+    limit = min(limit, 100)  # Prevent response amplification
+
+    def op(handle):
+        tools = GhidraTools(handle)
+        fm = handle.program.getFunctionManager()
+        caps = _ensure_capabilities(handle)
+
+        # Top functions by refs_in
+        funcs = tools.list_functions(limit=limit * 2, sort_by="refs_in", include_metadata=True)
+        top_functions = [
+            {"name": f.name, "address": f.address, "refs_in": f.refs_in, "size": f.size}
+            for f in funcs[:limit]
+        ]
+
+        # Imports — suspicious (tagged) first
+        imports = tools.list_imports(limit=limit * 3)
+        suspicious = [i for i in imports if i.tags]
+        normal = [i for i in imports if not i.tags]
+        top_imports = [
+            {"name": i.name, "tags": i.tags or []}
+            for i in (suspicious + normal)[:limit]
+        ]
+
+        # Notable strings (URLs, keys, paths, errors)
+        strings = tools.search_strings("", limit=limit * 3)
+        notable = [
+            {"value": s.value, "type": s.looks_like, "address": s.address}
+            for s in strings
+            if s.looks_like in ("url", "key", "path", "error")
+        ][:limit]
+
+        # High-entropy sections
+        try:
+            entropy = tools.entropy_map()
+            hot_sections = [s for s in entropy if s.get("entropy") and s["entropy"] > 7.0]
+        except Exception as _e:
+            logger.warning("triage_binary: entropy_map failed for %s: %s", handle.name, _e)
+            hot_sections = []
+
+        return {
+            "name": handle.name,
+            "unit_id": handle.unit_id,
+            "format": handle.metadata.get("Executable Format", "unknown"),
+            "arch": handle.metadata.get("Processor", "unknown"),
+            "analyzed": handle.analyzed,
+            "profile": handle.profile.value if handle.profile else None,
+            "capabilities": _format_capabilities(caps),
+            "num_functions": fm.getFunctionCount(),
+            "top_functions": top_functions,
+            "top_imports": top_imports,
+            "notable_strings": notable,
+            "high_entropy_sections": hot_sections,
+        }
+
+    return _with_handle("triage_binary", binary, op)
+
+
+@mcp.tool()
+def function_context(binary: str, function: str, ctx: Context) -> dict:
+    """Decompile a function and return full context in one call.
+
+    Returns decompiled code, callers (who calls this), callees (what this calls),
+    and strings referenced. Replaces separate decompile + get_xrefs calls.
+
+    Args:
+        binary: Binary name.
+        function: Function name or address.
+    """
+    def op(handle):
+        tools = GhidraTools(handle)
+        dec = tools.decompile_function(
+            function, include_callees=True, include_strings=True
+        )
+        callers = tools.get_xrefs(function, limit=10)
+        return {
+            "name": dec.name,
+            "address": dec.address,
+            "signature": dec.signature,
+            "decompiled": dec.code,
+            "callers": [
+                {"name": r.from_func, "address": r.from_addr}
+                for r in callers
+                if r.type == "call"
+            ],
+            "callees": dec.callees or [],
+            "strings_used": dec.strings_used or [],
+        }
+
+    return _with_handle("function_context", binary, op)
+
+
+@mcp.tool()
+def batch_xrefs(
+    binary: str,
+    targets: list[str],
+    ctx: Context,
+    limit: int = 20,
+) -> dict:
+    """Get cross-references for multiple targets in one call.
+
+    More efficient than N individual get_xrefs() calls when investigating
+    a set of related functions.
+
+    Args:
+        binary: Binary name.
+        targets: Function/symbol names or addresses (max 20).
+        limit: Max refs per target (default 20).
+    """
+    if not targets:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="targets must not be empty"))
+    if len(targets) > 20:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="Max 20 targets per call"))
+
+    def op(handle):
+        tools = GhidraTools(handle)
+        result = {}
+        for target in targets:
+            try:
+                refs = tools.get_xrefs(target, limit=limit)
+                result[target] = [
+                    {"from_func": r.from_func, "from_addr": r.from_addr, "type": r.type}
+                    for r in refs
+                ]
+            except Exception as _e:
+                logger.debug("batch_xrefs: failed for target %r: %s", target, _e)
+                result[target] = []
+        return result
+
+    return _with_handle("batch_xrefs", binary, op)
+
+
+@mcp.tool()
+def search_all(binary: str, query: str, ctx: Context, limit: int = 10) -> dict:
+    """Search functions, symbols, and strings simultaneously.
+
+    Replaces: list_functions(pattern=q) + search_symbols(q) + search_strings(q).
+    Reduces 3 calls to 1.
+
+    Args:
+        binary: Binary name.
+        query: Search term (case-insensitive substring match).
+        limit: Max results per category (default 10).
+    """
+    def op(handle):
+        tools = GhidraTools(handle)
+        return {
+            "query": query,
+            "functions": [
+                {"name": f.name, "address": f.address}
+                for f in tools.list_functions(pattern=query, limit=limit)
+            ],
+            "symbols": [
+                {"name": s.name, "address": s.address, "type": s.type}
+                for s in tools.search_symbols(query, limit=limit)
+            ],
+            "strings": [
+                {"value": s.value, "address": s.address}
+                for s in tools.search_strings(query, limit=limit)
+            ],
+        }
+
+    return _with_handle("search_all", binary, op)
+
+
+# =============================================================================
 # ELF TOOLS (Linux binaries)
 # =============================================================================
 
@@ -1910,7 +2258,7 @@ def elf_info(binary: str, ctx: Context) -> dict:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.elf import ElfTools
+    from pyghidra_lite.formats import ElfTools
 
     def op(handle):
         info = ElfTools(handle).get_elf_info()
@@ -1935,7 +2283,7 @@ def elf_sections(binary: str, ctx: Context) -> list[dict]:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.elf import ElfTools
+    from pyghidra_lite.formats import ElfTools
 
     return _with_handle(
         "elf_sections",
@@ -1969,7 +2317,7 @@ async def elf_symbols(
         limit: Max results (default 50).
         compact: Return only name/address to reduce tokens (default true).
     """
-    from pyghidra_lite.elf import ElfTools
+    from pyghidra_lite.formats import ElfTools
 
     symbols = _with_handle(
         "elf_symbols",
@@ -1998,7 +2346,7 @@ def elf_got_plt(binary: str, ctx: Context) -> list[dict]:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.elf import ElfTools
+    from pyghidra_lite.formats import ElfTools
 
     return _with_handle(
         "elf_got_plt",
@@ -2018,7 +2366,7 @@ def macho_info(binary: str, ctx: Context) -> dict:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.macho import MachOTools
+    from pyghidra_lite.formats import MachOTools
 
     def op(handle):
         info = MachOTools(handle).get_macho_info()
@@ -2041,7 +2389,7 @@ def macho_segments(binary: str, ctx: Context) -> list[dict]:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.macho import MachOTools
+    from pyghidra_lite.formats import MachOTools
 
     return _with_handle(
         "macho_segments",
@@ -2067,7 +2415,7 @@ def macho_dylibs(binary: str, ctx: Context) -> list[str]:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.macho import MachOTools
+    from pyghidra_lite.formats import MachOTools
 
     return _with_handle(
         "macho_dylibs",
@@ -2098,7 +2446,7 @@ async def swift_functions(
         limit: Max results (default 50).
         compact: Return only demangled name/address to reduce tokens (default true).
     """
-    from pyghidra_lite.swift import SwiftTools
+    from pyghidra_lite.lang import SwiftTools
 
     symbols = _with_handle(
         "swift_functions",
@@ -2132,7 +2480,7 @@ def swift_types(binary: str, ctx: Context, limit: int = 50) -> list[dict]:
         binary: Binary name.
         limit: Max results.
     """
-    from pyghidra_lite.swift import SwiftTools
+    from pyghidra_lite.lang import SwiftTools
 
     return _with_handle(
         "swift_types",
@@ -2152,7 +2500,7 @@ def swift_decompile(binary: str, function: str, ctx: Context) -> dict:
         binary: Binary name.
         function: Function name (mangled or demangled) or address.
     """
-    from pyghidra_lite.swift import SwiftTools
+    from pyghidra_lite.lang import SwiftTools
 
     return _with_handle(
         "swift_decompile",
@@ -2168,8 +2516,34 @@ def demangle(name: str, ctx: Context) -> str:
     Args:
         name: Mangled Swift symbol (e.g., _$s...).
     """
-    from pyghidra_lite.swift import demangle_swift
+    from pyghidra_lite.lang import demangle_swift
     return demangle_swift(name)
+
+
+@mcp.tool()
+def swift_info(binary: str, ctx: Context) -> dict:
+    """Swift binary overview: version, module name, type and protocol counts.
+
+    Faster than calling swift_functions + swift_types separately for a first look.
+
+    Args:
+        binary: Binary name.
+    """
+    from pyghidra_lite.lang import SwiftTools
+
+    def op(handle):
+        info = SwiftTools(handle).get_swift_info()
+        return {
+            "is_swift": info.is_swift,
+            "swift_version": info.swift_version,
+            "module_name": info.module_name,
+            "num_types": info.num_types,
+            "num_protocols": info.num_protocols,
+            "num_swift_functions": info.num_swift_functions,
+            "sections": info.sections,
+        }
+
+    return _with_handle("swift_info", binary, op)
 
 
 # =============================================================================
@@ -2185,7 +2559,7 @@ def objc_classes(binary: str, ctx: Context, pattern: str = "", limit: int = 50) 
         pattern: Filter by class name.
         limit: Max results.
     """
-    from pyghidra_lite.objc import ObjCTools
+    from pyghidra_lite.lang import ObjCTools
 
     return _with_handle(
         "objc_classes",
@@ -2217,7 +2591,7 @@ def objc_methods(
         pattern: Filter by selector.
         limit: Max results.
     """
-    from pyghidra_lite.objc import ObjCTools
+    from pyghidra_lite.lang import ObjCTools
 
     return _with_handle(
         "objc_methods",
@@ -2238,6 +2612,32 @@ def objc_methods(
 
 
 @mcp.tool()
+def objc_info(binary: str, ctx: Context) -> dict:
+    """Objective-C binary overview: class, method, protocol counts, ARC status.
+
+    Faster than calling objc_classes + objc_methods separately for a first look.
+
+    Args:
+        binary: Binary name.
+    """
+    from pyghidra_lite.lang import ObjCTools
+
+    def op(handle):
+        info = ObjCTools(handle).get_objc_info()
+        return {
+            "has_objc": info.has_objc,
+            "num_classes": info.num_classes,
+            "num_categories": info.num_categories,
+            "num_protocols": info.num_protocols,
+            "num_selectors": info.num_selectors,
+            "has_arc": info.has_arc,
+            "frameworks": info.frameworks,
+        }
+
+    return _with_handle("objc_info", binary, op)
+
+
+@mcp.tool()
 def objc_decompile(binary: str, signature: str, ctx: Context) -> dict:
     """Decompile an Objective-C method.
 
@@ -2245,7 +2645,7 @@ def objc_decompile(binary: str, signature: str, ctx: Context) -> dict:
         binary: Binary name.
         signature: Method signature like "-[NSObject init]".
     """
-    from pyghidra_lite.objc import ObjCTools
+    from pyghidra_lite.lang import ObjCTools
 
     return _with_handle(
         "objc_decompile",
@@ -2585,12 +2985,7 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
             )
 
             caps = detect_capabilities(handle)
-            cap_list = []
-            if caps.is_elf: cap_list.append("ELF")
-            if caps.is_macho: cap_list.append("Mach-O")
-            if caps.has_swift: cap_list.append("Swift")
-            if caps.has_objc: cap_list.append("ObjC")
-            if caps.has_hermes: cap_list.append("Hermes")
+            cap_list = _format_capabilities(caps)
 
             func_count = handle.program.getFunctionManager().getFunctionCount()
             if not handle.was_preexisting:

@@ -783,3 +783,141 @@ class GhidraTools:
                 break
 
         return "".join(chars)
+
+    def find_bytes(self, pattern: str, limit: int = 20) -> list[dict]:
+        """Search for a hex byte pattern across all initialized memory regions.
+
+        Uses Ghidra's built-in Java findBytes() API so no full-block allocation
+        occurs regardless of binary size.
+
+        Args:
+            pattern: Hex string (e.g., "deadbeef" or "de ad be ef"). Max 128 bytes.
+            limit: Max results to return (default 20).
+
+        Returns:
+            List of dicts with 'address', 'section', and 'function' keys.
+
+        Raises:
+            ValueError: If pattern is empty, too long, odd-length, or invalid hex.
+        """
+        hex_str = pattern.replace(" ", "").lower().replace("0x", "")
+        if not hex_str:
+            raise ValueError("Pattern must not be empty")
+        if len(hex_str) > 256:
+            raise ValueError("Pattern too long (max 128 bytes / 256 hex chars)")
+        if len(hex_str) % 2 != 0:
+            raise ValueError("Pattern must have an even number of hex characters")
+        try:
+            needle = bytes.fromhex(hex_str)
+        except ValueError as exc:
+            raise ValueError(f"Invalid hex pattern: {exc}") from exc
+
+        mem = self.program.getMemory()
+        fm = self.program.getFunctionManager()
+        blocks = [b for b in mem.getBlocks() if b.isInitialized()]
+        if not blocks:
+            return []
+
+        from jpype import JByte
+
+        # Build Java signed-byte arrays (Java byte is signed: 0xFF → -1)
+        java_needle = JByte[len(needle)]
+        java_mask = JByte[len(needle)]
+        for i, b in enumerate(needle):
+            java_needle[i] = b if b < 128 else b - 256
+            java_mask[i] = -1  # 0xFF: match all bits exactly
+
+        results = []
+
+        for block in blocks:
+            start = block.getStart()
+            end = block.getEnd()
+
+            # Ghidra's Java findBytes avoids pulling the full block into Python
+            addr = mem.findBytes(start, end, java_needle, java_mask, True, None)
+            while addr is not None:
+                fn = fm.getFunctionContaining(addr)
+                results.append({
+                    "address": str(addr),
+                    "section": block.getName(),
+                    "function": fn.getName() if fn else None,
+                })
+                if len(results) >= limit:
+                    return results
+                next_addr = addr.add(1)
+                if next_addr.compareTo(end) > 0:
+                    break
+                addr = mem.findBytes(next_addr, end, java_needle, java_mask, True, None)
+
+        return results
+
+    def entropy_map(self) -> list[dict]:
+        """Compute Shannon entropy per memory section.
+
+        Sections with entropy > 7.0 are likely encrypted or compressed.
+        Sections with entropy < 1.0 are mostly zeros or padding.
+
+        Returns:
+            List of dicts with 'name', 'size', 'entropy', and 'note' keys,
+            sorted by entropy descending.
+        """
+        import math
+
+        from jpype import JByte
+        mem = self.program.getMemory()
+        results = []
+
+        for block in mem.getBlocks():
+            if not block.isInitialized():
+                results.append({
+                    "name": block.getName(),
+                    "size": int(block.getSize()),
+                    "entropy": None,
+                    "note": "uninitialized",
+                })
+                continue
+
+            size = int(block.getSize())
+            # Sample up to 64KB for large sections (representative)
+            sample_size = min(size, 65536)
+            buf = JByte[sample_size]
+            n = mem.getBytes(block.getStart(), buf)
+            if n <= 0:
+                results.append({
+                    "name": block.getName(),
+                    "size": size,
+                    "entropy": None,
+                    "note": "read error",
+                })
+                continue
+            data = bytes([b & 0xFF for b in buf[:n]])
+
+            counts = [0] * 256
+            for b in data:
+                counts[b] += 1
+            entropy = 0.0
+            for c in counts:
+                if c > 0:
+                    p = c / len(data)  # use actual bytes read, not sample_size
+                    entropy -= p * math.log2(p)
+
+            entropy = round(entropy, 3)
+            if entropy > 7.5:
+                note = "likely encrypted/packed"
+            elif entropy > 7.0:
+                note = "high entropy"
+            elif entropy < 1.0:
+                note = "mostly zeros/padding"
+            else:
+                note = ""
+
+            results.append({
+                "name": block.getName(),
+                "size": size,
+                "entropy": entropy,
+                "note": note,
+            })
+
+        results.sort(key=lambda r: (r["entropy"] or 0), reverse=True)
+        return results
+
