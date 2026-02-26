@@ -1899,6 +1899,8 @@ def diff_symbols(binary_a: str, binary_b: str, ctx: Context) -> dict:
         binary_b: Second binary name (e.g., patched version).
     """
     def op():
+        import heapq
+
         backend = get_backend()
         handle_a = backend.get_program(binary_a)
         handle_b = backend.get_program(binary_b)
@@ -1910,16 +1912,16 @@ def diff_symbols(binary_a: str, binary_b: str, ctx: Context) -> dict:
         syms_a = _get_symbols(handle_a)
         syms_b = _get_symbols(handle_b)
 
-        added = sorted(syms_b - syms_a)
-        removed = sorted(syms_a - syms_b)
+        diff_added = syms_b - syms_a
+        diff_removed = syms_a - syms_b
 
         return {
             "binary_a": handle_a.name,
             "binary_b": handle_b.name,
-            "added": added[:100],
-            "removed": removed[:100],
-            "num_added": len(added),
-            "num_removed": len(removed),
+            "added": heapq.nsmallest(100, diff_added),
+            "removed": heapq.nsmallest(100, diff_removed),
+            "num_added": len(diff_added),
+            "num_removed": len(diff_removed),
             "num_common": len(syms_a & syms_b),
         }
 
