@@ -1,6 +1,7 @@
 """Ghidra tool implementations for pyghidra-lite."""
 
 import logging
+import math
 import time
 from typing import TYPE_CHECKING
 
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Cache TTL in seconds (functions don't change during analysis session)
+# Cache TTL in seconds (functions don't change after import)
 CACHE_TTL = 300
 
 # Capability tags for common APIs
@@ -81,7 +82,7 @@ class GhidraTools:
         self._symbols_cache: dict[str, list[SymbolInfo]] | None = None
 
     def invalidate_cache(self) -> None:
-        """Invalidate all caches (call after re-analysis)."""
+        """Invalidate all caches."""
         self._functions_cache = None
         self._functions_cache_time = 0
         self._function_name_index = None
@@ -391,13 +392,6 @@ class GhidraTools:
 
         return results
 
-    def get_callees(self, function: str) -> list[str]:
-        """Get functions called by a function."""
-        func = self._find_function(function)
-        if not func:
-            raise ValueError(f"Function not found: {function}")
-        return [f.getName() for f in func.getCalledFunctions(None)]
-
     def _resolve_address(self, name_or_addr: str):
         """Resolve a name or address string to an Address."""
         af = self.program.getAddressFactory()
@@ -595,47 +589,6 @@ class GhidraTools:
             ascii=ascii_repr,
         )
 
-    def batch_decompile(
-        self,
-        functions: list[str],
-        timeout: int = 30,
-        include_callees: bool = False,
-        include_strings: bool = False,
-    ) -> list[DecompiledFunction]:
-        """Decompile multiple functions in one call.
-
-        More efficient than individual decompile calls due to reduced
-        MCP round-trips and shared decompiler context.
-
-        Args:
-            functions: List of function names or addresses.
-            timeout: Per-function timeout in seconds.
-            include_callees: Include callee lists (increases response size).
-            include_strings: Include string references (increases response size).
-
-        Returns:
-            List of DecompiledFunction results (failed functions have error in code).
-        """
-        results = []
-        for func_name in functions:
-            try:
-                result = self.decompile_function(
-                    func_name,
-                    timeout=timeout,
-                    include_callees=include_callees,
-                    include_strings=include_strings,
-                    include_refs=False,
-                )
-                results.append(result)
-            except Exception as e:
-                # Return error placeholder instead of failing entire batch
-                results.append(DecompiledFunction(
-                    name=func_name,
-                    address="",
-                    code=f"// Error: {e}",
-                ))
-        return results
-
     def get_call_graph(
         self,
         function: str,
@@ -776,3 +729,119 @@ class GhidraTools:
                 break
 
         return "".join(chars)
+
+    def find_bytes(self, pattern: str, limit: int = 20) -> list[dict]:
+        """Search for byte pattern across initialized memory.
+
+        Args:
+            pattern: Hex bytes (e.g. "cafebabe" or "ca fe ba be").
+            limit: Max results (default 20).
+
+        Returns:
+            List of matches with address, containing function, and section.
+        """
+        from jpype import JByte
+
+        hex_str = pattern.replace(" ", "").replace("0x", "")
+        if len(hex_str) % 2:
+            raise ValueError("Hex pattern must have even number of digits")
+        search_bytes = bytes.fromhex(hex_str)
+
+        # Convert to Java byte array and mask
+        java_bytes = JByte[len(search_bytes)]
+        for i, b in enumerate(search_bytes):
+            java_bytes[i] = b if b < 128 else b - 256
+        mask = JByte[len(search_bytes)]
+        for i in range(len(search_bytes)):
+            mask[i] = -1  # 0xFF — match all bits
+
+        mem = self.program.getMemory()
+        fm = self.program.getFunctionManager()
+        results = []
+
+        for block in mem.getBlocks():
+            if not block.isInitialized():
+                continue
+            start = block.getStart()
+            end = block.getEnd()
+            addr = start
+
+            while addr is not None:
+                addr = mem.findBytes(addr, end, java_bytes, mask, True, None)
+                if addr is None:
+                    break
+
+                func = fm.getFunctionContaining(addr)
+                results.append({
+                    "address": str(addr),
+                    "function": func.getName() if func else None,
+                    "section": block.getName(),
+                })
+
+                if len(results) >= limit:
+                    return results
+                addr = addr.add(1)
+
+        return results
+
+    def entropy_map(self) -> list[dict]:
+        """Per-section entropy to identify packed/encrypted regions.
+
+        Returns:
+            List of sections with entropy (0.0-8.0).
+            >7.0 suggests encryption/compression, <1.0 is mostly zeros.
+        """
+        from jpype import JByte
+
+        mem = self.program.getMemory()
+        results = []
+
+        for block in mem.getBlocks():
+            size = int(block.getSize())
+
+            if not block.isInitialized() or size == 0:
+                results.append({
+                    "name": block.getName(),
+                    "size": size,
+                    "entropy": None,
+                    "note": "uninitialized" if size > 0 else "empty",
+                })
+                continue
+
+            # Sample up to 64KB for large sections
+            read_size = min(size, 65536)
+            buf = JByte[read_size]
+            n = mem.getBytes(block.getStart(), buf)
+
+            if n <= 0:
+                continue
+
+            data = bytes([b & 0xFF for b in buf[:n]])
+
+            # Shannon entropy
+            freq = [0] * 256
+            for b in data:
+                freq[b] += 1
+
+            entropy = 0.0
+            for f in freq:
+                if f > 0:
+                    p = f / len(data)
+                    entropy -= p * math.log2(p)
+
+            note = None
+            if entropy > 7.5:
+                note = "likely encrypted/compressed"
+            elif entropy > 7.0:
+                note = "high entropy"
+            elif entropy < 1.0:
+                note = "mostly zeros/padding"
+
+            results.append({
+                "name": block.getName(),
+                "size": size,
+                "entropy": round(entropy, 2),
+                "note": note,
+            })
+
+        return results

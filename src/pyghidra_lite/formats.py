@@ -1,4 +1,4 @@
-"""ELF-specific analysis tools for pyghidra-lite."""
+"""ELF and Mach-O format inspection tools for pyghidra-lite."""
 
 import logging
 from dataclasses import dataclass, field
@@ -9,8 +9,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# ELF
+# =============================================================================
+
 # ELF section types
-SECTION_TYPES = {
+ELF_SECTION_TYPES = {
     0: "NULL",
     1: "PROGBITS",
     2: "SYMTAB",
@@ -24,13 +29,6 @@ SECTION_TYPES = {
     11: "DYNSYM",
     14: "INIT_ARRAY",
     15: "FINI_ARRAY",
-}
-
-# ELF section flags
-SECTION_FLAGS = {
-    0x1: "WRITE",
-    0x2: "ALLOC",
-    0x4: "EXECINSTR",
 }
 
 
@@ -56,6 +54,13 @@ class ElfSymbol:
 
 
 @dataclass
+class ElfDynamic:
+    """ELF dynamic entry."""
+    tag: str
+    value: str
+
+
+@dataclass
 class ElfRelocation:
     """ELF relocation entry."""
     offset: int
@@ -65,29 +70,22 @@ class ElfRelocation:
 
 
 @dataclass
-class ElfDynamic:
-    """ELF dynamic entry."""
-    tag: str
-    value: str
-
-
-@dataclass
 class ElfInfo:
     """Summary of ELF binary structure."""
     is_elf: bool
-    bits: int | None = None  # 32 or 64
-    endian: str | None = None  # little or big
-    machine: str | None = None  # x86_64, ARM, etc.
-    type: str | None = None  # EXEC, DYN, REL
+    bits: int | None = None
+    endian: str | None = None
+    machine: str | None = None
+    type: str | None = None
     num_sections: int = 0
     num_symbols: int = 0
     has_debug: bool = False
     is_stripped: bool = True
-    interpreter: str | None = None  # /lib64/ld-linux-x86-64.so.2
+    interpreter: str | None = None
 
 
 class ElfTools:
-    """ELF-specific analysis tools."""
+    """ELF format inspection tools."""
 
     def __init__(self, handle: "ProgramHandle"):
         self.handle = handle
@@ -105,7 +103,6 @@ class ElfTools:
 
         metadata = self.handle.metadata
 
-        # Parse bits
         bits = None
         addr_size = metadata.get("Address Size", "")
         if "64" in addr_size:
@@ -113,7 +110,6 @@ class ElfTools:
         elif "32" in addr_size:
             bits = 32
 
-        # Parse endianness
         endian = metadata.get("Endian", "").lower()
         if "little" in endian:
             endian = "little"
@@ -122,24 +118,16 @@ class ElfTools:
         else:
             endian = None
 
-        # Parse machine type
         machine = metadata.get("Processor", "")
-
-        # Count sections
         sections = self.list_sections()
-
-        # Check for debug info
         has_debug = any(s.name.startswith(".debug") for s in sections)
-
-        # Check if stripped (no .symtab section usually means stripped)
         is_stripped = not any(s.name == ".symtab" for s in sections)
 
-        # Count symbols
         num_symbols = 0
         st = self.program.getSymbolTable()
         for _ in st.getAllSymbols(True):
             num_symbols += 1
-            if num_symbols > 10000:  # Cap counting
+            if num_symbols > 10000:
                 break
 
         return ElfInfo(
@@ -161,7 +149,6 @@ class ElfTools:
         for block in mem.getBlocks():
             name = block.getName()
 
-            # Parse flags from block permissions
             flags = []
             if block.isWrite():
                 flags.append("WRITE")
@@ -170,7 +157,6 @@ class ElfTools:
             if block.isInitialized():
                 flags.append("ALLOC")
 
-            # Determine type
             sec_type = "PROGBITS"
             if name == ".bss" or not block.isInitialized():
                 sec_type = "NOBITS"
@@ -178,7 +164,7 @@ class ElfTools:
                 sec_type = "SYMTAB"
             elif name == ".dynsym":
                 sec_type = "DYNSYM"
-            elif name == ".strtab" or name == ".dynstr":
+            elif name in (".strtab", ".dynstr"):
                 sec_type = "STRTAB"
             elif name.startswith(".rela"):
                 sec_type = "RELA"
@@ -211,25 +197,16 @@ class ElfTools:
         return None
 
     def list_symbols(self, pattern: str = "", limit: int = 50) -> list[ElfSymbol]:
-        """List ELF symbols.
-
-        Args:
-            pattern: Filter by name substring
-            limit: Max results (default 50)
-        """
+        """List ELF symbols."""
         st = self.program.getSymbolTable()
         fm = self.program.getFunctionManager()
         symbols = []
 
         for sym in st.getAllSymbols(True):
             name = sym.getName()
-
             if pattern and pattern.lower() not in name.lower():
                 continue
 
-            addr = int(sym.getAddress().getOffset())
-
-            # Determine type
             sym_type = str(sym.getSymbolType())
             if sym_type == "Function":
                 sym_type = "FUNC"
@@ -238,12 +215,10 @@ class ElfTools:
             else:
                 sym_type = "OBJECT"
 
-            # Determine binding (approximation)
             bind = "GLOBAL"
             if sym.getParentNamespace().getName() != "Global":
                 bind = "LOCAL"
 
-            # Get size for functions
             size = 0
             func = fm.getFunctionAt(sym.getAddress())
             if func:
@@ -251,7 +226,7 @@ class ElfTools:
 
             symbols.append(ElfSymbol(
                 name=name,
-                addr=addr,
+                addr=int(sym.getAddress().getOffset()),
                 size=size,
                 type=sym_type,
                 bind=bind,
@@ -264,7 +239,6 @@ class ElfTools:
 
     def list_dynamic(self) -> list[ElfDynamic]:
         """List dynamic section entries (NEEDED libs, etc)."""
-        # This is approximated from external symbols
         st = self.program.getSymbolTable()
         libs = set()
 
@@ -273,38 +247,12 @@ class ElfTools:
             if lib and lib != "EXTERNAL":
                 libs.add(lib)
 
-        entries = []
-        for lib in sorted(libs):
-            entries.append(ElfDynamic(tag="NEEDED", value=lib))
-
-        return entries
-
-    def list_relocations(self, limit: int = 100) -> list[ElfRelocation]:
-        """List relocations (GOT/PLT entries)."""
-        rm = self.program.getReferenceManager()
-        fm = self.program.getFunctionManager()
-        st = self.program.getSymbolTable()
-        relocations = []
-
-        # Find external references (these are typically relocations)
-        for sym in st.getExternalSymbols():
-            for ref in rm.getReferencesTo(sym.getAddress()):
-                relocations.append(ElfRelocation(
-                    offset=int(ref.getFromAddress().getOffset()),
-                    type="R_X86_64_PLT32" if fm.getFunctionContaining(ref.getFromAddress()) else "R_X86_64_GLOB_DAT",
-                    symbol=sym.getName(),
-                ))
-
-                if len(relocations) >= limit:
-                    return relocations
-
-        return relocations
+        return [ElfDynamic(tag="NEEDED", value=lib) for lib in sorted(libs)]
 
     def get_got_plt(self) -> list[dict]:
         """Get GOT/PLT entries."""
         results = []
 
-        # Find .got.plt or .plt sections
         got_section = self.get_section(".got.plt") or self.get_section(".got")
         plt_section = self.get_section(".plt")
 
@@ -314,7 +262,6 @@ class ElfTools:
                 "addr": hex(got_section.addr),
                 "size": got_section.size,
             })
-
         if plt_section:
             results.append({
                 "section": ".plt",
@@ -322,7 +269,6 @@ class ElfTools:
                 "size": plt_section.size,
             })
 
-        # List PLT entries (thunk functions)
         fm = self.program.getFunctionManager()
         for func in fm.getFunctions(True):
             if func.isThunk():
@@ -336,3 +282,216 @@ class ElfTools:
                     })
 
         return results
+
+
+# =============================================================================
+# MACH-O
+# =============================================================================
+
+# Mach-O load commands (reference)
+MACHO_LOAD_COMMANDS = {
+    0x1: "LC_SEGMENT",
+    0x19: "LC_SEGMENT_64",
+    0xC: "LC_LOAD_DYLIB",
+    0x1D: "LC_CODE_SIGNATURE",
+    0x28: "LC_MAIN",
+    0x32: "LC_BUILD_VERSION",
+    0x80000022: "LC_DYLD_INFO_ONLY",
+}
+
+
+@dataclass
+class MachOSegment:
+    """Mach-O segment information."""
+    name: str
+    vmaddr: int
+    vmsize: int
+    fileoff: int
+    filesize: int
+    maxprot: int
+    initprot: int
+    sections: list["MachOSection"] = field(default_factory=list)
+
+
+@dataclass
+class MachOSection:
+    """Mach-O section information."""
+    name: str
+    segment: str
+    addr: int
+    size: int
+    offset: int
+    flags: int
+
+
+@dataclass
+class MachODylib:
+    """Linked dynamic library."""
+    name: str
+    current_version: str | None = None
+    compat_version: str | None = None
+
+
+@dataclass
+class MachOInfo:
+    """Summary of Mach-O binary structure."""
+    is_macho: bool
+    cpu_type: str | None = None
+    file_type: str | None = None
+    num_segments: int = 0
+    num_sections: int = 0
+    num_dylibs: int = 0
+    has_code_signature: bool = False
+    has_encryption: bool = False
+    entrypoint: str | None = None
+
+
+class MachOTools:
+    """Mach-O format inspection tools."""
+
+    def __init__(self, handle: "ProgramHandle"):
+        self.handle = handle
+        self.program = handle.program
+
+    def is_macho(self) -> bool:
+        """Check if binary is Mach-O format."""
+        fmt = self.handle.metadata.get("Executable Format", "")
+        return "Mach-O" in fmt or "Mac OS X" in fmt
+
+    def get_macho_info(self) -> MachOInfo:
+        """Get Mach-O binary structure summary."""
+        if not self.is_macho():
+            return MachOInfo(is_macho=False)
+
+        metadata = self.handle.metadata
+        processor = metadata.get("Processor", "").lower()
+
+        cpu_type = None
+        if "x86" in processor and "64" in processor:
+            cpu_type = "x86_64"
+        elif "x86" in processor:
+            cpu_type = "x86"
+        elif "aarch64" in processor or "arm64" in processor:
+            cpu_type = "arm64"
+        elif "arm" in processor:
+            cpu_type = "arm"
+
+        segments = self.list_segments()
+        num_sections = sum(len(s.sections) for s in segments)
+        dylibs = self.list_dylibs()
+
+        has_sig = any("__LINKEDIT" in s.name for s in segments)
+        has_encryption = any(
+            sec.name == "__TEXT.__text" and sec.flags & 0x800
+            for s in segments for sec in s.sections
+        )
+
+        entrypoint = None
+        fm = self.program.getFunctionManager()
+        for func in fm.getFunctions(True):
+            if func.getName() in ("_main", "main", "start", "_start", "entry"):
+                entrypoint = str(func.getEntryPoint())
+                break
+
+        return MachOInfo(
+            is_macho=True,
+            cpu_type=cpu_type,
+            num_segments=len(segments),
+            num_sections=num_sections,
+            num_dylibs=len(dylibs),
+            has_code_signature=has_sig,
+            has_encryption=has_encryption,
+            entrypoint=entrypoint,
+        )
+
+    def list_segments(self) -> list[MachOSegment]:
+        """List Mach-O segments and their sections."""
+        mem = self.program.getMemory()
+        segments = {}
+
+        for block in mem.getBlocks():
+            name = block.getName()
+
+            if "." in name:
+                seg_name, sec_name = name.split(".", 1)
+            else:
+                seg_name = name
+                sec_name = None
+
+            if seg_name not in segments:
+                initprot = 0
+                if block.isRead():
+                    initprot |= 1
+                if block.isWrite():
+                    initprot |= 2
+                if block.isExecute():
+                    initprot |= 4
+
+                segments[seg_name] = MachOSegment(
+                    name=seg_name,
+                    vmaddr=int(block.getStart().getOffset()),
+                    vmsize=0,
+                    fileoff=0,
+                    filesize=0,
+                    maxprot=7,
+                    initprot=initprot,
+                )
+
+            seg = segments[seg_name]
+            seg.vmsize += int(block.getSize())
+
+            if sec_name:
+                seg.sections.append(MachOSection(
+                    name=sec_name,
+                    segment=seg_name,
+                    addr=int(block.getStart().getOffset()),
+                    size=int(block.getSize()),
+                    offset=0,
+                    flags=0,
+                ))
+
+        return list(segments.values())
+
+    def list_sections(self) -> list[MachOSection]:
+        """List all Mach-O sections."""
+        sections = []
+        for seg in self.list_segments():
+            sections.extend(seg.sections)
+        return sections
+
+    def list_dylibs(self) -> list[MachODylib]:
+        """List linked dynamic libraries."""
+        st = self.program.getSymbolTable()
+        dylibs = set()
+
+        for sym in st.getExternalSymbols():
+            lib = str(sym.getParentNamespace())
+            if lib and lib != "EXTERNAL":
+                dylibs.add(lib)
+
+        return [MachODylib(name=lib) for lib in sorted(dylibs)]
+
+    def get_section(self, name: str) -> MachOSection | None:
+        """Get a specific section by name (e.g., '__TEXT.__text')."""
+        for section in self.list_sections():
+            full_name = f"__{section.segment}.{section.name}"
+            if name in (section.name, full_name, f"__{section.segment}.__{section.name}"):
+                return section
+        return None
+
+    def read_section(self, name: str) -> bytes | None:
+        """Read raw bytes from a section."""
+        section = self.get_section(name)
+        if not section:
+            return None
+
+        mem = self.program.getMemory()
+        addr = self.program.getAddressFactory().getAddress(hex(section.addr))
+
+        from jpype import JByte
+        buf = JByte[section.size]
+        n = mem.getBytes(addr, buf)
+
+        if n > 0:
+            return bytes([b & 0xFF for b in buf[:n]])
+        return None

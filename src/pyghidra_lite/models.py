@@ -4,28 +4,11 @@ from pydantic import BaseModel
 
 
 # =============================================================================
-# BINARY / PROJECT MODELS
+# BINARY MODELS
 # =============================================================================
 
-class BinaryUnit(BaseModel):
-    """A single analyzable binary (may be extracted from container)."""
-    unit_id: str                    # sha256 of binary content
-    name: str                       # Display name
-    path: str | None = None         # Original path or path in container
-    parent_id: str | None = None    # If extracted from APK/IPA/AppImage
-    kind: str = "unknown"           # elf, macho, pe, dex, archive
-    arch: str | None = None         # x86_64, arm64, etc.
-
-
-class ContainerInfo(BaseModel):
-    """Info about an extracted container (APK/IPA/AppImage)."""
-    asset_id: str                   # sha256 of container
-    container_type: str             # apk, ipa, appimage, zip
-    units: list[BinaryUnit] = []    # Extracted binaries
-
-
 class BinaryMetadata(BaseModel):
-    """Binary metadata with analysis metrics."""
+    """Binary metadata from import."""
     unit_id: str
     name: str | None = None
     arch: str | None = None
@@ -106,17 +89,6 @@ class CrossRef(BaseModel):
 # =============================================================================
 # SEARCH RESULTS
 # =============================================================================
-
-class CodeMatch(BaseModel):
-    """Semantic search result."""
-    function: str
-    address: str
-    stable_id: str | None = None
-    code: str
-    score: float
-    # Why this matched (for agent context)
-    match_reason: str | None = None
-
 
 class StringXref(BaseModel):
     """String with cross-references - key for understanding behavior."""

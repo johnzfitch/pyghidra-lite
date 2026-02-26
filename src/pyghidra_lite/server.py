@@ -253,6 +253,10 @@ def _init_backend(eager_load: bool = False) -> GhidraBackend:
         resolved_runtime_home = _ensure_runtime_environment(config.project_dir, config.runtime_home)
         config.runtime_home = resolved_runtime_home
         logger.info("Using runtime home: %s", resolved_runtime_home)
+
+        # Import-only workload needs modest heap (no analyzeAll)
+        _upsert_jvm_option("_JAVA_OPTIONS", "-Xmx", "-Xmx512m")
+
         _backend = GhidraBackend(
             project_name=config.project_name,
             project_dir=config.project_dir,
@@ -305,8 +309,8 @@ def _ensure_capabilities(handle) -> BinaryCapabilities:
 
 def _available_tools(caps: BinaryCapabilities) -> list[str]:
     tools = [
+        "binary_info",
         "list_functions",
-        "get_function_info",
         "disassemble",
         "decompile",
         "search_strings",
@@ -314,9 +318,11 @@ def _available_tools(caps: BinaryCapabilities) -> list[str]:
         "list_imports",
         "list_exports",
         "get_xrefs",
-        "get_callees",
         "read_bytes",
         "read_string",
+        "memory_map",
+        "find_bytes",
+        "entropy_map",
     ]
 
     if caps.is_elf:
@@ -324,11 +330,11 @@ def _available_tools(caps: BinaryCapabilities) -> list[str]:
     if caps.is_macho:
         tools.extend(["macho_info", "macho_segments", "macho_dylibs"])
     if caps.has_swift:
-        tools.extend(["swift_functions", "swift_types", "swift_decompile", "demangle"])
+        tools.extend(["swift_info", "demangle"])
     if caps.has_objc:
-        tools.extend(["objc_classes", "objc_methods", "objc_decompile"])
+        tools.append("objc_info")
     if caps.has_hermes:
-        tools.extend(["hermes_info", "hermes_components", "hermes_endpoints"])
+        tools.append("hermes_info")
 
     return tools
 
@@ -414,7 +420,7 @@ def detect_capabilities(handle, deep: bool = False) -> BinaryCapabilities:
             logger.debug(f"Hermes detection failed: {e}")
 
         if caps.has_swift:
-            from pyghidra_lite.swift import SwiftTools
+            from pyghidra_lite.lang import SwiftTools
             try:
                 swift_tools = SwiftTools(handle)
                 info = swift_tools.get_swift_info()
@@ -786,51 +792,6 @@ def read_string(binary: str, address: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-def get_callees(binary: str, function: str, ctx: Context) -> list[str]:
-    """Get functions called BY this function.
-
-    Args:
-        binary: Binary name.
-        function: Function name or address.
-    """
-    return _with_handle(
-        "get_callees",
-        binary,
-        lambda handle: GhidraTools(handle).get_callees(function),
-    )
-
-
-@mcp.tool()
-def batch_decompile(
-    binary: str,
-    functions: list[str],
-    ctx: Context,
-    include_callees: bool = False,
-    include_strings: bool = False,
-) -> list[DecompiledFunction]:
-    """Decompile multiple functions in one call (reduces round trips).
-
-    Args:
-        binary: Binary name.
-        functions: List of function names or addresses.
-        include_callees: Include callee lists (increases response size).
-        include_strings: Include string references (increases response size).
-
-    Returns:
-        List of decompiled functions. Failed functions have error in code field.
-    """
-    return _with_handle(
-        "batch_decompile",
-        binary,
-        lambda handle: GhidraTools(handle).batch_decompile(
-            functions,
-            include_callees=include_callees,
-            include_strings=include_strings,
-        ),
-    )
-
-
-@mcp.tool()
 def call_graph(
     binary: str,
     function: str,
@@ -894,66 +855,6 @@ def search_symbols(binary: str, query: str, ctx: Context, limit: int = 30) -> li
 
 
 @mcp.tool()
-def get_function_info(binary: str, function: str, ctx: Context) -> dict:
-    """Get detailed info about a single function.
-
-    Args:
-        binary: Binary name.
-        function: Function name or address.
-    """
-    def op(handle):
-        fm = handle.program.getFunctionManager()
-        rm = handle.program.getReferenceManager()
-
-        func = None
-        if function.startswith("0x"):
-            try:
-                addr = handle.program.getAddressFactory().getAddress(function.replace("0x", ""))
-                func = fm.getFunctionAt(addr)
-            except Exception:
-                pass
-
-        if not func:
-            for f in fm.getFunctions(True):
-                if f.getName() == function or function.lower() in f.getName().lower():
-                    func = f
-                    break
-
-        if not func:
-            raise ValueError(f"Function not found: {function}")
-
-        entry = func.getEntryPoint()
-        body = func.getBody()
-
-        callers = []
-        for ref in rm.getReferencesTo(entry):
-            caller = fm.getFunctionContaining(ref.getFromAddress())
-            if caller and caller.getName() not in callers:
-                callers.append(caller.getName())
-
-        callees = [f.getName() for f in func.getCalledFunctions(None)]
-
-        return {
-            "name": func.getName(),
-            "address": str(entry),
-            "size": int(body.getNumAddresses()),
-            "is_thunk": func.isThunk(),
-            "is_external": func.isExternal(),
-            "calling_convention": str(func.getCallingConventionName()),
-            "stack_frame_size": (
-                func.getStackFrame().getFrameSize() if func.getStackFrame() else None
-            ),
-            "num_params": func.getParameterCount(),
-            "callers": callers[:20],
-            "callees": callees[:20],
-            "num_callers": len(list(rm.getReferencesTo(entry))),
-            "num_callees": len(callees),
-        }
-
-    return _with_handle("get_function_info", binary, op)
-
-
-@mcp.tool()
 def disassemble(binary: str, function: str, ctx: Context, limit: int = 100) -> list[dict]:
     """Get assembly instructions for a function.
 
@@ -1009,6 +910,149 @@ def disassemble(binary: str, function: str, ctx: Context, limit: int = 100) -> l
 
 
 # =============================================================================
+# SURGICAL / OVERVIEW TOOLS
+# =============================================================================
+
+@mcp.tool()
+def binary_info(binary: str, ctx: Context) -> dict:
+    """One-shot overview of a binary. Call this first after import.
+
+    Returns format, architecture, entry point, section summary,
+    function/symbol counts, and detected capabilities.
+
+    Args:
+        binary: Binary name.
+    """
+    def op(handle):
+        program = handle.program
+        fm = program.getFunctionManager()
+        st = program.getSymbolTable()
+        mem = program.getMemory()
+
+        num_functions = fm.getFunctionCount()
+        num_symbols = st.getNumSymbols()
+
+        # Sections summary
+        sections = []
+        for block in mem.getBlocks():
+            perms = ""
+            if block.isRead():
+                perms += "r"
+            if block.isWrite():
+                perms += "w"
+            if block.isExecute():
+                perms += "x"
+            sections.append({
+                "name": block.getName(),
+                "size": int(block.getSize()),
+                "perms": perms or "---",
+            })
+
+        # Entry point
+        entry = None
+        for func in fm.getFunctions(True):
+            if func.getName() in ("main", "_main", "_start", "start", "entry"):
+                entry = str(func.getEntryPoint())
+                break
+
+        caps = _ensure_capabilities(handle)
+
+        return {
+            "name": handle.name,
+            "unit_id": handle.unit_id,
+            "format": handle.metadata.get("Executable Format", "unknown"),
+            "arch": handle.metadata.get("Processor", "unknown"),
+            "bits": handle.metadata.get("Address Size", "unknown"),
+            "endian": handle.metadata.get("Endian", "unknown"),
+            "entry_point": entry,
+            "num_functions": num_functions,
+            "num_symbols": num_symbols,
+            "sections": sections,
+            "capabilities": _format_capabilities(caps),
+        }
+
+    return _with_handle("binary_info", binary, op)
+
+
+@mcp.tool()
+def find_bytes(
+    binary: str,
+    pattern: str,
+    ctx: Context,
+    limit: int = 20,
+) -> list[dict]:
+    """Search for byte pattern across memory (magic numbers, crypto constants).
+
+    Args:
+        binary: Binary name.
+        pattern: Hex bytes (e.g. "cafebabe" or "ca fe ba be").
+        limit: Max results (default 20).
+    """
+    return _with_handle(
+        "find_bytes",
+        binary,
+        lambda handle: GhidraTools(handle).find_bytes(pattern, limit=limit),
+    )
+
+
+@mcp.tool()
+def entropy_map(binary: str, ctx: Context) -> list[dict]:
+    """Per-section entropy to identify packed/encrypted regions.
+
+    High entropy (>7.0) suggests encryption/compression.
+    Low entropy (<1.0) is mostly zeros/padding.
+
+    Args:
+        binary: Binary name.
+    """
+    return _with_handle(
+        "entropy_map",
+        binary,
+        lambda handle: GhidraTools(handle).entropy_map(),
+    )
+
+
+@mcp.tool()
+def diff_symbols(binary_a: str, binary_b: str, ctx: Context) -> dict:
+    """Compare symbol tables of two binaries (patch diffing).
+
+    Args:
+        binary_a: First binary name.
+        binary_b: Second binary name.
+
+    Returns:
+        Added/removed symbols and overlap count.
+    """
+    def op():
+        backend = get_backend()
+        handle_a = backend.get_program(binary_a)
+        handle_b = backend.get_program(binary_b)
+
+        def get_symbols(program):
+            st = program.getSymbolTable()
+            return {sym.getName() for sym in st.getAllSymbols(True)}
+
+        syms_a = get_symbols(handle_a.program)
+        syms_b = get_symbols(handle_b.program)
+
+        added = sorted(syms_b - syms_a)
+        removed = sorted(syms_a - syms_b)
+
+        return {
+            "binary_a": handle_a.name,
+            "binary_b": handle_b.name,
+            "added": added[:100],
+            "removed": removed[:100],
+            "num_added": len(syms_b - syms_a),
+            "num_removed": len(syms_a - syms_b),
+            "num_common": len(syms_a & syms_b),
+        }
+
+    with _backend_lock:
+        return _guarded_tool_call("diff_symbols", op)
+
+
+# =============================================================================
 # ELF TOOLS (Linux binaries)
 # =============================================================================
 
@@ -1019,7 +1063,7 @@ def elf_info(binary: str, ctx: Context) -> dict:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.elf import ElfTools
+    from pyghidra_lite.formats import ElfTools
 
     def op(handle):
         info = ElfTools(handle).get_elf_info()
@@ -1044,7 +1088,7 @@ def elf_sections(binary: str, ctx: Context) -> list[dict]:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.elf import ElfTools
+    from pyghidra_lite.formats import ElfTools
 
     return _with_handle(
         "elf_sections",
@@ -1078,7 +1122,7 @@ async def elf_symbols(
         limit: Max results (default 50).
         compact: Return only name/address to reduce tokens (default true).
     """
-    from pyghidra_lite.elf import ElfTools
+    from pyghidra_lite.formats import ElfTools
 
     symbols = _with_handle(
         "elf_symbols",
@@ -1107,7 +1151,7 @@ def elf_got_plt(binary: str, ctx: Context) -> list[dict]:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.elf import ElfTools
+    from pyghidra_lite.formats import ElfTools
 
     return _with_handle(
         "elf_got_plt",
@@ -1127,7 +1171,7 @@ def macho_info(binary: str, ctx: Context) -> dict:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.macho import MachOTools
+    from pyghidra_lite.formats import MachOTools
 
     def op(handle):
         info = MachOTools(handle).get_macho_info()
@@ -1150,7 +1194,7 @@ def macho_segments(binary: str, ctx: Context) -> list[dict]:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.macho import MachOTools
+    from pyghidra_lite.formats import MachOTools
 
     return _with_handle(
         "macho_segments",
@@ -1176,7 +1220,7 @@ def macho_dylibs(binary: str, ctx: Context) -> list[str]:
     Args:
         binary: Binary name.
     """
-    from pyghidra_lite.macho import MachOTools
+    from pyghidra_lite.formats import MachOTools
 
     return _with_handle(
         "macho_dylibs",
@@ -1190,84 +1234,40 @@ def macho_dylibs(binary: str, ctx: Context) -> list[str]:
 # =============================================================================
 
 @mcp.tool()
-async def swift_functions(
+def swift_info(
     binary: str,
     ctx: Context,
     pattern: str = "",
-    kind: str | None = None,
-    limit: int = 50,
-    compact: bool = True,
-) -> list[dict]:
-    """List Swift functions with demangled names.
+    limit: int = 30,
+) -> dict:
+    """Swift overview: module, types, and functions with demangled names.
+
+    Use `decompile` to decompile individual Swift functions by address.
 
     Args:
         binary: Binary name.
-        pattern: Filter by demangled name.
-        kind: Filter by kind (function, initializer, getter, setter, witness).
-        limit: Max results (default 50).
-        compact: Return only demangled name/address to reduce tokens (default true).
+        pattern: Filter functions/types by name substring.
+        limit: Max function results (default 30).
     """
-    from pyghidra_lite.swift import SwiftTools
+    from pyghidra_lite.lang import SwiftTools
 
-    symbols = _with_handle(
-        "swift_functions",
-        binary,
-        lambda handle: SwiftTools(handle).list_swift_functions(
-            pattern=pattern, kind=kind, limit=limit
-        ),
-    )
-    await _warn_if_limit_reached(
-        ctx, "swift_functions", limit, len(symbols), suggest_compact=True
-    )
-    if compact:
-        return [{"demangled": f.demangled, "address": f.address} for f in symbols]
-    return [
-        {
-            "demangled": f.demangled,
-            "mangled": f.mangled,
-            "address": f.address,
-            "kind": f.kind,
-            "module": f.module,
+    def op(handle):
+        tools = SwiftTools(handle)
+        info = tools.get_swift_info()
+        functions = tools.list_swift_functions(pattern=pattern, limit=limit)
+        types = tools.list_swift_types(limit=limit)
+        return {
+            "module": info.module_name,
+            "num_functions": info.num_swift_functions,
+            "sections": info.sections,
+            "types": [{"name": t.name, "module": t.module, "kind": t.kind} for t in types],
+            "functions": [
+                {"demangled": f.demangled, "addr": f.address, "kind": f.kind}
+                for f in functions
+            ],
         }
-        for f in symbols
-    ]
 
-
-@mcp.tool()
-def swift_types(binary: str, ctx: Context, limit: int = 50) -> list[dict]:
-    """List Swift types from metadata.
-
-    Args:
-        binary: Binary name.
-        limit: Max results.
-    """
-    from pyghidra_lite.swift import SwiftTools
-
-    return _with_handle(
-        "swift_types",
-        binary,
-        lambda handle: [
-            {"name": t.name, "module": t.module, "kind": t.kind}
-            for t in SwiftTools(handle).list_swift_types(limit=limit)
-        ],
-    )
-
-
-@mcp.tool()
-def swift_decompile(binary: str, function: str, ctx: Context) -> dict:
-    """Decompile Swift function with demangled callees.
-
-    Args:
-        binary: Binary name.
-        function: Function name (mangled or demangled) or address.
-    """
-    from pyghidra_lite.swift import SwiftTools
-
-    return _with_handle(
-        "swift_decompile",
-        binary,
-        lambda handle: SwiftTools(handle).decompile_swift(function),
-    )
+    return _with_handle("swift_info", binary, op)
 
 
 @mcp.tool()
@@ -1277,7 +1277,7 @@ def demangle(name: str, ctx: Context) -> str:
     Args:
         name: Mangled Swift symbol (e.g., _$s...).
     """
-    from pyghidra_lite.swift import demangle_swift
+    from pyghidra_lite.lang import demangle_swift
     return demangle_swift(name)
 
 
@@ -1286,81 +1286,52 @@ def demangle(name: str, ctx: Context) -> str:
 # =============================================================================
 
 @mcp.tool()
-def objc_classes(binary: str, ctx: Context, pattern: str = "", limit: int = 50) -> list[dict]:
-    """List Objective-C classes.
-
-    Args:
-        binary: Binary name.
-        pattern: Filter by class name.
-        limit: Max results.
-    """
-    from pyghidra_lite.objc import ObjCTools
-
-    return _with_handle(
-        "objc_classes",
-        binary,
-        lambda handle: [
-            {
-                "name": c.name,
-                "address": c.address,
-                "num_methods": len(c.methods),
-            }
-            for c in ObjCTools(handle).list_classes(pattern=pattern, limit=limit)
-        ],
-    )
-
-
-@mcp.tool()
-def objc_methods(
+def objc_info(
     binary: str,
     ctx: Context,
-    class_name: str | None = None,
     pattern: str = "",
-    limit: int = 50,
-) -> list[dict]:
-    """List Objective-C methods.
+    class_name: str | None = None,
+    limit: int = 30,
+) -> dict:
+    """ObjC overview: classes, methods, and framework usage.
+
+    Use `decompile` to decompile individual methods by address.
 
     Args:
         binary: Binary name.
-        class_name: Filter by class.
-        pattern: Filter by selector.
-        limit: Max results.
+        pattern: Filter by class/method name.
+        class_name: Show methods for a specific class.
+        limit: Max results (default 30).
     """
-    from pyghidra_lite.objc import ObjCTools
+    from pyghidra_lite.lang import ObjCTools
 
-    return _with_handle(
-        "objc_methods",
-        binary,
-        lambda handle: [
-            {
-                "signature": m.signature,
-                "class": m.class_name,
-                "selector": m.selector,
-                "is_class_method": m.is_class_method,
-                "address": m.impl_address,
-            }
-            for m in ObjCTools(handle).list_methods(
+    def op(handle):
+        tools = ObjCTools(handle)
+        info = tools.get_objc_info()
+        result = {
+            "num_classes": info.num_classes,
+            "num_selectors": info.num_selectors,
+            "has_arc": info.has_arc,
+            "frameworks": info.frameworks,
+        }
+
+        if class_name:
+            methods = tools.list_methods(
                 class_name=class_name, pattern=pattern, limit=limit
             )
-        ],
-    )
+            result["methods"] = [
+                {"sig": m.signature, "addr": m.impl_address} for m in methods
+            ]
+        else:
+            classes = tools.list_classes(pattern=pattern, limit=limit)
+            result["classes"] = [
+                {"name": c.name, "addr": c.address, "methods": len(c.methods)}
+                for c in classes
+            ]
 
+        return result
 
-@mcp.tool()
-def objc_decompile(binary: str, signature: str, ctx: Context) -> dict:
-    """Decompile an Objective-C method.
-
-    Args:
-        binary: Binary name.
-        signature: Method signature like "-[NSObject init]".
-    """
-    from pyghidra_lite.objc import ObjCTools
-
-    return _with_handle(
-        "objc_decompile",
-        binary,
-        lambda handle: ObjCTools(handle).decompile_method(signature),
-    )
+    return _with_handle("objc_info", binary, op)
 
 
 # =============================================================================
@@ -1368,57 +1339,30 @@ def objc_decompile(binary: str, signature: str, ctx: Context) -> dict:
 # =============================================================================
 
 @mcp.tool()
-def hermes_info(binary: str, ctx: Context) -> dict:
-    """Check for Hermes bytecode (React Native).
+def hermes_info(binary: str, ctx: Context, limit: int = 30) -> dict:
+    """React Native / Hermes overview: components, endpoints, and metadata.
 
     Args:
         binary: Binary name.
+        limit: Max results for components/endpoints (default 30).
     """
     from pyghidra_lite.hermes import HermesTools
 
     def op(handle):
-        info = HermesTools(handle).get_hermes_info()
-        return {
+        tools = HermesTools(handle)
+        info = tools.get_hermes_info()
+        result = {
             "is_hermes": info.is_hermes,
-            "num_strings": info.num_strings,
             "bundle_size": info.bundle_size,
         }
 
+        if info.is_hermes:
+            result["components"] = tools.find_react_components(limit=limit)
+            result["endpoints"] = tools.extract_api_endpoints(limit=limit)
+
+        return result
+
     return _with_handle("hermes_info", binary, op)
-
-
-@mcp.tool()
-def hermes_components(binary: str, ctx: Context, limit: int = 50) -> list[dict]:
-    """Find React component names in bundle.
-
-    Args:
-        binary: Binary name.
-        limit: Max results.
-    """
-    from pyghidra_lite.hermes import HermesTools
-
-    return _with_handle(
-        "hermes_components",
-        binary,
-        lambda handle: HermesTools(handle).find_react_components(limit=limit),
-    )
-
-
-@mcp.tool()
-def hermes_endpoints(binary: str, ctx: Context, limit: int = 50) -> list[dict]:
-    """Find API endpoints and URLs in React Native bundle.
-
-    Args:
-        binary: Binary name.
-        limit: Max results.
-    """
-    from pyghidra_lite.hermes import HermesTools
-
-    return _with_handle(
-        "hermes_endpoints",
-        binary,
-        lambda handle: HermesTools(handle).extract_api_endpoints(limit=limit),
-    )
 
 
 # =============================================================================

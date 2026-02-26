@@ -115,5 +115,5 @@ def test_available_tools_expands_for_capabilities() -> None:
     )
 
     tools = server._available_tools(caps)
-    for tool in ("elf_info", "macho_info", "swift_functions", "objc_classes", "hermes_info"):
+    for tool in ("elf_info", "macho_info", "swift_info", "objc_info", "hermes_info"):
         assert tool in tools
