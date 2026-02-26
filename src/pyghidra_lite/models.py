@@ -1,23 +1,6 @@
-"""Models with metadata annotations, stable IDs, and provenance."""
-
-from enum import Enum
+"""Models with metadata annotations and stable IDs."""
 
 from pydantic import BaseModel
-
-
-class AnalysisProfile(str, Enum):
-    """Analysis depth profiles."""
-    FAST = "fast"        # Quick triage, minimal decompiler analysis
-    DEFAULT = "default"  # Balanced: good decompilation without full analysis
-    DEEP = "deep"        # Thorough: full analysis for obfuscated code
-
-
-class Provenance(BaseModel):
-    """Analysis provenance for reproducibility."""
-    unit_id: str                    # Content-addressed ID for the binary
-    profile: AnalysisProfile        # Analysis profile used
-    ghidra_version: str | None = None
-    tool_version: str | None = None
 
 
 # =============================================================================
@@ -32,8 +15,6 @@ class BinaryUnit(BaseModel):
     parent_id: str | None = None    # If extracted from APK/IPA/AppImage
     kind: str = "unknown"           # elf, macho, pe, dex, archive
     arch: str | None = None         # x86_64, arm64, etc.
-    analyzed: bool = False
-    profile: AnalysisProfile | None = None
 
 
 class ContainerInfo(BaseModel):
@@ -54,9 +35,6 @@ class BinaryMetadata(BaseModel):
     num_functions: int | None = None
     num_symbols: int | None = None
     num_strings: int | None = None
-    analyzed: bool = False
-    profile: AnalysisProfile | None = None
-    provenance: Provenance | None = None
 
 
 # =============================================================================
@@ -78,7 +56,7 @@ class FunctionInfo(BaseModel):
 
 
 class DecompiledFunction(BaseModel):
-    """Decompiled function with provenance."""
+    """Decompiled function with metadata."""
     name: str
     address: str
     stable_id: str | None = None
@@ -89,7 +67,6 @@ class DecompiledFunction(BaseModel):
     refs_out: int | None = None
     callees: list[str] | None = None  # Names of called functions
     strings_used: list[str] | None = None  # String literals referenced
-    provenance: Provenance | None = None
 
 
 # =============================================================================
@@ -160,17 +137,3 @@ class BytesResult(BaseModel):
     size: int
     hex: str
     ascii: str | None = None        # Printable representation
-    provenance: Provenance | None = None
-
-
-# =============================================================================
-# ANALYSIS RESULTS
-# =============================================================================
-
-class AnalysisStatus(BaseModel):
-    """Status of import/analysis job."""
-    unit_id: str
-    state: str                      # queued, importing, analyzing, ready, failed
-    profile: AnalysisProfile
-    progress: float | None = None   # 0.0-1.0
-    error: str | None = None

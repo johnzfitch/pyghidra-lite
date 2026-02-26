@@ -228,7 +228,6 @@ class GhidraTools:
         timeout: int = 30,
         include_callees: bool = True,
         include_strings: bool = True,
-        include_provenance: bool = False,
         include_refs: bool = True,
     ) -> DecompiledFunction:
         """Decompile a function.
@@ -238,7 +237,6 @@ class GhidraTools:
             timeout: Decompilation timeout in seconds (default 30).
             include_callees: Include list of called functions (default True).
             include_strings: Include referenced strings (default True).
-            include_provenance: Include analysis provenance (default False, saves tokens).
             include_refs: Include refs_in/refs_out counts (default True).
 
         Returns:
@@ -293,7 +291,6 @@ class GhidraTools:
             refs_out=refs_out,
             callees=callees,
             strings_used=strings_used,
-            provenance=self.handle.get_provenance() if include_provenance else None,
         )
 
     def _find_function(self, name_or_addr: str) -> "Function | None":
@@ -554,14 +551,12 @@ class GhidraTools:
         self,
         address: str,
         size: int,
-        include_provenance: bool = False,
     ) -> BytesResult:
         """Read raw bytes at an address.
 
         Args:
             address: Hex address (0x...) or symbol name.
             size: Number of bytes to read (1-4096).
-            include_provenance: Include analysis provenance (default False).
 
         Returns:
             BytesResult with hex and ASCII representation.
@@ -598,7 +593,6 @@ class GhidraTools:
             size=len(data),
             hex=data.hex(),
             ascii=ascii_repr,
-            provenance=self.handle.get_provenance() if include_provenance else None,
         )
 
     def batch_decompile(
@@ -630,7 +624,6 @@ class GhidraTools:
                     timeout=timeout,
                     include_callees=include_callees,
                     include_strings=include_strings,
-                    include_provenance=False,
                     include_refs=False,
                 )
                 results.append(result)

@@ -1,18 +1,15 @@
-"""PyGhidra backend - manages Ghidra context and program analysis."""
+"""PyGhidra backend - manages Ghidra context and program importing."""
 
 import hashlib
 import logging
 import os
-import threading
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pyghidra
 
-from pyghidra_lite.models import AnalysisProfile, Provenance
 
 if TYPE_CHECKING:
     from ghidra.app.decompiler import DecompInterface
@@ -109,37 +106,19 @@ def compute_stable_id(unit_id: str, address: str) -> str:
 
 @dataclass
 class ProgramHandle:
-    """Handle to an analyzed program in Ghidra."""
+    """Handle to an imported program in Ghidra."""
     name: str
     unit_id: str
     program: "Program"
     flat_api: "FlatProgramAPI"
     decompiler: "DecompInterface"
-    profile: AnalysisProfile
     file_path: Path | None = None
-    analyzed: bool = False
     was_preexisting: bool = False  # True if the Ghidra project already existed on disk
     metadata: dict = field(default_factory=dict)
 
-    def get_provenance(self) -> Provenance:
-        """Get provenance info for this program."""
-        from pyghidra_lite import __version__
-        ghidra_version = None
-        try:
-            from ghidra import GhidraVersion
-            ghidra_version = str(GhidraVersion.getApplicationVersion())
-        except Exception:
-            pass
-        return Provenance(
-            unit_id=self.unit_id,
-            profile=self.profile,
-            ghidra_version=ghidra_version,
-            tool_version=__version__,
-        )
-
 
 class GhidraBackend:
-    """Manages Ghidra project and program analysis.
+    """Manages Ghidra project and program importing.
 
     Uses separate Ghidra projects per binary to enable multi-agent parallelism.
     Each binary gets its own project directory to avoid lock contention.
@@ -152,13 +131,11 @@ class GhidraBackend:
         self,
         project_name: str = "pyghidra_lite",
         project_dir: Path | None = None,
-        default_profile: AnalysisProfile = AnalysisProfile.DEFAULT,
         shared: bool = False,
         ghidra_dir: Path | None = None,
     ):
         self.project_name = project_name
         self.project_dir = project_dir or DEFAULT_PROJECT_DIR
-        self.default_profile = default_profile
         self.shared = shared
         self.ghidra_dir = ghidra_dir
 
@@ -277,7 +254,6 @@ class GhidraBackend:
         self,
         program: "Program",
         name: str,
-        profile: AnalysisProfile | None = None,
         unit_id: str | None = None,
     ) -> ProgramHandle:
         """Initialize a ProgramHandle for a loaded program."""
@@ -312,20 +288,15 @@ class GhidraBackend:
             program=program,
             flat_api=FlatProgramAPI(program),
             decompiler=decomp,
-            profile=profile or self.default_profile,
             file_path=Path(exe_path) if exe_path else None,
-            analyzed=True,  # Existing programs are analyzed
             metadata=metadata,
         )
 
     def import_binary(
         self,
         path: Path | str,
-        profile: AnalysisProfile | str | None = None,
-        analyze: bool = True,
-        on_progress: Callable[[int], None] | None = None,
     ) -> ProgramHandle:
-        """Import and optionally analyze a binary."""
+        """Import a binary (no analysis)."""
         if not self._started:
             self.start()
 
@@ -333,10 +304,6 @@ class GhidraBackend:
         if isinstance(path, str):
             path = Path(path)
 
-        # Convert string to enum if needed
-        if isinstance(profile, str):
-            profile = AnalysisProfile(profile)
-        profile = profile or self.default_profile
         path = path.resolve()
 
         # Generate unique ID using streaming hash (memory-efficient)
@@ -372,152 +339,12 @@ class GhidraBackend:
             program.name = prog_name
             project.saveAs(program, "/", prog_name, True)
 
-        handle = self._init_program_handle(program, prog_name, profile, unit_id=unit_id)
-        handle.analyzed = program_existed
+        handle = self._init_program_handle(program, prog_name, unit_id=unit_id)
         handle.was_preexisting = program_existed
         handle.file_path = path
         self.programs[prog_name] = handle
 
-        if analyze and not program_existed:
-            self.analyze_program(prog_name, profile, on_progress=on_progress)
-
         return handle
-
-    def analyze_program(
-        self,
-        name: str,
-        profile: AnalysisProfile | str | None = None,
-        on_progress: Callable[[int], None] | None = None,
-    ) -> None:
-        """Analyze a program with the specified profile."""
-        if name not in self.programs:
-            raise ValueError(f"Program not found: {name}")
-
-        handle = self.programs[name]
-        # Convert string to enum if needed
-        if isinstance(profile, str):
-            profile = AnalysisProfile(profile)
-        profile = profile or handle.profile
-
-        logger.info(f"Analyzing {name} with profile={profile.value}")
-        self._apply_profile(handle, profile)
-
-        from ghidra.app.script import GhidraScriptUtil
-        from ghidra.program.util import GhidraProgramUtilities
-
-        # Background thread: sample function count every 10s during analyzeAll.
-        # This is the only practical way to get intermediate progress out of
-        # Ghidra's blocking analyzeAll() without a native TaskMonitor proxy.
-        _stop_sampling = threading.Event()
-
-        def _sample_progress() -> None:
-            try:
-                import jpype
-                if not jpype.isThreadAttachedToJVM():
-                    jpype.attachThreadToJVM()
-            except Exception as exc:
-                logger.debug(f"Analysis progress: sampler could not attach to JVM ({exc})")
-                return
-            while not _stop_sampling.wait(10):
-                try:
-                    count = handle.program.getFunctionManager().getFunctionCount()
-                except Exception as exc:
-                    logger.debug(f"Analysis progress: sampler stopped ({exc})")
-                    break
-                logger.debug(f"Analysis progress: {count} functions discovered ({name})")
-                if on_progress is not None:
-                    try:
-                        on_progress(count)
-                    except Exception as exc:
-                        logger.debug(f"Analysis progress: on_progress callback failed ({exc})")
-
-        sampler = threading.Thread(target=_sample_progress, daemon=True,
-                                   name=f"progress-{name[:16]}")
-        sampler.start()
-
-        # Start transaction for program modifications
-        tx_id = handle.program.startTransaction("Analysis")
-        tx_success = False
-        try:
-            GhidraScriptUtil.acquireBundleHostReference()
-            handle.flat_api.analyzeAll(handle.program)
-
-            if hasattr(GhidraProgramUtilities, "setAnalyzedFlag"):
-                GhidraProgramUtilities.setAnalyzedFlag(handle.program, True)
-            elif hasattr(GhidraProgramUtilities, "markProgramAnalyzed"):
-                GhidraProgramUtilities.markProgramAnalyzed(handle.program)
-
-            tx_success = True
-        finally:
-            _stop_sampling.set()
-            sampler.join(timeout=5)
-            # End transaction (commit if successful, rollback if failed)
-            handle.program.endTransaction(tx_id, tx_success)
-            GhidraScriptUtil.releaseBundleHostReference()
-            # Save to the binary's project
-            if tx_success and handle.unit_id in self._projects:
-                self._projects[handle.unit_id].save(handle.program)
-
-        handle.analyzed = True
-        handle.profile = profile
-        logger.info(f"Analysis complete: {name}")
-
-    def _apply_profile(self, handle: ProgramHandle, profile: AnalysisProfile) -> None:
-        """Apply analysis profile settings."""
-        from ghidra.program.model.listing import Program
-
-        prog = handle.program
-        options = prog.getOptions(Program.ANALYSIS_PROPERTIES)
-
-        if profile == AnalysisProfile.FAST:
-            # Disable all expensive analyzers for quick triage (<60s).
-            # Keeps: entry point, subroutine refs, basic blocks, ASCII strings,
-            # symbol table, imports/exports — enough for function listing,
-            # string search, and on-demand decompilation.
-            slow_analyzers = [
-                "Decompiler Parameter ID",
-                "Stack",
-                "Non-Returning Functions - Discovered",
-                "Aggressive Instruction Finder",
-                "Function Start Search",
-                "DWARF",
-                "PDB Universal",
-                "PDB MSDIA",
-                "Embedded Media",
-                "Scalar Operand References",
-                "Data Reference",
-                "GCC Exception Handlers",
-                "Windows x86 PE Exception Handling",
-                "Apply Data Archives",
-                "Shared Return Calls",
-                "Condense Filler Bytes",
-                "Function Start Search After Code",
-                "Function Start Search After Data",
-                "Demangler GNU",
-                "Demangler Microsoft",
-            ]
-            for name in slow_analyzers:
-                self._set_option(options, name, False)
-            logger.debug("Applied FAST profile: disabled %d slow analyzers", len(slow_analyzers))
-        elif profile == AnalysisProfile.DEEP:
-            # Enable thorough analysis
-            self._set_option(options, "Decompiler Parameter ID", True)
-            self._set_option(options, "Aggressive Instruction Finder", True)
-            logger.debug("Applied DEEP profile")
-        # DEFAULT uses Ghidra defaults
-
-    def _set_option(self, options, name: str, value) -> None:
-        """Set an analysis option safely."""
-        try:
-            opt_type = str(options.getType(name))
-            if opt_type == "BOOLEAN_TYPE":
-                options.setBoolean(name, value)
-            elif opt_type == "INT_TYPE":
-                options.setInt(name, int(value))
-            elif opt_type == "STRING_TYPE":
-                options.setString(name, str(value))
-        except Exception as e:
-            logger.debug(f"Could not set option {name}: {e}")
 
     def get_program(self, name: str) -> ProgramHandle:
         """Get a program handle by name."""
