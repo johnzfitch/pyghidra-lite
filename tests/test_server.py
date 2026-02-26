@@ -177,46 +177,57 @@ def test_format_capabilities_stays_lowercase() -> None:
     assert "Mach-O" not in result
 
 
-def test_find_bytes_validation_empty_pattern() -> None:
-    """find_bytes must reject empty patterns before any JVM call."""
+def _make_ghidra_tools_stub():
+    """Create a GhidraTools instance with mocked Ghidra program (no JVM needed).
+
+    The mock program has an empty memory with no blocks, which is enough to
+    exercise find_bytes() validation before any actual search occurs.
+    """
     from unittest.mock import MagicMock
     from pyghidra_lite.tools import GhidraTools
+
     handle = MagicMock()
     handle.unit_id = "a" * 16
     gt = GhidraTools.__new__(GhidraTools)
     gt.handle = handle
+    gt.program = handle.program
+    gt.decompiler = handle.decompiler
+    # Empty memory — validation runs before iteration
+    gt.program.getMemory().getBlocks.return_value = []
+    return gt
 
-    import pytest
+
+def test_find_bytes_validation_empty_pattern() -> None:
+    """find_bytes must reject empty patterns before any JVM call."""
+    gt = _make_ghidra_tools_stub()
     with pytest.raises(ValueError, match="empty"):
-        # Replicate the validation logic directly
-        hex_str = "".replace(" ", "").replace("0x", "").lower()
-        if not hex_str:
-            raise ValueError("Pattern must not be empty")
+        gt.find_bytes("")
 
 
 def test_find_bytes_validation_too_long() -> None:
-    import pytest
+    gt = _make_ghidra_tools_stub()
     with pytest.raises(ValueError, match="too long"):
-        hex_str = ("aa" * 129)  # 129 bytes = 258 hex chars
-        if len(hex_str) > 256:
-            raise ValueError("Pattern too long (max 128 bytes / 256 hex chars)")
+        gt.find_bytes("aa" * 129)  # 129 bytes = 258 hex chars
 
 
 def test_find_bytes_validation_odd_length() -> None:
-    import pytest
+    gt = _make_ghidra_tools_stub()
     with pytest.raises(ValueError, match="even"):
-        hex_str = "abc"
-        if len(hex_str) % 2 != 0:
-            raise ValueError("Pattern must have an even number of hex characters")
+        gt.find_bytes("abc")
 
 
 def test_find_bytes_validation_invalid_hex() -> None:
-    import pytest
+    gt = _make_ghidra_tools_stub()
     with pytest.raises(ValueError, match="Invalid hex"):
-        try:
-            bytes.fromhex("zzzz")
-        except ValueError as exc:
-            raise ValueError(f"Invalid hex pattern: {exc}") from exc
+        gt.find_bytes("zzzz")
+
+
+def test_find_bytes_handles_uppercase_0X_prefix() -> None:
+    """Regression: 0XDEADBEEF should be handled the same as 0xdeadbeef."""
+    gt = _make_ghidra_tools_stub()
+    # Should NOT raise — validation passes, returns empty list (no memory blocks)
+    result = gt.find_bytes("0XDEADBEEF")
+    assert result == []
 
 
 def test_no_deprecated_get_event_loop() -> None:

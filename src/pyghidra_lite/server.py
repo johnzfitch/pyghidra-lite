@@ -996,7 +996,8 @@ def _do_import_blocking(
 
     # Analysis runs outside the lock — analyzeAll() operates on a
     # per-program transaction and doesn't need the global lock.
-    if analyze:
+    # Skip if program was already analyzed (preexisting on disk or in memory).
+    if analyze and not handle.analyzed:
         tracker.update(50, "Analyzing")
         backend.analyze_program(handle.name, profile_enum)
         tracker.update(85, "Analysis complete")
@@ -1173,7 +1174,10 @@ async def import_binary(
             "unit_id": handle.unit_id,
             "kind": kind,
             "capabilities": _format_capabilities(caps),
+            "status": "ready",
         }
+        if handle.was_preexisting:
+            result["note"] = "already_analyzed"
 
         # Only include tool list if requested (saves tokens)
         if list_tools:
@@ -1804,11 +1808,13 @@ def binary_info(binary: str, ctx: Context) -> dict:
         addr_size = metadata.get("Address Size", "")
         bits = 64 if "64" in addr_size else (32 if "32" in addr_size else None)
 
-        # Entry point scan
+        # Entry point: prefer symbol table lookup (O(1) per name) over full function scan
         entry = None
-        for func in fm.getFunctions(True):
-            if func.getName() in ("main", "_main", "_start", "start", "entry"):
-                entry = str(func.getEntryPoint())
+        st = handle.program.getSymbolTable()
+        for name in ("main", "_main", "_start", "start", "entry"):
+            syms = list(st.getGlobalSymbols(name))
+            if syms:
+                entry = str(syms[0].getAddress())
                 break
 
         # Sections with permissions
@@ -2223,7 +2229,7 @@ def search_all(binary: str, query: str, ctx: Context, limit: int = 10) -> dict:
                 for f in tools.list_functions(pattern=query, limit=limit)
             ],
             "symbols": [
-                {"name": s.name, "address": s.address, "type": s.sym_type}
+                {"name": s.name, "address": s.address, "type": s.type}
                 for s in tools.search_symbols(query, limit=limit)
             ],
             "strings": [
@@ -2973,12 +2979,7 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
             )
 
             caps = detect_capabilities(handle)
-            cap_list = []
-            if caps.is_elf: cap_list.append("ELF")
-            if caps.is_macho: cap_list.append("Mach-O")
-            if caps.has_swift: cap_list.append("Swift")
-            if caps.has_objc: cap_list.append("ObjC")
-            if caps.has_hermes: cap_list.append("Hermes")
+            cap_list = _format_capabilities(caps)
 
             func_count = handle.program.getFunctionManager().getFunctionCount()
             if not handle.was_preexisting:

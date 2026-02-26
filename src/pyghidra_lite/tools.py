@@ -797,7 +797,7 @@ class GhidraTools:
         Raises:
             ValueError: If pattern is empty, too long, odd-length, or invalid hex.
         """
-        hex_str = pattern.replace(" ", "").replace("0x", "").lower()
+        hex_str = pattern.replace(" ", "").lower().replace("0x", "")
         if not hex_str:
             raise ValueError("Pattern must not be empty")
         if len(hex_str) > 256:
@@ -815,10 +815,13 @@ class GhidraTools:
         mem = self.program.getMemory()
         results = []
 
+        # Cap per-block read to 64MB to avoid OOM on huge mapped regions.
+        _MAX_BLOCK_READ = 64 * 1024 * 1024
+
         for block in mem.getBlocks():
             if not block.isInitialized():
                 continue
-            block_size = int(block.getSize())
+            block_size = min(int(block.getSize()), _MAX_BLOCK_READ)
             buf = JByte[block_size]
             mem.getBytes(block.getStart(), buf)
             data = bytes([b & 0xFF for b in buf])
