@@ -787,12 +787,15 @@ class GhidraTools:
     def find_bytes(self, pattern: str, limit: int = 20) -> list[dict]:
         """Search for a hex byte pattern across all initialized memory regions.
 
+        Uses Ghidra's built-in Java findBytes() API so no full-block allocation
+        occurs regardless of binary size.
+
         Args:
             pattern: Hex string (e.g., "deadbeef" or "de ad be ef"). Max 128 bytes.
             limit: Max results to return (default 20).
 
         Returns:
-            List of dicts with 'address', 'match', and 'context' keys.
+            List of dicts with 'address', 'section', and 'function' keys.
 
         Raises:
             ValueError: If pattern is empty, too long, odd-length, or invalid hex.
@@ -808,40 +811,43 @@ class GhidraTools:
             needle = bytes.fromhex(hex_str)
         except ValueError as exc:
             raise ValueError(f"Invalid hex pattern: {exc}") from exc
-        if len(needle) == 0:
-            raise ValueError("Decoded pattern is empty")
+
+        mem = self.program.getMemory()
+        fm = self.program.getFunctionManager()
+        blocks = [b for b in mem.getBlocks() if b.isInitialized()]
+        if not blocks:
+            return []
 
         from jpype import JByte
-        mem = self.program.getMemory()
+
+        # Build Java signed-byte arrays (Java byte is signed: 0xFF → -1)
+        java_needle = JByte[len(needle)]
+        java_mask = JByte[len(needle)]
+        for i, b in enumerate(needle):
+            java_needle[i] = b if b < 128 else b - 256
+            java_mask[i] = -1  # 0xFF: match all bits exactly
+
         results = []
 
-        # Cap per-block read to 64MB to avoid OOM on huge mapped regions.
-        _MAX_BLOCK_READ = 64 * 1024 * 1024
+        for block in blocks:
+            start = block.getStart()
+            end = block.getEnd()
 
-        for block in mem.getBlocks():
-            if not block.isInitialized():
-                continue
-            block_size = min(int(block.getSize()), _MAX_BLOCK_READ)
-            buf = JByte[block_size]
-            mem.getBytes(block.getStart(), buf)
-            data = bytes([b & 0xFF for b in buf])
-
-            offset = 0
-            while offset <= len(data) - len(needle):
-                idx = data.find(needle, offset)
-                if idx == -1:
-                    break
-                match_addr = block.getStart().add(idx)
-                ctx_start = max(0, idx - 8)
-                ctx_end = min(len(data), idx + len(needle) + 8)
+            # Ghidra's Java findBytes avoids pulling the full block into Python
+            addr = mem.findBytes(start, end, java_needle, java_mask, True, None)
+            while addr is not None:
+                fn = fm.getFunctionContaining(addr)
                 results.append({
-                    "address": str(match_addr),
-                    "match": data[idx:idx + len(needle)].hex(),
-                    "context": data[ctx_start:ctx_end].hex(),
+                    "address": str(addr),
+                    "section": block.getName(),
+                    "function": fn.getName() if fn else None,
                 })
                 if len(results) >= limit:
                     return results
-                offset = idx + 1
+                next_addr = addr.add(1)
+                if next_addr.compareTo(end) > 0:
+                    break
+                addr = mem.findBytes(next_addr, end, java_needle, java_mask, True, None)
 
         return results
 
@@ -875,8 +881,16 @@ class GhidraTools:
             # Sample up to 64KB for large sections (representative)
             sample_size = min(size, 65536)
             buf = JByte[sample_size]
-            mem.getBytes(block.getStart(), buf)
-            data = bytes([b & 0xFF for b in buf])
+            n = mem.getBytes(block.getStart(), buf)
+            if n <= 0:
+                results.append({
+                    "name": block.getName(),
+                    "size": size,
+                    "entropy": None,
+                    "note": "read error",
+                })
+                continue
+            data = bytes([b & 0xFF for b in buf[:n]])
 
             counts = [0] * 256
             for b in data:
@@ -884,7 +898,7 @@ class GhidraTools:
             entropy = 0.0
             for c in counts:
                 if c > 0:
-                    p = c / sample_size
+                    p = c / len(data)  # use actual bytes read, not sample_size
                     entropy -= p * math.log2(p)
 
             entropy = round(entropy, 3)

@@ -2079,8 +2079,10 @@ def triage_binary(binary: str, ctx: Context, limit: int = 15) -> dict:
 
     Args:
         binary: Binary name.
-        limit: Max items per category (default 15).
+        limit: Max items per category (default 15, capped at 100).
     """
+    limit = min(limit, 100)  # Prevent response amplification
+
     def op(handle):
         tools = GhidraTools(handle)
         fm = handle.program.getFunctionManager()
@@ -2114,7 +2116,8 @@ def triage_binary(binary: str, ctx: Context, limit: int = 15) -> dict:
         try:
             entropy = tools.entropy_map()
             hot_sections = [s for s in entropy if s.get("entropy") and s["entropy"] > 7.0]
-        except Exception:
+        except Exception as _e:
+            logger.warning("triage_binary: entropy_map failed for %s: %s", handle.name, _e)
             hot_sections = []
 
         return {
@@ -2201,7 +2204,8 @@ def batch_xrefs(
                     {"from_func": r.from_func, "from_addr": r.from_addr, "type": r.type}
                     for r in refs
                 ]
-            except Exception:
+            except Exception as _e:
+                logger.debug("batch_xrefs: failed for target %r: %s", target, _e)
                 result[target] = []
         return result
 

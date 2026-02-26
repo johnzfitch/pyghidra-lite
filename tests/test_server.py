@@ -205,18 +205,21 @@ def test_find_bytes_validation_empty_pattern() -> None:
 
 
 def test_find_bytes_validation_too_long() -> None:
+    """find_bytes must reject patterns longer than 128 bytes (256 hex chars)."""
     gt = _make_ghidra_tools_stub()
     with pytest.raises(ValueError, match="too long"):
         gt.find_bytes("aa" * 129)  # 129 bytes = 258 hex chars
 
 
 def test_find_bytes_validation_odd_length() -> None:
+    """find_bytes must reject patterns with an odd number of hex digits."""
     gt = _make_ghidra_tools_stub()
     with pytest.raises(ValueError, match="even"):
         gt.find_bytes("abc")
 
 
 def test_find_bytes_validation_invalid_hex() -> None:
+    """find_bytes must reject strings that are not valid hex."""
     gt = _make_ghidra_tools_stub()
     with pytest.raises(ValueError, match="Invalid hex"):
         gt.find_bytes("zzzz")
