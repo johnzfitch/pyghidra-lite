@@ -783,3 +783,124 @@ class GhidraTools:
                 break
 
         return "".join(chars)
+
+    def find_bytes(self, pattern: str, limit: int = 20) -> list[dict]:
+        """Search for a hex byte pattern across all initialized memory regions.
+
+        Args:
+            pattern: Hex string (e.g., "deadbeef" or "de ad be ef"). Max 128 bytes.
+            limit: Max results to return (default 20).
+
+        Returns:
+            List of dicts with 'address', 'match', and 'context' keys.
+
+        Raises:
+            ValueError: If pattern is empty, too long, odd-length, or invalid hex.
+        """
+        hex_str = pattern.replace(" ", "").replace("0x", "").lower()
+        if not hex_str:
+            raise ValueError("Pattern must not be empty")
+        if len(hex_str) > 256:
+            raise ValueError("Pattern too long (max 128 bytes / 256 hex chars)")
+        if len(hex_str) % 2 != 0:
+            raise ValueError("Pattern must have an even number of hex characters")
+        try:
+            needle = bytes.fromhex(hex_str)
+        except ValueError as exc:
+            raise ValueError(f"Invalid hex pattern: {exc}") from exc
+        if len(needle) == 0:
+            raise ValueError("Decoded pattern is empty")
+
+        from jpype import JByte
+        mem = self.program.getMemory()
+        results = []
+
+        for block in mem.getBlocks():
+            if not block.isInitialized():
+                continue
+            block_size = int(block.getSize())
+            buf = JByte[block_size]
+            mem.getBytes(block.getStart(), buf)
+            data = bytes([b & 0xFF for b in buf])
+
+            offset = 0
+            while offset <= len(data) - len(needle):
+                idx = data.find(needle, offset)
+                if idx == -1:
+                    break
+                match_addr = block.getStart().add(idx)
+                ctx_start = max(0, idx - 8)
+                ctx_end = min(len(data), idx + len(needle) + 8)
+                results.append({
+                    "address": str(match_addr),
+                    "match": data[idx:idx + len(needle)].hex(),
+                    "context": data[ctx_start:ctx_end].hex(),
+                })
+                if len(results) >= limit:
+                    return results
+                offset = idx + 1
+
+        return results
+
+    def entropy_map(self) -> list[dict]:
+        """Compute Shannon entropy per memory section.
+
+        Sections with entropy > 7.0 are likely encrypted or compressed.
+        Sections with entropy < 1.0 are mostly zeros or padding.
+
+        Returns:
+            List of dicts with 'name', 'size', 'entropy', and 'note' keys,
+            sorted by entropy descending.
+        """
+        import math
+
+        from jpype import JByte
+        mem = self.program.getMemory()
+        results = []
+
+        for block in mem.getBlocks():
+            if not block.isInitialized():
+                results.append({
+                    "name": block.getName(),
+                    "size": int(block.getSize()),
+                    "entropy": None,
+                    "note": "uninitialized",
+                })
+                continue
+
+            size = int(block.getSize())
+            # Sample up to 64KB for large sections (representative)
+            sample_size = min(size, 65536)
+            buf = JByte[sample_size]
+            mem.getBytes(block.getStart(), buf)
+            data = bytes([b & 0xFF for b in buf])
+
+            counts = [0] * 256
+            for b in data:
+                counts[b] += 1
+            entropy = 0.0
+            for c in counts:
+                if c > 0:
+                    p = c / sample_size
+                    entropy -= p * math.log2(p)
+
+            entropy = round(entropy, 3)
+            if entropy > 7.5:
+                note = "likely encrypted/packed"
+            elif entropy > 7.0:
+                note = "high entropy"
+            elif entropy < 1.0:
+                note = "mostly zeros/padding"
+            else:
+                note = ""
+
+            results.append({
+                "name": block.getName(),
+                "size": size,
+                "entropy": entropy,
+                "note": note,
+            })
+
+        results.sort(key=lambda r: (r["entropy"] or 0), reverse=True)
+        return results
+
