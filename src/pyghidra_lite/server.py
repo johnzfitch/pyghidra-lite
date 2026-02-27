@@ -1096,15 +1096,27 @@ async def import_binary(
                 try:
                     status_data = json.loads(status_file.read_text())
                     if status_data.get("status") == "complete":
-                        return {
+                        # Hot-load into memory so it's immediately available
+                        hot_loaded = False
+                        hot_load_error = None
+                        try:
+                            await _hot_load(unit_id)
+                            hot_loaded = True
+                        except Exception as e:
+                            hot_load_error = str(e)
+                        result = {
                             "unit_id": unit_id,
                             "binary_name": p.name,
                             "kind": kind,
                             "status": "ready",
                             "functions": status_data.get("functions"),
                             "capabilities": status_data.get("capabilities", []),
-                            "note": "on_disk, will load on first query",
                         }
+                        if hot_loaded:
+                            result["hot_loaded"] = True
+                        if hot_load_error:
+                            result["hot_load_error"] = hot_load_error
+                        return result
                 except (json.JSONDecodeError, OSError):
                     pass
 
