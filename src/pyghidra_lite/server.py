@@ -1072,6 +1072,45 @@ async def import_binary(
                     "capabilities": _format_capabilities(caps),
                 }
 
+        # Check disk: already analyzed by a previous import run? (outside lock)
+        project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+        gpr = project_dir / unit_id / f"{unit_id}.gpr"
+        status_file = project_dir / unit_id / ".analysis_status"
+        if gpr.exists() and status_file.exists():
+            try:
+                status_data = json.loads(status_file.read_text())
+                if status_data.get("status") == "complete":
+                    # Hot-load into memory so it's immediately available
+                    hot_load_error = None
+                    try:
+                        await _hot_load(unit_id)
+                    except Exception as e:
+                        hot_load_error = str(e)
+                    # Verify program actually loaded (hot-load can silently fail)
+                    hot_loaded = False
+                    with _backend_lock:
+                        if _backend:
+                            hot_loaded = any(
+                                h.unit_id == unit_id for h in _backend.programs.values()
+                            )
+                    result = {
+                        "unit_id": unit_id,
+                        "binary_name": p.name,
+                        "kind": kind,
+                        "status": "ready" if hot_loaded else "load_failed",
+                        "functions": status_data.get("functions"),
+                        "capabilities": status_data.get("capabilities", []),
+                    }
+                    if hot_loaded:
+                        result["hot_loaded"] = True
+                    if hot_load_error:
+                        result["hot_load_error"] = hot_load_error
+                    elif not hot_loaded:
+                        result["hot_load_error"] = "Program not found in backend after load"
+                    return result
+            except (json.JSONDecodeError, OSError):
+                pass
+
         async with (_active_jobs_lock or nullcontext()):
             # Already in progress?
             if unit_id in _active_jobs:
@@ -1088,38 +1127,6 @@ async def import_binary(
                         ),
                     }
                 # Terminal state stale entry: fall through and re-queue.
-
-            # Check disk: already analyzed by a previous import run?
-            project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
-            gpr = project_dir / unit_id / f"{unit_id}.gpr"
-            status_file = project_dir / unit_id / ".analysis_status"
-            if gpr.exists() and status_file.exists():
-                try:
-                    status_data = json.loads(status_file.read_text())
-                    if status_data.get("status") == "complete":
-                        # Hot-load into memory so it's immediately available
-                        hot_loaded = False
-                        hot_load_error = None
-                        try:
-                            await _hot_load(unit_id)
-                            hot_loaded = True
-                        except Exception as e:
-                            hot_load_error = str(e)
-                        result = {
-                            "unit_id": unit_id,
-                            "binary_name": p.name,
-                            "kind": kind,
-                            "status": "ready",
-                            "functions": status_data.get("functions"),
-                            "capabilities": status_data.get("capabilities", []),
-                        }
-                        if hot_loaded:
-                            result["hot_loaded"] = True
-                        if hot_load_error:
-                            result["hot_load_error"] = hot_load_error
-                        return result
-                except (json.JSONDecodeError, OSError):
-                    pass
 
             # Spawn async worker subprocess.
             estimated = _estimate_analysis_time(p.stat().st_size, profile)

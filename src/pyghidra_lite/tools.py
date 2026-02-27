@@ -320,9 +320,11 @@ class GhidraTools:
             dest_iter = block.getDestinations(monitor)
             while dest_iter.hasNext():
                 dest = dest_iter.next()
-                successors.append(hex(dest.getDestinationAddress().getOffset()))
+                # Use full address string to preserve address space qualifier
+                # (avoids collisions on binaries with EXTERNAL/overlay spaces)
+                successors.append(str(dest.getDestinationAddress()))
             blocks.append({
-                "addr": hex(block.getFirstStartAddress().getOffset()),
+                "addr": str(block.getFirstStartAddress()),
                 "size": int(block.getNumAddresses()),
                 "successors": successors,
             })
