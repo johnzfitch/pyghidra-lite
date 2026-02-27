@@ -499,12 +499,22 @@ class GhidraBackend:
             for name in slow_analyzers:
                 self._set_option(options, name, False)
             logger.debug("Applied FAST profile: disabled %d slow analyzers", len(slow_analyzers))
+        elif profile == AnalysisProfile.DEFAULT:
+            # Balanced: disable the single most expensive analyzer (~10x speedup
+            # over deep) while keeping everything else for good quality results.
+            self._set_option(options, "Decompiler Parameter ID", False)
+            # Disable the irrelevant demangler based on binary format
+            exe_fmt = str(prog.getExecutableFormat()).lower()
+            if "elf" in exe_fmt or "mach" in exe_fmt:
+                self._set_option(options, "Demangler Microsoft", False)
+            elif "pe" in exe_fmt:
+                self._set_option(options, "Demangler GNU", False)
+            logger.debug("Applied DEFAULT profile: disabled Decompiler Parameter ID + irrelevant demangler")
         elif profile == AnalysisProfile.DEEP:
             # Enable thorough analysis
             self._set_option(options, "Decompiler Parameter ID", True)
             self._set_option(options, "Aggressive Instruction Finder", True)
             logger.debug("Applied DEEP profile")
-        # DEFAULT uses Ghidra defaults
 
     def _set_option(self, options, name: str, value) -> None:
         """Set an analysis option safely."""

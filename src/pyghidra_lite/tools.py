@@ -296,6 +296,40 @@ class GhidraTools:
             provenance=self.handle.get_provenance() if include_provenance else None,
         )
 
+    def get_cfg(self, name_or_addr: str) -> list[dict]:
+        """Extract control flow graph (basic blocks + edges) for a function.
+
+        Returns a list of basic blocks with their addresses, sizes, and
+        successor edges. Useful for structural analysis without running
+        the expensive Decompiler Parameter ID pass.
+        """
+        from ghidra.program.model.block import BasicBlockModel
+        from ghidra.util.task import ConsoleTaskMonitor
+
+        func = self._find_function(name_or_addr)
+        if not func:
+            raise ValueError(f"Function not found: {name_or_addr}")
+
+        monitor = ConsoleTaskMonitor()
+        bbm = BasicBlockModel(self.program)
+        blocks = []
+        block_iter = bbm.getCodeBlocksContaining(func.getBody(), monitor)
+        while block_iter.hasNext():
+            block = block_iter.next()
+            successors = []
+            dest_iter = block.getDestinations(monitor)
+            while dest_iter.hasNext():
+                dest = dest_iter.next()
+                # Use full address string to preserve address space qualifier
+                # (avoids collisions on binaries with EXTERNAL/overlay spaces)
+                successors.append(str(dest.getDestinationAddress()))
+            blocks.append({
+                "addr": str(block.getFirstStartAddress()),
+                "size": int(block.getNumAddresses()),
+                "successors": successors,
+            })
+        return blocks
+
     def _find_function(self, name_or_addr: str) -> "Function | None":
         """Find a function by name or address.
 
