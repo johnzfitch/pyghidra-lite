@@ -674,9 +674,10 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
     async with _worker_semaphore:
         job["status"] = "analyzing"
 
-        # Auto-size JVM heap based on binary size
+        # Auto-size JVM heap based on binary size.
+        # Set -Xms = -Xmx to avoid GC resizing overhead on startup.
         binary_mb = path.stat().st_size / (1024 * 1024)
-        heap_mb = max(2048, min(8192, int(binary_mb * 4)))
+        heap_mb = max(2048, min(16384, int(binary_mb * 4)))
 
         cmd = [
             sys.executable, "-m", "pyghidra_lite.server",
@@ -2187,6 +2188,39 @@ def function_context(binary: str, function: str, ctx: Context) -> dict:
 
 
 @mcp.tool()
+def decompile_with_cfg(binary: str, function: str, ctx: Context) -> dict:
+    """Decompile a function and return its control flow graph.
+
+    Returns pseudo-code alongside basic block structure (addresses, sizes,
+    edges). The CFG gives structural context that helps with type inference
+    and understanding control flow without needing the expensive Decompiler
+    Parameter ID analyzer pass.
+
+    Args:
+        binary: Binary name.
+        function: Function name or address.
+    """
+    def op(handle):
+        tools = GhidraTools(handle)
+        dec = tools.decompile_function(
+            function, include_callees=True, include_strings=True
+        )
+        cfg = tools.get_cfg(function)
+        return {
+            "name": dec.name,
+            "address": dec.address,
+            "signature": dec.signature,
+            "decompiled": dec.code,
+            "cfg": cfg,
+            "num_blocks": len(cfg),
+            "callees": dec.callees or [],
+            "strings_used": dec.strings_used or [],
+        }
+
+    return _with_handle("decompile_with_cfg", binary, op)
+
+
+@mcp.tool()
 def batch_xrefs(
     binary: str,
     targets: list[str],
@@ -2961,6 +2995,8 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
 
     if jvm_heap:
         _upsert_jvm_option("_JAVA_OPTIONS", "-Xmx", f"-Xmx{jvm_heap}")
+        # Set initial heap = max heap to avoid GC resizing overhead on startup
+        _upsert_jvm_option("_JAVA_OPTIONS", "-Xms", f"-Xms{jvm_heap}")
 
     profile_enum = AnalysisProfile(profile)
 

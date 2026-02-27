@@ -617,4 +617,4 @@ class TestWorkerConfig:
         source = inspect.getsource(server._run_worker)
         assert "heap_mb" in source
         assert "2048" in source  # min heap
-        assert "8192" in source  # max heap
+        assert "16384" in source  # max heap
