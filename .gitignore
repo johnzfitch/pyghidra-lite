@@ -62,8 +62,9 @@ HANDOFF.md
 TOKEN_OPTIMIZATIONS.md
 AUDIT-*.md
 
-# MCP publisher tokens
+# MCP publisher tokens and tools
 .mcpregistry_*
+.tools/
 
 # Local MCP config (contains personal paths)
 .mcp.json
