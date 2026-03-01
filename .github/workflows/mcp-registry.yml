@@ -25,7 +25,7 @@ jobs:
 
       - name: Install mcp-publisher
         run: |
-          curl -sL https://registry.modelcontextprotocol.io/releases/latest/mcp-publisher-linux-amd64 -o mcp-publisher
+          curl -sL https://registry.modelcontextprotocol.io/v0.1/releases/latest/mcp-publisher-linux-amd64 -o mcp-publisher
           chmod +x mcp-publisher
 
       - name: Authenticate with OIDC
