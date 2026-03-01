@@ -5,6 +5,28 @@ All notable changes to pyghidra-lite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-01
+
+### Added
+- **`decompile_with_cfg` tool**: Returns decompiled pseudo-code plus control flow graph in one call, enabling LLM clients to infer types from structure
+- **MCP Registry workflow**: Automated publishing via GitHub Actions OIDC
+
+### Changed
+- **10x faster DEFAULT profile**: Disabled Decompiler Parameter ID by default
+- **Smart demangler selection**: ELF/Mach-O disables Microsoft demangler, PE disables GNU demangler
+- **JVM heap tuning**: Raised auto-size cap from 8GB to 16GB, set -Xms equal to -Xmx when --jvm-heap specified
+- **Hot-load on import**: Previously-analyzed binaries detected and loaded immediately
+
+### Fixed
+- `find_bytes`: Fixed OOM on large search patterns
+- `diff_symbols`: Resolved O(n^2) sort inefficiency
+- `entropy_map`: Improved accuracy for small sections
+- `search_all`: Fixed crash on malformed regex
+- Stale Ghidra lock files now swept on server startup
+
+### Security
+- Closed several denial-of-service vectors in search tools
+
 ## [0.3.0] - 2026-02-10
 
 ### Added
@@ -76,6 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Path allowlist prevents unauthorized file access
 - Per-binary project isolation
 
+[0.4.0]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.4.0
 [0.3.0]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.3.0
 [0.2.0]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.2.0
 [0.1.1]: https://github.com/johnzfitch/pyghidra-lite/releases/tag/v0.1.1
