@@ -1,0 +1,35 @@
+name: Publish to MCP Registry
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish to MCP Registry
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update server.json version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+          cat server.json
+
+      - name: Install mcp-publisher
+        run: |
+          curl -sL https://registry.modelcontextprotocol.io/releases/latest/mcp-publisher-linux-amd64 -o mcp-publisher
+          chmod +x mcp-publisher
+
+      - name: Authenticate with OIDC
+        run: ./mcp-publisher auth github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish
