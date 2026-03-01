@@ -31,8 +31,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Authenticate with OIDC
-        run: ./mcp-publisher auth github-oidc
-
       - name: Publish to MCP Registry
-        run: ./mcp-publisher publish
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
