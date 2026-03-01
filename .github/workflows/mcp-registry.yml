@@ -25,8 +25,11 @@ jobs:
 
       - name: Install mcp-publisher
         run: |
-          curl -sL https://registry.modelcontextprotocol.io/v0.1/releases/latest/mcp-publisher-linux-amd64 -o mcp-publisher
+          gh release download --repo modelcontextprotocol/registry --pattern 'mcp-publisher_linux_amd64.tar.gz'
+          tar -xzf mcp-publisher_linux_amd64.tar.gz
           chmod +x mcp-publisher
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Authenticate with OIDC
         run: ./mcp-publisher auth github-oidc
