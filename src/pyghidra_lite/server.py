@@ -111,6 +111,7 @@ _LARGE_BINARY_MB = 10
 # Async job tracking for analyze_binary
 _active_jobs: dict[str, dict] = {}  # unit_id → job dict
 _active_jobs_lock: asyncio.Lock | None = None  # initialized in serve
+_jobs_mutex = threading.Lock()  # guards _active_jobs dict mutations from sync callers
 _worker_semaphore: asyncio.Semaphore | None = None  # initialized in serve, default 4
 
 # Valid unit_id format: 16 lowercase hex chars (64-bit xxHash)
@@ -418,7 +419,9 @@ def _last_opened_by_unit_id() -> dict[str, str]:
 def _find_on_disk(binary: str) -> str | None:
     """Return unit_id for a completed on-disk project matching binary (unit_id hex or filename).
 
-    Raises McpError for in-progress/errored unit_ids or ambiguous filename matches.
+    Raises McpError for in-progress/errored unit_ids.
+    For ambiguous filename matches, logs a warning and selects never-opened first,
+    then most-recently-opened.
     Used by _get_handle to auto-lazy-load programs that exist on disk but aren't loaded.
     """
     projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
@@ -462,7 +465,8 @@ def _find_on_disk(binary: str) -> str | None:
         chosen = matches[0][0]
         others = [uid for uid, _ in matches[1:]]
         logger.warning(
-            "Ambiguous name %r: %d projects match. Picking most recently opened %r. Others: %s",
+            "Ambiguous name %r: %d projects match. Picking preferred project %r"
+            " (never-opened first, then most recently opened). Others: %s",
             binary, len(matches), chosen, others,
         )
         return chosen
@@ -481,19 +485,20 @@ def _get_handle(binary: str):
     unit_id = _find_on_disk(binary)
     if unit_id:
         loaded = _hot_load_blocking(unit_id)  # RLock allows reentry; one-time cost per session
-        try:
-            return backend.get_program(binary)
-        except ValueError:
-            if loaded:
-                raise McpError(ErrorData(
-                    code=INTERNAL_ERROR,
-                    message=f"Hot-loaded {unit_id!r} but {binary!r} still not accessible; "
-                            "internal name mismatch — try the full program name from list_binaries()",
-                ))
+        # Resolve by unit_id — avoids re-triggering ambiguity on the original input string
+        for handle in backend.programs.values():
+            if handle.unit_id == unit_id:
+                return handle
+        if loaded:
             raise McpError(ErrorData(
                 code=INTERNAL_ERROR,
-                message=f"Hot-load failed for {unit_id!r}; check server logs",
+                message=f"Hot-loaded {unit_id!r} but program not found in backend; "
+                        "internal name mismatch — try the full program name from list_binaries()",
             ))
+        raise McpError(ErrorData(
+            code=INTERNAL_ERROR,
+            message=f"Hot-load failed for {unit_id!r}; check server logs",
+        ))
 
     # Nothing found — list what's available
     loaded_names = list(backend.programs.keys())
@@ -1189,6 +1194,10 @@ async def _autopurge_stale_projects() -> None:
             continue  # Never opened — brand new, skip
         if last_open < cutoff_str:  # ISO UTC strings compare lexicographically
             try:
+                with _backend_lock:
+                    active_ids = set(get_backend()._projects.keys()) if _backend else set()
+                if uid in active_ids:
+                    continue  # in-use — skip purge
                 shutil.rmtree(project_base / uid)
                 purged.append((uid, data.get("binary_name", uid)))
                 logger.info("Autopurged %s (%s), last opened %s", data.get("binary_name", uid), uid, last_open)
@@ -1220,7 +1229,8 @@ async def _stale_job_monitor(interval: int = 30):
                         "error": f"Worker process {pid} died unexpectedly",
                         "phase": "unknown",
                     })
-                    _active_jobs.pop(uid, None)
+                    with _jobs_mutex:
+                        _active_jobs.pop(uid, None)
 
 
 # =============================================================================
@@ -1328,7 +1338,7 @@ async def import_binary(
             if proj_path.exists():
                 shutil.rmtree(proj_path, ignore_errors=True)
             async with (_active_jobs_lock or nullcontext()):
-                _active_jobs.pop(unit_id, None)
+                _kill_job(unit_id)
             logger.info("fresh=True: purged all cached state for unit_id=%s", unit_id)
 
         # Already loaded in memory?
@@ -1413,7 +1423,8 @@ async def import_binary(
                 "profile": profile,
                 "pid": None,
             }
-            _active_jobs[unit_id] = job
+            with _jobs_mutex:
+                _active_jobs[unit_id] = job
             asyncio.create_task(_run_worker(p, unit_id, profile, job))
             return {
                 "unit_id": unit_id,
@@ -1586,7 +1597,8 @@ async def analyze_binary(
                 "profile": profile,
                 "pid": None,
             }
-            _active_jobs[unit_id] = job
+            with _jobs_mutex:
+                _active_jobs[unit_id] = job
             asyncio.create_task(_run_worker(path, unit_id, profile, job))
 
         results.append({
@@ -1649,7 +1661,8 @@ async def analysis_status(
                 "capabilities": _format_capabilities(caps),
             })
             async with (_active_jobs_lock or nullcontext()):
-                _active_jobs.pop(uid, None)
+                with _jobs_mutex:
+                    _active_jobs.pop(uid, None)
             continue
 
         # Read status file from disk
@@ -3311,7 +3324,8 @@ def hermes_endpoints(binary: str, ctx: Context, limit: int = 50) -> list[dict]:
 
 def _kill_job(unit_id: str) -> None:
     """Kill any active worker for unit_id and remove it from _active_jobs."""
-    job = _active_jobs.pop(unit_id, None)
+    with _jobs_mutex:
+        job = _active_jobs.pop(unit_id, None)
     if job:
         pid = job.get("pid")
         if pid:
@@ -3338,15 +3352,26 @@ def delete_binary(binary: str, ctx: Context) -> str:
 
         # --- Path 1: loaded in memory — search without triggering auto-load ---
         handle = None
-        for h in list(backend.programs.values()):
-            if binary in (h.name, h.unit_id) or binary in h.name:
-                handle = h
-                break
+        exact   = [h for h in backend.programs.values() if binary in (h.name, h.unit_id)]
+        partial = [h for h in backend.programs.values() if binary in h.name] if not exact else []
+        matches = exact or partial
+        if len(matches) > 1:
+            candidates = [f"{h.name} ({h.unit_id})" for h in matches]
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Ambiguous match for {binary!r}: {candidates}. Use exact name or unit_id.",
+            ))
+        handle = matches[0] if matches else None
 
         if handle is not None:
             unit_id = handle.unit_id
             _capabilities.pop(unit_id, None)
-            backend.delete_program(handle.name)
+            deleted = backend.delete_program(handle.name)
+            if not deleted:
+                raise McpError(ErrorData(
+                    code=INTERNAL_ERROR,
+                    message=f"Failed to delete {handle.name!r} from Ghidra project",
+                ))
             _kill_job(unit_id)
             shutil.rmtree(project_base / unit_id, ignore_errors=True)
             return f"Deleted {handle.name} ({unit_id})"

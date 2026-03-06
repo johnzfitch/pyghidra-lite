@@ -148,6 +148,15 @@ class StringXref(BaseModel):
     refs: list[str] = []            # Function names that reference this
     # Hints
     looks_like: str | None = None   # url, path, key, error, format_string
+    section: str | None = None      # ".rodata", ".strtab", ".data", etc.
+
+
+class EmbeddedRuntime(BaseModel):
+    """Detected embedded runtime payload within a binary."""
+    type: str            # "bunfs", "electron_asar", "upx", etc.
+    confidence: str      # "high" | "medium" | "low"
+    strategy: str        # "search_payload" | "unpack_first" | "external_tools"
+    payload_offset: str | None = None  # Only present when strategy == "search_payload"
 
 
 # =============================================================================

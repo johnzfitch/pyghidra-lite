@@ -233,6 +233,19 @@ def test_find_bytes_handles_uppercase_0X_prefix() -> None:
     assert result == []
 
 
+def test_available_tools_includes_v0_5_tools() -> None:
+    """Regression: v0.5.0 layer-aware tools must be in the base available_tools list."""
+    caps = server.BinaryCapabilities(name="sample")
+    tools = server._available_tools(caps)
+    for tool in (
+        "detect_embedded_runtime",
+        "search_strings_deep",
+        "batch_search_strings",
+        "extract_strings_from_blob",
+    ):
+        assert tool in tools, f"Expected '{tool}' in base available_tools"
+
+
 def test_no_deprecated_get_event_loop() -> None:
     """Regression: asyncio.get_event_loop() was replaced with get_running_loop()."""
     import inspect
@@ -262,9 +275,158 @@ def test_file_consolidation_lang_importable() -> None:
     assert demangle_swift is not None
 
 
-def test_total_tool_count_at_least_49() -> None:
-    """Sanity check: 39 original + 10 new = 49 total tools."""
+def test_total_tool_count_at_least_53() -> None:
+    """Sanity check: 49 existing + 4 new (v0.5.0) = 53 total tools."""
     import re
     src = open("src/pyghidra_lite/server.py").read()
     count = len(re.findall(r"^@mcp\.tool\(\)", src, re.MULTILINE))
-    assert count >= 49, f"Expected >= 49 @mcp.tool() decorators, found {count}"
+    assert count >= 53, f"Expected >= 53 @mcp.tool() decorators, found {count}"
+
+
+# =============================================================================
+# Tests added for 0.5.1 bootstrap / version-tracking fixes (PR #8 follow-up)
+# =============================================================================
+
+def _make_mock_handle(name: str, unit_id: str, named: int, total: int, analyzed: bool = True):
+    """Build a minimal mock ProgramHandle for bootstrap tests (no JVM)."""
+    from unittest.mock import MagicMock
+
+    handle = MagicMock()
+    handle.name = name
+    handle.unit_id = unit_id
+    handle.analyzed = analyzed
+
+    fm = MagicMock()
+    fm.getFunctionCount.return_value = total
+
+    def _fake_functions(forward=True):
+        funcs = []
+        # named_functions get human names; rest get FUN_* auto-names
+        for i in range(named):
+            f = MagicMock()
+            f.getName.return_value = f"real_func_{i}"
+            funcs.append(f)
+        for i in range(total - named):
+            f = MagicMock()
+            f.getName.return_value = f"FUN_{i:08x}"
+            funcs.append(f)
+        return iter(funcs)
+
+    fm.getFunctions.side_effect = _fake_functions
+    handle.program.getFunctionManager.return_value = fm
+    return handle
+
+
+def test_rank_bootstrap_sources_sorted_descending(monkeypatch: pytest.MonkeyPatch) -> None:
+    """rank_bootstrap_sources (via _rank_sources_blocking) returns list sorted by named_functions desc."""
+    from unittest.mock import MagicMock
+
+    handle_a = _make_mock_handle("claude-old", "a" * 16, named=800, total=1000)
+    handle_b = _make_mock_handle("claude-new", "b" * 16, named=200, total=1000)
+
+    backend = MagicMock()
+    backend.programs = {"a" * 16: handle_a, "b" * 16: handle_b}
+
+    monkeypatch.setattr(server, "_backend", backend)
+    monkeypatch.setattr(server, "get_backend", lambda: backend)
+
+    result = server._rank_sources_blocking()
+
+    assert len(result) == 2
+    assert result[0]["name"] == "claude-old"
+    assert result[0]["named_functions"] == 800
+    assert result[1]["name"] == "claude-new"
+    assert result[1]["named_functions"] == 200
+    # Descending order
+    assert result[0]["named_functions"] >= result[1]["named_functions"]
+
+
+def test_rank_bootstrap_sources_excludes_dest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_rank_sources_blocking excludes the dest_binary from results."""
+    from unittest.mock import MagicMock
+
+    handle_a = _make_mock_handle("source", "a" * 16, named=500, total=1000)
+    handle_b = _make_mock_handle("dest", "b" * 16, named=100, total=1000)
+
+    backend = MagicMock()
+    backend.programs = {"a" * 16: handle_a, "b" * 16: handle_b}
+
+    monkeypatch.setattr(server, "_backend", backend)
+    monkeypatch.setattr(server, "get_backend", lambda: backend)
+
+    result = server._rank_sources_blocking(exclude_name="dest")
+    names = [r["name"] for r in result]
+    assert "dest" not in names
+    assert "source" in names
+
+
+def test_rank_bootstrap_sources_named_pct(monkeypatch: pytest.MonkeyPatch) -> None:
+    """named_pct field is rounded percentage of named/total."""
+    from unittest.mock import MagicMock
+
+    handle = _make_mock_handle("binary", "a" * 16, named=1, total=4)
+    backend = MagicMock()
+    backend.programs = {"a" * 16: handle}
+    monkeypatch.setattr(server, "_backend", backend)
+    monkeypatch.setattr(server, "get_backend", lambda: backend)
+
+    result = server._rank_sources_blocking()
+    assert result[0]["named_pct"] == 25.0
+
+
+def test_kill_job_acquires_jobs_mutex() -> None:
+    """_kill_job removes entry from _active_jobs under _jobs_mutex; SIGTERM on live pid."""
+    import signal as _signal
+    from unittest.mock import patch
+
+    server._active_jobs["test_uid"] = {"status": "analyzing", "pid": None}
+    with patch.object(_signal, "SIGTERM", _signal.SIGTERM):
+        server._kill_job("test_uid")
+
+    assert "test_uid" not in server._active_jobs
+
+
+def test_kill_job_sends_sigterm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_kill_job sends SIGTERM to the stored pid."""
+    signals_sent = []
+
+    def _fake_kill(pid, sig):
+        signals_sent.append((pid, sig))
+
+    monkeypatch.setattr(server.os, "kill", _fake_kill)
+    server._active_jobs["uid2"] = {"status": "analyzing", "pid": 99999}
+    server._kill_job("uid2")
+
+    assert "uid2" not in server._active_jobs
+    assert (99999, server.signal.SIGTERM) in signals_sent
+
+
+def test_delete_binary_ambiguous_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """delete_binary raises INVALID_PARAMS when multiple handles share the substring."""
+    from unittest.mock import MagicMock
+    from mcp.types import INVALID_PARAMS
+
+    handle_a = MagicMock()
+    handle_a.name = "claude-aaaaaaaaaaaaaaa1"
+    handle_a.unit_id = "a" * 16
+
+    handle_b = MagicMock()
+    handle_b.name = "claude-bbbbbbbbbbbbbb1"
+    handle_b.unit_id = "b" * 16
+
+    backend = MagicMock()
+    backend.programs = {"a" * 16: handle_a, "b" * 16: handle_b}
+    monkeypatch.setattr(server, "_backend", backend)
+    monkeypatch.setattr(server, "get_backend", lambda: backend)
+
+    config = server.ServerConfig(allow_any_path=True)
+    monkeypatch.setattr(server, "_server_config", config)
+
+    with pytest.raises(McpError) as exc:
+        # "claude" is a substring of both handle names
+        server.delete_binary("claude", None)
+
+    error = getattr(exc.value, "error", None) or getattr(exc.value, "data", None)
+    assert error is not None
+    assert error.code == INVALID_PARAMS
+    assert "Ambiguous" in error.message

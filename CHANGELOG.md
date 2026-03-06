@@ -5,6 +5,27 @@ All notable changes to pyghidra-lite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-03
+
+### Added
+- **`detect_embedded_runtime` tool**: Identifies embedded runtime payloads (Bun/BunFS,
+  Electron ASAR, Node SEA, PyInstaller, UPX, V8 snapshot, Lua bytecode) with confidence
+  ratings and recommended search strategies (`external_tools`, `search_payload`,
+  `unpack_first`). Replaces 8+ exploratory tool calls with one definitive answer.
+- **`search_strings_deep` tool**: Raw memory scan for printable ASCII strings, bypassing
+  Ghidra's defined-string list. Useful for lightly-analyzed sections. Supports section
+  filtering and optional high-entropy skip.
+- **`batch_search_strings` tool**: Searches up to 20 patterns in one call. Reads memory
+  blocks once and scans all queries simultaneously. Returns `{query: count}` compact or
+  `{query: hits[]}` verbose.
+- **`extract_strings_from_blob` tool**: Extracts strings from a raw memory region without
+  decompression. Accepts `payload_offset` from `detect_embedded_runtime` for uncompressed
+  payloads (ASAR, Node SEA).
+- **`StringXref.section`**: Section provenance (`.rodata`, `.strtab`, etc.) added to all
+  `search_strings` results. Non-breaking — field defaults to None.
+- **`EmbeddedRuntime` model**: New model for runtime detection results with `type`,
+  `confidence`, `strategy`, and optional `payload_offset`.
+
 ## [0.4.0] - 2026-03-01
 
 ### Added
