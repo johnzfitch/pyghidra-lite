@@ -20,6 +20,7 @@ import re
 import click
 from mcp.server import Server
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import BaseModel
 from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
 
@@ -38,6 +39,7 @@ from pyghidra_lite.models import (
     BytesResult,
     CrossRef,
     DecompiledFunction,
+    EmbeddedRuntime,
     ExportInfo,
     FunctionInfo,
     ImportInfo,
@@ -126,6 +128,7 @@ class ServerConfig:
     allow_any_path: bool = False
     allowed_paths: list[Path] = field(default_factory=list)
     shared: bool = False  # True for SSE (shared server), False for stdio (isolated)
+    autopurge_days: int | None = None  # Delete projects not opened in N days (None = off)
 
     def resolved_allowed_paths(self) -> list[Path]:
         """Return de-duplicated, resolved allowlist roots."""
@@ -224,6 +227,7 @@ def configure_server(
     allow_any_path: bool | None = None,
     allowed_paths: list[Path] | None = None,
     shared: bool | None = None,
+    autopurge_days: int | None = None,
 ) -> None:
     """Apply runtime configuration for backend and import policy."""
     global _server_config
@@ -243,6 +247,8 @@ def configure_server(
         _server_config.allowed_paths.extend(allowed_paths)
     if shared is not None:
         _server_config.shared = shared
+    if autopurge_days is not None:
+        _server_config.autopurge_days = autopurge_days
 
 
 def get_backend() -> GhidraBackend:
@@ -347,9 +353,160 @@ def _resolve_import_path(path: str) -> Path:
     raise ValueError(f"Path not allowed: {resolved}. Allowed: {roots}")
 
 
+def _iter_disk_status():
+    """Yield (unit_id, status_dict) for every valid .analysis_status file on disk."""
+    projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    if not projects_path.exists():
+        return
+    for entry in projects_path.iterdir():
+        if not entry.is_dir() or not _UNIT_ID_RE.match(entry.name):
+            continue
+        status_file = entry / ".analysis_status"
+        if not status_file.exists():
+            continue
+        try:
+            yield entry.name, json.loads(status_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+
+
+def _history_path() -> Path:
+    return Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / "history.jsonl"
+
+
+def _append_history(unit_id: str, binary_name: str) -> None:
+    """Append one open event to history.jsonl (non-blocking, best-effort)."""
+    from datetime import datetime, timezone
+    entry = {
+        "unit_id": unit_id,
+        "binary_name": binary_name,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        p = _history_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        logger.debug("Failed to write history: %s", e)
+
+
+def _last_opened_by_unit_id() -> dict[str, str]:
+    """Read history.jsonl and return {unit_id: most_recent_opened_at ISO string}."""
+    result: dict[str, str] = {}
+    path = _history_path()
+    if not path.exists():
+        return result
+    try:
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+                uid = entry.get("unit_id", "")
+                opened_at = entry.get("opened_at", "")
+                # Lines are chronological; later lines overwrite earlier ones
+                if uid and opened_at:
+                    result[uid] = opened_at
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        pass
+    return result
+
+
+def _find_on_disk(binary: str) -> str | None:
+    """Return unit_id for a completed on-disk project matching binary (unit_id hex or filename).
+
+    Raises McpError for in-progress/errored unit_ids or ambiguous filename matches.
+    Used by _get_handle to auto-lazy-load programs that exist on disk but aren't loaded.
+    """
+    projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    if not projects_path.exists():
+        return None
+
+    # Fast path: exact unit_id match
+    if _UNIT_ID_RE.match(binary):
+        status_file = projects_path / binary / ".analysis_status"
+        if status_file.exists():
+            try:
+                data = json.loads(status_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                return None
+            status = data.get("status")
+            if status == "complete":
+                return binary
+            # Exists but not ready — give a specific error rather than "not found"
+            msg = f"Unit {binary!r} found but status={status!r}"
+            if status in ("analyzing", "queued"):
+                msg += ". Poll with analysis_status() for progress."
+            elif status == "error":
+                msg += f": {data.get('error', 'unknown error')}"
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=msg))
+        return None
+
+    # Slow path: exact basename match against binary_name
+    binary_base = Path(binary).name
+    matches: list[tuple[str, dict]] = []
+    for unit_id, data in _iter_disk_status():
+        if data.get("status") == "complete" and data.get("binary_name", "") == binary_base:
+            matches.append((unit_id, data))
+
+    if len(matches) > 1:
+        # Sort: never-opened (brand new) first, then by most recently opened per history.
+        last_opened = _last_opened_by_unit_id()
+        matches.sort(
+            key=lambda t: (last_opened.get(t[0]) is None, last_opened.get(t[0]) or ""),
+            reverse=True,
+        )
+        chosen = matches[0][0]
+        others = [uid for uid, _ in matches[1:]]
+        logger.warning(
+            "Ambiguous name %r: %d projects match. Picking most recently opened %r. Others: %s",
+            binary, len(matches), chosen, others,
+        )
+        return chosen
+    return matches[0][0] if matches else None
+
+
 def _get_handle(binary: str):
     backend = get_backend()
-    return backend.get_program(binary)
+    try:
+        return backend.get_program(binary)
+    except ValueError:
+        pass
+
+    # Auto-lazy-load: find a completed project on disk by unit_id or filename
+    # (raises McpError for in-progress/ambiguous — let that propagate)
+    unit_id = _find_on_disk(binary)
+    if unit_id:
+        loaded = _hot_load_blocking(unit_id)  # RLock allows reentry; one-time cost per session
+        try:
+            return backend.get_program(binary)
+        except ValueError:
+            if loaded:
+                raise McpError(ErrorData(
+                    code=INTERNAL_ERROR,
+                    message=f"Hot-loaded {unit_id!r} but {binary!r} still not accessible; "
+                            "internal name mismatch — try the full program name from list_binaries()",
+                ))
+            raise McpError(ErrorData(
+                code=INTERNAL_ERROR,
+                message=f"Hot-load failed for {unit_id!r}; check server logs",
+            ))
+
+    # Nothing found — list what's available
+    loaded_names = list(backend.programs.keys())
+    on_disk = [
+        v.get("binary_name", k)
+        for k, v in _iter_disk_status()
+        if v.get("status") == "complete"
+        and k not in {h.unit_id for h in backend.programs.values()}
+    ]
+    msg = f"Binary not found: {binary!r}. Loaded: {loaded_names}."
+    if on_disk:
+        msg += f" Available on disk (auto-loads on tool call): {on_disk}"
+    raise McpError(ErrorData(code=INVALID_PARAMS, message=msg))
 
 
 def _ensure_capabilities(handle) -> BinaryCapabilities:
@@ -377,7 +534,12 @@ def _available_tools(caps: BinaryCapabilities) -> list[str]:
         # Search
         "search_all",
         "search_strings",
+        "search_strings_deep",
+        "batch_search_strings",
         "search_symbols",
+        # Layer detection & blob extraction
+        "detect_embedded_runtime",
+        "extract_strings_from_blob",
         # Xrefs
         "get_xrefs",
         "batch_xrefs",
@@ -422,6 +584,41 @@ def _guarded_tool_call(action: str, op):
 def _with_handle(action: str, binary: str, op):
     with _backend_lock:
         return _guarded_tool_call(action, lambda: op(_get_handle(binary)))
+
+
+def _rank_sources_blocking(exclude_name: str | None = None) -> list[dict]:
+    """Rank loaded+analyzed binaries by transferable named function count.
+
+    Counts functions whose names are not auto-generated (FUN_* / thunk_FUN_*),
+    since those are the only names that bootstrap_from_version can transfer.
+    Results are sorted descending — index 0 is the richest source.
+
+    Lock is held only to snapshot the handles list; JVM enumeration runs unlocked.
+    """
+    with _backend_lock:
+        backend = get_backend()
+        handles = [h for h in backend.programs.values() if h.analyzed]
+
+    results = []
+    for handle in handles:
+        if exclude_name and handle.name == exclude_name:
+            continue
+        fm = handle.program.getFunctionManager()
+        total = fm.getFunctionCount()
+        named = sum(
+            1 for f in fm.getFunctions(True)
+            if not f.getName().startswith(("FUN_", "thunk_FUN_"))
+        )
+        results.append({
+            "name": handle.name,
+            "unit_id": handle.unit_id,
+            "total_functions": total,
+            "named_functions": named,
+            "named_pct": round(named / total * 100, 1) if total else 0.0,
+        })
+
+    results.sort(key=lambda r: r["named_functions"], reverse=True)
+    return results
 
 
 async def _warn_if_limit_reached(
@@ -577,6 +774,9 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
     # Recover any in-progress jobs from previous server run
     await _recover_in_progress_jobs()
 
+    # Purge projects not opened within autopurge_days (never-opened projects are exempt)
+    await _autopurge_stale_projects()
+
     # Start background stale job monitor
     stale_task = asyncio.create_task(_stale_job_monitor(interval=30))
 
@@ -722,21 +922,35 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
         asyncio.get_running_loop().call_later(300, _active_jobs.pop, unit_id, None)
 
 
-def _hot_load_blocking(unit_id: str) -> None:
-    """Load a completed project into the running backend (blocking, runs in thread pool)."""
+def _hot_load_blocking(unit_id: str) -> bool:
+    """Load a completed project into the running backend (blocking, runs in thread pool).
+
+    Returns True if the program is now in backend.programs (loaded here or already loaded),
+    False if it could not be loaded.
+    """
     with _backend_lock:
         if _backend is None:
-            return
+            return False
         # Already loaded (race guard)
         if any(h.unit_id == unit_id for h in _backend.programs.values()):
-            return
+            return True
 
+        # Projects written by worker subprocesses live at base project_dir/unit_id,
+        # not at the session-scoped backend.project_dir used for in-process imports.
         project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
         if not project_dir.exists():
-            return
+            return False
 
         try:
-            project = _backend._get_or_create_project_for_binary(unit_id)
+            from ghidra.base.project import GhidraProject
+            from ghidra.framework.model import ProjectLocator
+
+            project_str = str(project_dir.absolute())
+            locator = ProjectLocator(project_str, unit_id)
+            if not locator.exists():
+                logger.warning(f"Ghidra project missing for hot-load: {project_dir}")
+                return False
+            project = GhidraProject.openProject(project_str, unit_id, True)
             _backend._projects[unit_id] = project
 
             root_folder = project.getRootFolder()
@@ -751,9 +965,14 @@ def _hot_load_blocking(unit_id: str) -> None:
                     _backend.programs[prog_name] = handle
                     _ensure_capabilities(handle)
                     logger.info(f"Hot-loaded {prog_name} (unit_id={unit_id})")
-                    break  # One program per project
+                    binary_name = _read_status_file(unit_id).get("binary_name", prog_name)
+                    _append_history(unit_id, binary_name)
+                    return True  # One program per project
+            logger.warning(f"Hot-load: no programs found in project {unit_id}")
+            return False
         except Exception as e:
             logger.error(f"Failed to hot-load {unit_id}: {e}")
+            return False
 
 
 async def _hot_load(unit_id: str) -> None:
@@ -918,7 +1137,7 @@ async def _recover_in_progress_jobs():
             continue
 
         if status.get("status") == "complete":
-            continue  # Will be handled by eager_load or watcher
+            continue  # Loaded lazily on first tool call via _get_handle/_find_on_disk
 
         pid = status.get("pid")
         alive = pid and _pid_alive(pid)
@@ -942,6 +1161,42 @@ async def _recover_in_progress_jobs():
             status["error"] = f"Worker process {pid} died (server restarted)"
             _write_status_file(uid, status)
             logger.warning(f"Marked stale job {uid} as error (pid={pid})")
+
+
+async def _autopurge_stale_projects() -> None:
+    """Delete on-disk projects whose last open was more than autopurge_days days ago.
+
+    Brand-new analyses (never opened, no history entry) are always skipped — they
+    may be freshly analyzed and waiting for an agent to start working on them.
+    """
+    days = _server_config.autopurge_days
+    if not days or days <= 0:
+        return
+
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_str = cutoff.isoformat()
+
+    last_opened = _last_opened_by_unit_id()
+    project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+
+    purged = []
+    for uid, data in _iter_disk_status():
+        if data.get("status") != "complete":
+            continue
+        last_open = last_opened.get(uid)
+        if last_open is None:
+            continue  # Never opened — brand new, skip
+        if last_open < cutoff_str:  # ISO UTC strings compare lexicographically
+            try:
+                shutil.rmtree(project_base / uid)
+                purged.append((uid, data.get("binary_name", uid)))
+                logger.info("Autopurged %s (%s), last opened %s", data.get("binary_name", uid), uid, last_open)
+            except OSError as e:
+                logger.warning("Failed to autopurge %s: %s", uid, e)
+
+    if purged:
+        logger.info("Autopurge complete: removed %d project(s)", len(purged))
 
 
 async def _stale_job_monitor(interval: int = 30):
@@ -977,6 +1232,7 @@ def _do_import_blocking(
     profile_enum: AnalysisProfile,
     analyze: bool,
     tracker: ProgressTracker,
+    fresh: bool = False,
 ) -> tuple:
     """Blocking import operation (runs in thread pool).
 
@@ -991,7 +1247,7 @@ def _do_import_blocking(
     with _backend_lock:
         backend = get_backend()
         tracker.update(20, "Importing to Ghidra")
-        handle = backend.import_binary(p, profile_enum, analyze=False)
+        handle = backend.import_binary(p, profile_enum, analyze=False, fresh=fresh)
 
     tracker.update(40, "Import complete")
 
@@ -1017,6 +1273,7 @@ async def import_binary(
     profile: str = "fast",
     analyze: bool = True,
     list_tools: bool = False,
+    fresh: bool = False,
 ) -> dict:
     """Import and analyze a binary file.
 
@@ -1030,6 +1287,9 @@ async def import_binary(
         profile: Analysis depth - "fast" (default), "default", or "deep".
         analyze: Run analysis (set False to import without analyzing).
         list_tools: Include available_tools list (default False, saves tokens).
+        fresh: If True, discard any cached/previous analysis for this binary
+               and re-import from scratch. Use when a prior run was corrupted,
+               used the wrong profile, or produced unexpected results.
     """
     try:
         p = _resolve_import_path(path)
@@ -1057,26 +1317,41 @@ async def import_binary(
         _require_backend()
         unit_id = compute_unit_id_streaming(p)
 
+        # fresh=True: purge everything before any caching checks so the
+        # subsequent import and worker spawn always start from a clean slate.
+        if fresh:
+            with _backend_lock:
+                if _backend:
+                    _backend._purge_binary(unit_id)
+            project_dir_fresh = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+            proj_path = project_dir_fresh / unit_id
+            if proj_path.exists():
+                shutil.rmtree(proj_path, ignore_errors=True)
+            async with (_active_jobs_lock or nullcontext()):
+                _active_jobs.pop(unit_id, None)
+            logger.info("fresh=True: purged all cached state for unit_id=%s", unit_id)
+
         # Already loaded in memory?
-        with _backend_lock:
-            loaded_handles = list(_backend.programs.values()) if _backend else []
-        for h in loaded_handles:
-            if h.unit_id == unit_id and h.analyzed:
-                caps = _ensure_capabilities(h)
-                return {
-                    "unit_id": unit_id,
-                    "binary_name": p.name,
-                    "kind": kind,
-                    "status": "ready",
-                    "functions": h.program.getFunctionManager().getFunctionCount(),
-                    "capabilities": _format_capabilities(caps),
-                }
+        if not fresh:
+            with _backend_lock:
+                loaded_handles = list(_backend.programs.values()) if _backend else []
+            for h in loaded_handles:
+                if h.unit_id == unit_id and h.analyzed:
+                    caps = _ensure_capabilities(h)
+                    return {
+                        "unit_id": unit_id,
+                        "binary_name": p.name,
+                        "kind": kind,
+                        "status": "ready",
+                        "functions": h.program.getFunctionManager().getFunctionCount(),
+                        "capabilities": _format_capabilities(caps),
+                    }
 
         # Check disk: already analyzed by a previous import run? (outside lock)
         project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
         gpr = project_dir / unit_id / f"{unit_id}.gpr"
         status_file = project_dir / unit_id / ".analysis_status"
-        if gpr.exists() and status_file.exists():
+        if not fresh and gpr.exists() and status_file.exists():
             try:
                 status_data = json.loads(status_file.read_text())
                 if status_data.get("status") == "complete":
@@ -1112,8 +1387,8 @@ async def import_binary(
                 pass
 
         async with (_active_jobs_lock or nullcontext()):
-            # Already in progress?
-            if unit_id in _active_jobs:
+            # Already in progress? (skip check when fresh — we just cleared the job)
+            if not fresh and unit_id in _active_jobs:
                 job = _active_jobs[unit_id]
                 if job.get("status") not in ("complete", "error"):
                     return {
@@ -1161,7 +1436,7 @@ async def import_binary(
     # Run blocking import in thread pool
     import_future = loop.run_in_executor(
         _import_executor,
-        lambda: _do_import_blocking(p, profile_enum, analyze, tracker)
+        lambda: _do_import_blocking(p, profile_enum, analyze, tracker, fresh=fresh)
     )
 
     # Report progress: every 10% change OR every 60s
@@ -1911,6 +2186,154 @@ def entropy_map(binary: str, ctx: Context) -> list[dict]:
 
 
 @mcp.tool()
+def detect_embedded_runtime(binary: str, ctx: Context, compact: bool = True) -> dict:
+    """Detect embedded runtime payloads within the binary.
+
+    Call this before search_strings on any unfamiliar binary to determine which
+    layer holds application logic. Returns the runtime type and the recommended
+    strategy for finding strings.
+
+    Strategies:
+      - "external_tools": payload is compressed (e.g. Bun/BunFS); raw scanning
+        is useless. Use external tools to extract it first.
+      - "search_payload": payload is uncompressed; pass payload_offset to
+        extract_strings_from_blob() to scan it directly.
+      - "unpack_first": payload is packed (e.g. UPX); unpack before scanning.
+
+    Args:
+        binary: Binary name.
+        compact: Return minimal output (default True). Set False for magic_address
+                 and section details per runtime entry.
+    """
+    return _with_handle(
+        "detect_embedded_runtime",
+        binary,
+        lambda handle: GhidraTools(handle).detect_embedded_runtime(compact=compact),
+    )
+
+
+@mcp.tool()
+def search_strings_deep(
+    binary: str,
+    query: str,
+    ctx: Context,
+    min_length: int = 4,
+    sections: list[str] | None = None,
+    skip_high_entropy: bool = False,
+    compact: bool = True,
+    limit: int = 20,
+) -> list[dict]:
+    """Raw memory scan for strings, bypassing Ghidra's defined-string list.
+
+    Finds strings in sections that Ghidra hasn't fully analyzed. Unlike
+    search_strings(), this scans raw bytes for printable ASCII runs.
+
+    For compressed payloads (Bun/BunFS), use detect_embedded_runtime() first —
+    raw scanning won't find readable strings in compressed data.
+
+    Args:
+        binary: Binary name.
+        query: Case-insensitive substring filter.
+        min_length: Minimum string length (default 4).
+        sections: Only scan these sections (e.g., [".rodata"]). Default: all.
+        skip_high_entropy: Skip sections with entropy > 7.5 (default False).
+        compact: Return [{value, address, section}] (default True).
+        limit: Max results (default 20).
+    """
+    return _with_handle(
+        "search_strings_deep",
+        binary,
+        lambda handle: GhidraTools(handle).search_strings_deep(
+            query,
+            min_length=min_length,
+            sections=sections,
+            skip_high_entropy=skip_high_entropy,
+            compact=compact,
+            limit=limit,
+        ),
+    )
+
+
+@mcp.tool()
+def batch_search_strings(
+    binary: str,
+    queries: list[str],
+    ctx: Context,
+    mode: str = "deep",
+    min_length: int = 4,
+    skip_high_entropy: bool = False,
+    compact: bool = True,
+    limit_per_query: int = 5,
+) -> dict:
+    """Search for multiple string patterns in one call.
+
+    Reads memory once and scans all queries simultaneously. More efficient
+    than multiple search_strings_deep() calls when checking many terms.
+
+    Args:
+        binary: Binary name.
+        queries: List of search patterns (max 20).
+        mode: "deep" (raw memory scan, default) or "indexed" (defined strings only).
+        min_length: Minimum string length (default 4).
+        skip_high_entropy: Skip high-entropy sections (default False).
+        compact: Return {query: count} (default True). If False, returns
+                 {query: [{value, address, section}]}.
+        limit_per_query: Max hits per query (default 5).
+    """
+    return _with_handle(
+        "batch_search_strings",
+        binary,
+        lambda handle: GhidraTools(handle).batch_search_strings(
+            queries,
+            mode=mode,
+            min_length=min_length,
+            skip_high_entropy=skip_high_entropy,
+            compact=compact,
+            limit_per_query=limit_per_query,
+        ),
+    )
+
+
+@mcp.tool()
+def extract_strings_from_blob(
+    binary: str,
+    offset: str,
+    size: int,
+    ctx: Context,
+    query: str = "",
+    min_length: int = 6,
+    compact: bool = True,
+    limit: int = 20,
+) -> list[dict]:
+    """Extract strings from a raw memory region (no decompression).
+
+    Use this to scan uncompressed embedded payloads (ASAR, Node SEA).
+    Pass the payload_offset returned by detect_embedded_runtime().
+
+    Args:
+        binary: Binary name.
+        offset: Start address (hex, e.g., "0x1b20000").
+        size: Region size in bytes (max 50MB).
+        query: Case-insensitive filter (default: all strings).
+        min_length: Minimum string length (default 6).
+        compact: Return [{value, address}] (default True). If False, adds blob_offset.
+        limit: Max results (default 20).
+    """
+    return _with_handle(
+        "extract_strings_from_blob",
+        binary,
+        lambda handle: GhidraTools(handle).extract_strings_from_blob(
+            offset,
+            size,
+            query=query,
+            min_length=min_length,
+            compact=compact,
+            limit=limit,
+        ),
+    )
+
+
+@mcp.tool()
 def diff_symbols(binary_a: str, binary_b: str, ctx: Context) -> dict:
     """Compare symbol tables of two binaries. Useful for patch diffing.
 
@@ -1947,6 +2370,123 @@ def diff_symbols(binary_a: str, binary_b: str, ctx: Context) -> dict:
 
     with _backend_lock:
         return _guarded_tool_call("diff_symbols", op)
+
+
+@mcp.tool()
+async def bootstrap_from_version(
+    dest_binary: str,
+    ctx: Context,
+    source_binary: str = "auto",
+    min_func_size: int = 16,
+    max_func_size: int = 4096,
+) -> dict:
+    """Transfer function names from an analyzed reference binary to a new version.
+
+    Uses exact byte matching to find identical functions between two binaries
+    and copies names from source to dest. Equivalent to running Ghidra's
+    'Exact Match Bytes' version tracking correlator, without the full VT framework.
+
+    Typical workflow:
+        1. Have an analyzed reference binary (e.g., 2.1.59) already loaded.
+        2. Import the new binary without analyzing: import_binary(path, analyze=False).
+        3. Call bootstrap_from_version(dest="claude-<new>") — source auto-selects.
+        4. Run analyze_binary on the new binary — pre-labeled functions speed analysis.
+
+    When source_binary="auto" (default), all loaded binaries are ranked by their count
+    of transferable named functions and presented to the user for confirmation via the
+    MCP elicitation surface. The user can accept the top-ranked choice or enter a
+    different binary name to override.
+
+    A name is transferred only when the byte pattern is unique in the destination
+    and the match address is an auto-named (FUN_*) function entry point.
+    Only executable memory sections are searched to avoid data false-positives.
+
+    Args:
+        dest_binary: Name of the target binary to annotate.
+        source_binary: Name of the reference binary, or "auto" to rank and confirm.
+        min_func_size: Minimum function byte size to transfer (default 16).
+        max_func_size: Maximum function byte size to consider (default 4096).
+    """
+    loop = asyncio.get_running_loop()
+
+    if source_binary == "auto":
+        ranked = await loop.run_in_executor(
+            _import_executor,
+            lambda: _rank_sources_blocking(exclude_name=dest_binary),
+        )
+
+        if not ranked:
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message="No analyzed binaries available as bootstrap sources. "
+                        "Import and analyze a reference binary first.",
+            ))
+
+        top = ranked[0]
+
+        lines = ["Ranked bootstrap sources (by transferable named functions):\n"]
+        for i, r in enumerate(ranked):
+            marker = "* " if i == 0 else "  "
+            lines.append(
+                f"  {marker}{i + 1}. {r['name']}"
+                f"  named={r['named_functions']:,}"
+                f"  total={r['total_functions']:,}"
+                f"  ({r['named_pct']}%)"
+            )
+        lines.append(f"\nAuto-selected: {top['name']}")
+        lines.append(
+            "Leave 'selected_source' blank to confirm, "
+            "or type a different binary name to override."
+        )
+
+        class _BootstrapConfirmation(BaseModel):
+            selected_source: str = ""
+
+        result = await ctx.elicit(message="\n".join(lines), schema=_BootstrapConfirmation)
+
+        if result.action in ("decline", "cancel"):
+            return {"status": "cancelled", "message": "Bootstrap cancelled by user."}
+
+        chosen = result.data.selected_source.strip()
+        source_binary = chosen if chosen else top["name"]
+
+    def _do_transfer():
+        def op():
+            return get_backend().transfer_analysis(
+                source_binary, dest_binary,
+                min_func_size=min_func_size,
+                max_func_size=max_func_size,
+            )
+        with _backend_lock:
+            return _guarded_tool_call("bootstrap_from_version", op)
+
+    return await loop.run_in_executor(_import_executor, _do_transfer)
+
+
+@mcp.tool()
+async def rank_bootstrap_sources(ctx: Context, dest_binary: str = "") -> list[dict]:
+    """Rank loaded binaries by their transferable named function count.
+
+    Use this to identify the best source binary for bootstrap_from_version.
+    The binary with the most non-FUN_* named functions will transfer the most
+    knowledge to a new version. Results are sorted descending.
+
+    Fields per entry:
+        name            - binary name as registered in pyghidra-lite
+        unit_id         - content-addressed ID
+        total_functions - total function count (including FUN_* auto-names)
+        named_functions - count of transferable named functions
+        named_pct       - named_functions as % of total
+
+    Args:
+        dest_binary: Optional. Exclude this binary from results (it's the target).
+    """
+    loop = asyncio.get_running_loop()
+    exclude = dest_binary.strip() or None
+    return await loop.run_in_executor(
+        _import_executor,
+        lambda: _rank_sources_blocking(exclude_name=exclude),
+    )
 
 
 @mcp.tool()
@@ -2769,21 +3309,80 @@ def hermes_endpoints(binary: str, ctx: Context, limit: int = 50) -> list[dict]:
 # PROJECT MANAGEMENT
 # =============================================================================
 
+def _kill_job(unit_id: str) -> None:
+    """Kill any active worker for unit_id and remove it from _active_jobs."""
+    job = _active_jobs.pop(unit_id, None)
+    if job:
+        pid = job.get("pid")
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
 @mcp.tool()
 def delete_binary(binary: str, ctx: Context) -> str:
-    """Remove binary from project.
+    """Remove a binary, its on-disk project, and any running analysis worker.
+
+    Works for loaded programs, completed on-disk projects, and errored/incomplete
+    analyses. Pass a unit_id (from list_binaries) to delete projects that failed
+    or never finished loading.
 
     Args:
-        binary: Binary name.
+        binary: Binary name, unit_id, or partial name match.
     """
     def op():
         backend = get_backend()
-        handle = backend.get_program(binary)
-        if handle.unit_id in _capabilities:
-            del _capabilities[handle.unit_id]
-        if backend.delete_program(handle.name):
-            return f"Deleted {handle.name}"
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Failed to delete {handle.name}"))
+        project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+
+        # --- Path 1: loaded in memory — search without triggering auto-load ---
+        handle = None
+        for h in list(backend.programs.values()):
+            if binary in (h.name, h.unit_id) or binary in h.name:
+                handle = h
+                break
+
+        if handle is not None:
+            unit_id = handle.unit_id
+            _capabilities.pop(unit_id, None)
+            backend.delete_program(handle.name)
+            _kill_job(unit_id)
+            shutil.rmtree(project_base / unit_id, ignore_errors=True)
+            return f"Deleted {handle.name} ({unit_id})"
+
+        # --- Path 2: disk-only (errored, incomplete, never loaded) ---
+        # Resolve a filename to a unit_id if needed
+        unit_id = binary
+        if not _UNIT_ID_RE.match(binary):
+            binary_base = Path(binary).name
+            candidates = [
+                uid for uid, data in _iter_disk_status()
+                if data.get("binary_name", "") == binary_base
+            ]
+            if not candidates:
+                raise McpError(ErrorData(
+                    code=INVALID_PARAMS,
+                    message=f"Not found: {binary!r}. Use unit_id from list_binaries().",
+                ))
+            if len(candidates) > 1:
+                raise McpError(ErrorData(
+                    code=INVALID_PARAMS,
+                    message=f"Ambiguous name {binary!r} matches {candidates}. Use unit_id.",
+                ))
+            unit_id = candidates[0]
+
+        project_dir = project_base / unit_id
+        if not project_dir.exists():
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Project not found: {unit_id!r}",
+            ))
+
+        binary_name = _read_status_file(unit_id).get("binary_name", unit_id)
+        _kill_job(unit_id)
+        shutil.rmtree(project_dir)
+        return f"Deleted {binary_name} ({unit_id})"
 
     with _backend_lock:
         return _guarded_tool_call("delete_binary", op)
@@ -2898,6 +3497,11 @@ def cli():
     default=False,
     help="Load all cached projects at startup (slower startup, higher memory).",
 )
+@click.option(
+    "--autopurge-days", type=int, default=None,
+    help="Delete projects not opened in this many days at startup. "
+         "Brand-new analyses (never opened) are always exempt.",
+)
 @click.argument("binaries", nargs=-1, type=click.Path(exists=True, path_type=Path))
 def serve_cmd(
     transport: str,
@@ -2912,6 +3516,7 @@ def serve_cmd(
     allow_any_path: bool,
     max_workers: int,
     eager_load: bool,
+    autopurge_days: int | None,
     binaries: tuple[Path, ...],
 ):
     """Start the MCP server (default when no subcommand given)."""
@@ -2935,6 +3540,7 @@ def serve_cmd(
         allow_any_path=allow_any_path,
         allowed_paths=list(allow_paths),
         shared=True,
+        autopurge_days=autopurge_days,
     )
     _check_prerequisites(ghidra_dir)
     with _backend_lock:

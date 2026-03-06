@@ -318,14 +318,56 @@ class GhidraBackend:
             metadata=metadata,
         )
 
+    def _purge_binary(self, unit_id: str) -> None:
+        """Evict a binary from memory and delete its on-disk Ghidra project.
+
+        Safe to call even if the binary is not currently loaded. Used by
+        import_binary(fresh=True) and can also be called directly for cleanup.
+        """
+        import shutil
+
+        # Close all in-memory program handles for this unit_id
+        to_remove = [name for name, h in self.programs.items() if h.unit_id == unit_id]
+        if unit_id in self._projects:
+            project = self._projects[unit_id]
+            for name in to_remove:
+                try:
+                    project.close(self.programs[name].program)
+                except Exception:
+                    pass
+            try:
+                project.close()
+            except Exception:
+                pass
+            del self._projects[unit_id]
+        for name in to_remove:
+            del self.programs[name]
+
+        # Wipe the on-disk project directory so the next import starts clean
+        project_path = self.project_dir / unit_id
+        if project_path.exists():
+            shutil.rmtree(project_path, ignore_errors=True)
+            logger.info("Purged project for unit_id=%s", unit_id)
+
     def import_binary(
         self,
         path: Path | str,
         profile: AnalysisProfile | str | None = None,
         analyze: bool = True,
         on_progress: Callable[[int], None] | None = None,
+        fresh: bool = False,
     ) -> ProgramHandle:
-        """Import and optionally analyze a binary."""
+        """Import and optionally analyze a binary.
+
+        Args:
+            path: Path to the binary file.
+            profile: Analysis depth profile.
+            analyze: Run analysis after import.
+            on_progress: Optional progress callback (called with function count).
+            fresh: If True, discard any existing Ghidra project for this binary
+                   and re-import from scratch. Use when a previous analysis is
+                   corrupted, incomplete, or run with a different profile.
+        """
         if not self._started:
             self.start()
 
@@ -342,11 +384,15 @@ class GhidraBackend:
         # Generate unique ID using streaming hash (memory-efficient)
         unit_id = compute_unit_id_streaming(path)
 
-        # Check if already imported
-        for handle in self.programs.values():
-            if handle.unit_id == unit_id:
-                logger.info("Program already imported (unit_id match): %s", handle.name)
-                return handle
+        if fresh:
+            self._purge_binary(unit_id)
+
+        # Check if already imported (bypassed when fresh since we just purged)
+        if not fresh:
+            for handle in self.programs.values():
+                if handle.unit_id == unit_id:
+                    logger.info("Program already imported (unit_id match): %s", handle.name)
+                    return handle
 
         prog_name = f"{path.name}-{unit_id[:8]}"
 
@@ -461,6 +507,164 @@ class GhidraBackend:
         handle.analyzed = True
         handle.profile = profile
         logger.info(f"Analysis complete: {name}")
+
+    def transfer_analysis(
+        self,
+        source_name: str,
+        dest_name: str,
+        min_func_size: int = 16,
+        max_func_size: int = 4096,
+    ) -> dict:
+        """Transfer function names from an analyzed source binary to a destination.
+
+        Uses exact byte matching to find identical functions between two binaries,
+        then copies names from source to destination. Equivalent to running Ghidra's
+        'Exact Match Bytes' version tracking correlator, without requiring the full
+        Version Tracking framework.
+
+        Only executable memory blocks are searched (avoids false matches in data
+        sections). A name is transferred only when the byte pattern appears exactly
+        once in the destination and the matching address is an unambiguously-named
+        (FUN_*) function entry point.
+
+        Args:
+            source_name: Name of the already-analyzed reference binary.
+            dest_name: Name of the target binary to annotate.
+            min_func_size: Minimum function size in bytes to consider (default 16).
+            max_func_size: Maximum function size in bytes to consider (default 4096).
+                           Very large functions are skipped — they're slow to search
+                           and rarely transfer cleanly across versions.
+
+        Returns:
+            Dict with transfer statistics.
+        """
+        from jpype import JByte
+        from ghidra.program.model.symbol import SourceType
+
+        source_handle = self.get_program(source_name)
+        dest_handle = self.get_program(dest_name)
+
+        source_mem = source_handle.program.getMemory()
+        dest_mem = dest_handle.program.getMemory()
+        dest_fm = dest_handle.program.getFunctionManager()
+        source_fm = source_handle.program.getFunctionManager()
+
+        # Collect only executable blocks from destination (avoids data false-positives)
+        dest_exec_blocks = [
+            (b.getStart(), b.getEnd())
+            for b in dest_mem.getBlocks()
+            if b.isInitialized() and b.isExecute()
+        ]
+
+        stats = {
+            "source": source_handle.name,
+            "dest": dest_handle.name,
+            "candidates": 0,
+            "matched_unique": 0,
+            "transferred": 0,
+            "skipped_multi_match": 0,
+            "skipped_no_match": 0,
+            "skipped_already_named": 0,
+            "skipped_size": 0,
+            "errors": 0,
+        }
+
+        transfers: list[tuple] = []
+
+        for func in source_fm.getFunctions(True):
+            name = func.getName()
+            # Skip auto-generated and thunk names — nothing meaningful to transfer
+            if name.startswith("FUN_") or name.startswith("thunk_FUN_"):
+                continue
+
+            size = int(func.getBody().getNumAddresses())
+            if size < min_func_size or size > max_func_size:
+                stats["skipped_size"] += 1
+                continue
+
+            stats["candidates"] += 1
+
+            # Read function bytes from source
+            entry = func.getEntryPoint()
+            buf = JByte[size]
+            try:
+                n = source_mem.getBytes(entry, buf)
+                if n != size:
+                    stats["errors"] += 1
+                    continue
+            except Exception:
+                stats["errors"] += 1
+                continue
+
+            # Build signed Java byte arrays (Java byte is signed: 0xFF → -1)
+            java_needle = JByte[size]
+            java_mask = JByte[size]
+            for i in range(size):
+                b = buf[i] & 0xFF
+                java_needle[i] = b if b < 128 else b - 256
+                java_mask[i] = -1  # 0xFF: match all bits exactly
+
+            # Search executable blocks in destination; stop after 2 hits
+            matches = []
+            for blk_start, blk_end in dest_exec_blocks:
+                addr = dest_mem.findBytes(blk_start, blk_end, java_needle, java_mask, True, None)
+                while addr is not None:
+                    matches.append(addr)
+                    if len(matches) > 1:
+                        break
+                    next_addr = addr.add(1)
+                    if next_addr.compareTo(blk_end) > 0:
+                        break
+                    addr = dest_mem.findBytes(next_addr, blk_end, java_needle, java_mask, True, None)
+                if len(matches) > 1:
+                    break
+
+            if not matches:
+                stats["skipped_no_match"] += 1
+                continue
+
+            if len(matches) > 1:
+                stats["skipped_multi_match"] += 1
+                continue
+
+            stats["matched_unique"] += 1
+            match_addr = matches[0]
+
+            dest_func = dest_fm.getFunctionAt(match_addr)
+            if dest_func is None:
+                # Not a function entry point in dest — skip
+                continue
+
+            if not dest_func.getName().startswith("FUN_"):
+                stats["skipped_already_named"] += 1
+                continue
+
+            transfers.append((dest_func, name))
+
+        # Apply all renames in a single transaction
+        tx_id = dest_handle.program.startTransaction("transfer_analysis")
+        try:
+            for dest_func, name in transfers:
+                try:
+                    dest_func.setName(name, SourceType.ANALYSIS)
+                    stats["transferred"] += 1
+                except Exception:
+                    stats["errors"] += 1
+            dest_handle.program.endTransaction(tx_id, True)
+        except Exception:
+            dest_handle.program.endTransaction(tx_id, False)
+            raise
+
+        # Persist to project
+        if dest_handle.unit_id in self._projects:
+            self._projects[dest_handle.unit_id].save(dest_handle.program)
+
+        logger.info(
+            "transfer_analysis: %d/%d names transferred (%d multi-match, %d no-match)",
+            stats["transferred"], stats["candidates"],
+            stats["skipped_multi_match"], stats["skipped_no_match"],
+        )
+        return stats
 
     def _apply_profile(self, handle: ProgramHandle, profile: AnalysisProfile) -> None:
         """Apply analysis profile settings."""
