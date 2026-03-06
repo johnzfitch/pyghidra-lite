@@ -9,6 +9,7 @@ from pyghidra_lite.models import (
     BytesResult,
     CrossRef,
     DecompiledFunction,
+    EmbeddedRuntime,
     ExportInfo,
     FunctionInfo,
     ImportInfo,
@@ -45,6 +46,19 @@ CAPABILITY_TAGS = {
     # JNI (Android)
     "jni": ["jni", "java", "dalvik", "findclass", "getmethod", "callmethod", "getfield"],
 }
+
+
+# Runtime payload signatures for detect_embedded_runtime()
+# Each entry: type, magic (hex), base confidence, strategy, and optional adjustments.
+_RUNTIME_SIGNATURES: list[dict] = [
+    {"type": "bunfs",          "magic": "42554e00",               "confidence": "high",   "strategy": "external_tools"},
+    {"type": "electron_asar",  "magic": "41534152",               "confidence": "high",   "strategy": "search_payload",  "section_adjust": True},
+    {"type": "node_sea",       "magic": "4e4f44455f5345415f46555345", "confidence": "high", "strategy": "search_payload", "strtab_fp": True},
+    {"type": "pyinstaller",    "magic": "4d45490e34120100",        "confidence": "high",   "strategy": "external_tools"},
+    {"type": "upx",            "magic": "55505821",                "confidence": "high",   "strategy": "unpack_first"},
+    {"type": "v8_snapshot",    "magic": "d80dcace",                "confidence": "medium", "strategy": "external_tools",  "symbol": "v8_snapshot_blob_data"},
+    {"type": "lua_bytecode",   "magic": "1b4c7561",                "confidence": "high",   "strategy": "external_tools"},
+]
 
 
 def get_capability_tags(name: str) -> list[str]:
@@ -511,6 +525,7 @@ class GhidraTools:
             from ghidra.program.util import DefinedDataIterator
             data_iter = DefinedDataIterator.definedStrings(self.program)
 
+        mem = self.program.getMemory()
         rm = self.program.getReferenceManager()
         fm = self.program.getFunctionManager()
         results = []
@@ -543,6 +558,10 @@ class GhidraTools:
                 elif any(kw in val.lower() for kw in ["key", "token", "secret", "password"]):
                     looks_like = "key"
 
+                # Get section name
+                block = mem.getBlock(data.getAddress())
+                section = block.getName() if block else None
+
                 # Truncate very long strings to save tokens
                 truncated_val = val[:500] if len(val) > 500 else val
                 results.append(StringXref(
@@ -550,6 +569,7 @@ class GhidraTools:
                     address=str(data.getAddress()),
                     refs=refs,
                     looks_like=looks_like,
+                    section=section,
                 ))
 
                 if len(results) >= limit:
@@ -953,5 +973,436 @@ class GhidraTools:
             })
 
         results.sort(key=lambda r: (r["entropy"] or 0), reverse=True)
+        return results
+
+    def detect_embedded_runtime(self, compact: bool = True) -> dict:
+        """Detect embedded runtime payloads within the binary.
+
+        Scans for magic byte signatures associated with common embedded runtime
+        formats. For each detected runtime, reports the type, confidence, and the
+        recommended strategy for finding strings within it.
+
+        Strategies:
+          - "external_tools": payload is compressed; raw scanning is useless.
+            Use external tools (e.g. extract_bunfs.py for Bun).
+          - "search_payload": payload is uncompressed; use extract_strings_from_blob()
+            with the returned payload_offset.
+          - "unpack_first": payload is packed (e.g. UPX); unpack before scanning.
+
+        Args:
+            compact: Return minimal output (detected + runtimes list). If False,
+                     adds magic_address and section per runtime entry.
+        """
+        mem = self.program.getMemory()
+        runtimes = []
+
+        for sig in _RUNTIME_SIGNATURES:
+            magic_address: str | None = None
+            hit_section: str | None = None
+            confidence = sig["confidence"]
+
+            # For v8_snapshot: check symbol table first (more stable than magic bytes)
+            if sig.get("symbol"):
+                st = self.program.getSymbolTable()
+                sym_found = False
+                for sym in st.getAllSymbols(True):
+                    if sym.getName() == sig["symbol"]:
+                        magic_address = str(sym.getAddress())
+                        confidence = "high"  # symbol match → upgrade to high
+                        block = mem.getBlock(sym.getAddress())
+                        hit_section = block.getName() if block else None
+                        sym_found = True
+                        break
+
+                if not sym_found:
+                    hits = self.find_bytes(sig["magic"], limit=1)
+                    if hits:
+                        magic_address = hits[0]["address"]
+                        hit_section = hits[0].get("section")
+                        # confidence stays at sig default ("medium" for v8 magic-only)
+            else:
+                hits = self.find_bytes(sig["magic"], limit=1)
+                if hits:
+                    magic_address = hits[0]["address"]
+                    hit_section = hits[0].get("section")
+
+            if magic_address is None:
+                continue
+
+            # Confidence adjustments — low-confidence hits are omitted entirely
+            if sig.get("section_adjust") and hit_section == ".text":
+                continue  # electron_asar in .text: likely false positive
+            if sig.get("strtab_fp") and hit_section == ".strtab":
+                continue  # node_sea fuse in .strtab: likely just the symbol name
+
+            payload_offset = magic_address if sig["strategy"] == "search_payload" else None
+            rt = EmbeddedRuntime(
+                type=sig["type"],
+                confidence=confidence,
+                strategy=sig["strategy"],
+                payload_offset=payload_offset,
+            )
+
+            if compact:
+                entry = rt.model_dump(exclude_none=True)
+            else:
+                entry = rt.model_dump(exclude_none=True)
+                entry["magic_address"] = magic_address
+                if hit_section:
+                    entry["section"] = hit_section
+
+            runtimes.append(entry)
+
+        return {"detected": len(runtimes) > 0, "runtimes": runtimes}
+
+    def search_strings_deep(
+        self,
+        query: str,
+        min_length: int = 4,
+        sections: list[str] | None = None,
+        skip_high_entropy: bool = False,
+        compact: bool = True,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Raw memory scan for ASCII strings, bypassing Ghidra's defined-string list.
+
+        Unlike search_strings() which only finds strings Ghidra has already defined,
+        this scans raw memory blocks for printable ASCII runs — useful for lightly-
+        analyzed binaries or sections with no defined data.
+
+        For compressed payloads (Bun/BunFS), this tool won't find readable strings —
+        use detect_embedded_runtime() first. For uncompressed/lightly-compressed
+        payloads (ASAR, Node SEA), pass the sections parameter or use
+        extract_strings_from_blob().
+
+        Args:
+            query: Case-insensitive substring filter.
+            min_length: Minimum string length (default 4).
+            sections: Only scan these sections (default: all initialized sections).
+            skip_high_entropy: Skip sections with Shannon entropy > 7.5 (default False).
+            compact: Return [{value, address, section}] (default True). If False,
+                     returns full value + is_defined + up to 5 refs per hit.
+            limit: Max results (default 20).
+        """
+        from jpype import JByte
+
+        mem = self.program.getMemory()
+        rm = self.program.getReferenceManager()
+        fm = self.program.getFunctionManager()
+        listing = self.program.getListing()
+
+        high_entropy_sections: set[str] = set()
+        if skip_high_entropy:
+            for entry in self.entropy_map():
+                if entry.get("entropy") is not None and entry["entropy"] > 7.5:
+                    high_entropy_sections.add(entry["name"])
+
+        results: list[dict] = []
+        query_lower = query.lower()
+        CHUNK = 65536
+
+        for block in mem.getBlocks():
+            if not block.isInitialized():
+                continue
+
+            block_name = block.getName()
+
+            if skip_high_entropy and block_name in high_entropy_sections:
+                continue
+
+            if sections is not None and block_name not in sections:
+                continue
+
+            # Read entire block in chunks to avoid OOM on large sections
+            size = int(block.getSize())
+            all_bytes = bytearray()
+            offset = 0
+            while offset < size:
+                n_read = min(CHUNK, size - offset)
+                buf = JByte[n_read]
+                n = mem.getBytes(block.getStart().add(offset), buf)
+                if n <= 0:
+                    break
+                all_bytes.extend(b & 0xFF for b in buf[:n])
+                offset += n
+
+            data = bytes(all_bytes)
+            data_len = len(data)
+
+            # Single-pass printable ASCII run scanner
+            i = 0
+            while i < data_len:
+                if 32 <= data[i] < 127:
+                    start = i
+                    while i < data_len and 32 <= data[i] < 127:
+                        i += 1
+                    length = i - start
+                    if length >= min_length:
+                        val = data[start:i].decode("ascii")
+                        if query_lower in val.lower():
+                            str_addr = block.getStart().add(start)
+
+                            if compact:
+                                results.append({
+                                    "value": val[:80],
+                                    "address": str(str_addr),
+                                    "section": block_name,
+                                })
+                            else:
+                                is_defined = False
+                                try:
+                                    d = listing.getDefinedDataAt(str_addr)
+                                    is_defined = d is not None and d.hasStringValue()
+                                except Exception:
+                                    pass
+
+                                refs: list[str] = []
+                                try:
+                                    for ref in rm.getReferencesTo(str_addr):
+                                        func = fm.getFunctionContaining(ref.getFromAddress())
+                                        if func:
+                                            refs.append(func.getName())
+                                        if len(refs) >= 5:
+                                            break
+                                    refs = list(set(refs))[:5]
+                                except Exception:
+                                    pass
+
+                                results.append({
+                                    "value": val,
+                                    "address": str(str_addr),
+                                    "section": block_name,
+                                    "is_defined": is_defined,
+                                    "refs": refs,
+                                })
+
+                            if len(results) >= limit:
+                                return results
+                else:
+                    i += 1
+
+        return results
+
+    def batch_search_strings(
+        self,
+        queries: list[str],
+        mode: str = "deep",
+        min_length: int = 4,
+        skip_high_entropy: bool = False,
+        compact: bool = True,
+        limit_per_query: int = 5,
+    ) -> dict:
+        """Search for multiple string patterns in one call.
+
+        For mode="deep": reads all memory blocks once and scans all queries
+        simultaneously — more efficient than N separate search_strings_deep() calls.
+        For mode="indexed": iterates Ghidra's defined strings once across all queries.
+        Entropy map is computed at most once for the batch, regardless of query count.
+
+        Args:
+            queries: List of search patterns (max 20).
+            mode: "deep" (raw memory scan, default) or "indexed" (defined strings only).
+            min_length: Minimum string length (default 4).
+            skip_high_entropy: Skip sections with entropy > 7.5 (default False).
+            compact: Return {query: count} (default True). If False, returns
+                     {query: [{value, address, section}]} — compact-format hits.
+            limit_per_query: Max hits per query (default 5).
+
+        Raises:
+            ValueError: If more than 20 queries are provided.
+        """
+        if len(queries) > 20:
+            raise ValueError("Maximum 20 queries per batch")
+
+        results_hits: dict[str, list[dict]] = {q: [] for q in queries}
+        queries_lower = {q: q.lower() for q in queries}
+
+        if mode == "indexed":
+            try:
+                from ghidra.program.util import DefinedStringIterator
+                data_iter = DefinedStringIterator.forProgram(self.program)
+            except (ImportError, AttributeError):
+                from ghidra.program.util import DefinedDataIterator
+                data_iter = DefinedDataIterator.definedStrings(self.program)
+
+            mem = self.program.getMemory()
+            for data in data_iter:
+                try:
+                    val = str(data.getValue())
+                    addr = data.getAddress()
+                    block = mem.getBlock(addr)
+                    section = block.getName() if block else None
+                    truncated = val[:80]
+                    val_lower = val.lower()
+                    for q, q_lower in queries_lower.items():
+                        if q_lower in val_lower and len(results_hits[q]) < limit_per_query:
+                            results_hits[q].append({
+                                "value": truncated,
+                                "address": str(addr),
+                                "section": section,
+                            })
+                except Exception:
+                    continue
+
+            if compact:
+                return {q: len(hits) for q, hits in results_hits.items()}
+            return results_hits
+
+        # mode == "deep": single-pass memory read, multi-query scan
+        from jpype import JByte
+
+        # Compute entropy once for the entire batch
+        high_entropy_sections: set[str] = set()
+        if skip_high_entropy:
+            for entry in self.entropy_map():
+                if entry.get("entropy") is not None and entry["entropy"] > 7.5:
+                    high_entropy_sections.add(entry["name"])
+
+        mem = self.program.getMemory()
+        CHUNK = 65536
+
+        for block in mem.getBlocks():
+            if not block.isInitialized():
+                continue
+            block_name = block.getName()
+            if skip_high_entropy and block_name in high_entropy_sections:
+                continue
+
+            # Early exit: all queries at limit
+            if all(len(hits) >= limit_per_query for hits in results_hits.values()):
+                break
+
+            size = int(block.getSize())
+            all_bytes = bytearray()
+            offset = 0
+            while offset < size:
+                n_read = min(CHUNK, size - offset)
+                buf = JByte[n_read]
+                n = mem.getBytes(block.getStart().add(offset), buf)
+                if n <= 0:
+                    break
+                all_bytes.extend(b & 0xFF for b in buf[:n])
+                offset += n
+
+            data = bytes(all_bytes)
+            data_len = len(data)
+
+            i = 0
+            while i < data_len:
+                if 32 <= data[i] < 127:
+                    start = i
+                    while i < data_len and 32 <= data[i] < 127:
+                        i += 1
+                    length = i - start
+                    if length >= min_length:
+                        val = data[start:i].decode("ascii")
+                        val_lower = val.lower()
+                        for q, q_lower in queries_lower.items():
+                            if q_lower in val_lower and len(results_hits[q]) < limit_per_query:
+                                str_addr = block.getStart().add(start)
+                                results_hits[q].append({
+                                    "value": val[:80],
+                                    "address": str(str_addr),
+                                    "section": block_name,
+                                })
+                else:
+                    i += 1
+
+        if compact:
+            return {q: len(hits) for q, hits in results_hits.items()}
+        return results_hits
+
+    def extract_strings_from_blob(
+        self,
+        offset: str,
+        size: int,
+        query: str = "",
+        min_length: int = 6,
+        compact: bool = True,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Extract strings from a raw memory region (no decompression).
+
+        Useful for scanning uncompressed embedded payloads like ASAR or Node SEA.
+        Pass the payload_offset returned by detect_embedded_runtime() as the offset.
+
+        For compressed payloads (Bun/BunFS), this won't find readable strings —
+        use external tools (extract_bunfs.py) instead.
+
+        Args:
+            offset: Start address (hex, e.g., "0x1b20000").
+            size: Region size in bytes (max 50MB).
+            query: Case-insensitive filter (default: return all strings).
+            min_length: Minimum string length (default 6).
+            compact: Return [{value, address}] (default True). If False, adds blob_offset
+                     (relative offset from region start as hex).
+            limit: Max results (default 20).
+
+        Raises:
+            ValueError: If size exceeds 50MB or offset is invalid.
+        """
+        from jpype import JByte
+
+        if size <= 0:
+            raise ValueError("size must be positive")
+        if size > 50 * 1024 * 1024:
+            raise ValueError("size exceeds 50MB limit")
+
+        addr = self._resolve_address(offset)
+        if not addr:
+            raise ValueError(f"Invalid address: {offset}")
+
+        mem = self.program.getMemory()
+        if not mem.contains(addr):
+            raise ValueError(f"Address not in memory: {offset}")
+
+        # Read region in chunks
+        CHUNK = 65536
+        all_bytes = bytearray()
+        bytes_read = 0
+        while bytes_read < size:
+            n_read = min(CHUNK, size - bytes_read)
+            buf = JByte[n_read]
+            read_addr = addr.add(bytes_read)
+            if not mem.contains(read_addr):
+                break
+            n = mem.getBytes(read_addr, buf)
+            if n <= 0:
+                break
+            all_bytes.extend(b & 0xFF for b in buf[:n])
+            bytes_read += n
+
+        data = bytes(all_bytes)
+        query_lower = query.lower() if query else ""
+        results: list[dict] = []
+
+        i = 0
+        data_len = len(data)
+        while i < data_len:
+            if 32 <= data[i] < 127:
+                start = i
+                while i < data_len and 32 <= data[i] < 127:
+                    i += 1
+                length = i - start
+                if length >= min_length:
+                    val = data[start:i].decode("ascii")
+                    if not query_lower or query_lower in val.lower():
+                        str_addr = addr.add(start)
+                        if compact:
+                            results.append({
+                                "value": val[:80],
+                                "address": str(str_addr),
+                            })
+                        else:
+                            results.append({
+                                "value": val,
+                                "address": str(str_addr),
+                                "blob_offset": hex(start),
+                            })
+                        if len(results) >= limit:
+                            return results
+            else:
+                i += 1
+
         return results
 
