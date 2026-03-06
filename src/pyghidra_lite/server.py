@@ -2392,6 +2392,7 @@ async def bootstrap_from_version(
     source_binary: str = "auto",
     min_func_size: int = 16,
     max_func_size: int = 4096,
+    label_fun_star: bool = False,
 ) -> dict:
     """Transfer function names from an analyzed reference binary to a new version.
 
@@ -2419,6 +2420,10 @@ async def bootstrap_from_version(
         source_binary: Name of the reference binary, or "auto" to rank and confirm.
         min_func_size: Minimum function byte size to transfer (default 16).
         max_func_size: Maximum function byte size to consider (default 4096).
+        label_fun_star: If True, also transfer FUN_* functions from source, renaming
+            them in dest as "{version}_{src_addr}" (e.g., "v2_1_59_02B4A120").
+            This creates a complete cross-version address map for all byte-identical
+            functions, not just the small set of named library symbols.
     """
     loop = asyncio.get_running_loop()
 
@@ -2465,10 +2470,18 @@ async def bootstrap_from_version(
 
     def _do_transfer():
         def op():
+            # Derive a short version prefix from source name for label_fun_star mode.
+            # "2.1.59-7a4a6539" → "v2_1_59"; "claude-abc" → "claude_abc"
+            fun_star_prefix = ""
+            if label_fun_star:
+                tag = source_binary.split("-")[0].replace(".", "_")
+                fun_star_prefix = f"v{tag}"
             return get_backend().transfer_analysis(
                 source_binary, dest_binary,
                 min_func_size=min_func_size,
                 max_func_size=max_func_size,
+                label_fun_star=label_fun_star,
+                fun_star_prefix=fun_star_prefix,
             )
         with _backend_lock:
             return _guarded_tool_call("bootstrap_from_version", op)

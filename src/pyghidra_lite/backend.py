@@ -514,6 +514,8 @@ class GhidraBackend:
         dest_name: str,
         min_func_size: int = 16,
         max_func_size: int = 4096,
+        label_fun_star: bool = False,
+        fun_star_prefix: str = "",
     ) -> dict:
         """Transfer function names from an analyzed source binary to a destination.
 
@@ -573,9 +575,17 @@ class GhidraBackend:
 
         for func in source_fm.getFunctions(True):
             name = func.getName()
-            # Skip auto-generated and thunk names — nothing meaningful to transfer
+            entry = func.getEntryPoint()
+
+            # Build transfer label
             if name.startswith("FUN_") or name.startswith("thunk_FUN_"):
-                continue
+                if not label_fun_star:
+                    continue
+                # Stable cross-version label: prefix + source address
+                prefix = fun_star_prefix or "fn"
+                transfer_name = f"{prefix}_{entry.toString().upper()}"
+            else:
+                transfer_name = name
 
             size = int(func.getBody().getNumAddresses())
             if size < min_func_size or size > max_func_size:
@@ -585,7 +595,6 @@ class GhidraBackend:
             stats["candidates"] += 1
 
             # Read function bytes from source
-            entry = func.getEntryPoint()
             buf = JByte[size]
             try:
                 n = source_mem.getBytes(entry, buf)
@@ -639,7 +648,7 @@ class GhidraBackend:
                 stats["skipped_already_named"] += 1
                 continue
 
-            transfers.append((dest_func, name))
+            transfers.append((dest_func, transfer_name))
 
         # Apply all renames in a single transaction
         tx_id = dest_handle.program.startTransaction("transfer_analysis")
