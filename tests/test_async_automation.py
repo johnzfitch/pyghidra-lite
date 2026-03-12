@@ -135,6 +135,11 @@ class TestPhase1CLI:
         params = {p.name for p in server.import_cmd.params}
         assert "runtime_home" in params
 
+    def test_import_cmd_has_bootstrap(self):
+        """import should accept --bootstrap."""
+        params = {p.name for p in server.import_cmd.params}
+        assert "bootstrap" in params
+
     def test_serve_cmd_has_max_workers(self):
         """serve should accept --max-workers."""
         params = {p.name for p in server.serve_cmd.params}
@@ -535,30 +540,37 @@ class TestCrashRecovery:
 # =============================================================================
 
 class TestMCPToolRegistration:
+    """Test consolidated MCP tool registration (8 tools)."""
 
-    def test_analyze_binary_registered(self):
-        """analyze_binary should be a registered MCP tool."""
+    def test_load_registered(self):
+        """load should be a registered MCP tool."""
         tools = server.mcp._tool_manager._tools
-        assert "analyze_binary" in tools
+        assert "load" in tools
 
-    def test_analysis_status_registered(self):
+    def test_binaries_registered(self):
         tools = server.mcp._tool_manager._tools
-        assert "analysis_status" in tools
+        assert "binaries" in tools
 
-    def test_cancel_analysis_registered(self):
+    def test_delete_registered(self):
         tools = server.mcp._tool_manager._tools
-        assert "cancel_analysis" in tools
+        assert "delete" in tools
 
-    def test_import_binary_auto_delegates(self):
-        """import_binary docstring should describe large-file async delegation."""
+    def test_load_describes_async(self):
+        """load docstring should describe async delegation for large files."""
         tools = server.mcp._tool_manager._tools
-        doc = tools["import_binary"].fn.__doc__ or ""
-        assert "async" in doc.lower() or "analysis_status" in doc.lower()
+        doc = tools["load"].fn.__doc__ or ""
+        assert "async" in doc.lower() or "10MB" in doc
 
     def test_total_tool_count(self):
-        """Should have 39 total tools (36 original + 3 new)."""
+        """Should have exactly 8 consolidated tools."""
         tools = server.mcp._tool_manager._tools
-        assert len(tools) >= 39, f"Expected >=39 tools, got {len(tools)}: {sorted(tools.keys())}"
+        assert len(tools) == 8, f"Expected 8 tools, got {len(tools)}: {sorted(tools.keys())}"
+
+    def test_all_8_tools_registered(self):
+        """All 8 consolidated tools should be registered."""
+        tools = server.mcp._tool_manager._tools
+        expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"}
+        assert expected == set(tools.keys()), f"Missing: {expected - set(tools.keys())}"
 
 
 # =============================================================================
@@ -578,9 +590,10 @@ class TestWorkerConfig:
         )
         assert "--project-dir" in source
         assert "--profile" in source
+        assert "--bootstrap" in source
 
     def test_run_worker_cmd_via_mock(self, tmp_path, monkeypatch):
-        """_run_worker should pass --profile and --project-dir, never --status-file."""
+        """_run_worker should pass bootstrap/profile/project-dir, never --status-file."""
         captured_args: list = []
 
         async def fake_exec(*args, **kwargs):
@@ -596,7 +609,7 @@ class TestWorkerConfig:
         fake_path = tmp_path / "test.bin"
         fake_path.write_bytes(b"\x00" * (1024 * 1024))  # 1 MB dummy binary
 
-        job: dict = {"status": "queued", "pid": None}
+        job: dict = {"status": "queued", "pid": None, "bootstrap": "b" * 16}
         unit_id = "a" * 16
 
         async def run():
@@ -608,6 +621,8 @@ class TestWorkerConfig:
         assert "--profile" in cmd
         assert "fast" in cmd
         assert "--project-dir" in cmd
+        assert "--bootstrap" in cmd
+        assert "b" * 16 in cmd
         assert "--status-file" not in cmd, "--status-file must not be passed to worker"
         assert "--jvm-heap" in cmd
 
@@ -618,3 +633,50 @@ class TestWorkerConfig:
         assert "heap_mb" in source
         assert "2048" in source  # min heap
         assert "16384" in source  # max heap
+
+
+class TestBinariesLiveStatus:
+
+    def test_binaries_jobs_reads_live_status_file(self, tmp_path, monkeypatch):
+        """binaries(jobs=True) should merge current .analysis_status values for binary jobs."""
+        backend = MagicMock()
+        backend.list_programs.return_value = []
+        backend.programs = {}
+        monkeypatch.setattr(server, "_backend", backend)
+        monkeypatch.setattr(server, "get_backend", lambda: backend)
+        monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=tmp_path))
+
+        old_jobs = server._active_jobs.copy()
+        server._active_jobs.clear()
+        try:
+            uid = "a" * 16
+            server._active_jobs[uid] = {
+                "status": "analyzing",
+                "binary_name": "claude.bin",
+                "profile": "fast",
+                "eta_sec": 1125,
+            }
+
+            unit_dir = tmp_path / uid
+            unit_dir.mkdir()
+            (unit_dir / ".analysis_status").write_text(json.dumps({
+                "status": "analyzing",
+                "phase": "analysis",
+                "done": 25300,
+                "elapsed_seconds": 700,
+                "binary_name": "claude.bin",
+                "profile": "fast",
+            }))
+
+            result = asyncio.run(server.binaries(ctx=MagicMock(), jobs=True))
+        finally:
+            server._active_jobs.clear()
+            server._active_jobs.update(old_jobs)
+
+        job_entries = [r for r in result if r.get("unit_id") == uid]
+        assert len(job_entries) == 1
+        assert job_entries[0]["status"] == "analyzing"
+        assert job_entries[0]["phase"] == "analysis"
+        assert job_entries[0]["done"] == 25300
+        assert job_entries[0]["elapsed_seconds"] == 700
+        assert job_entries[0]["eta_sec"] == 425

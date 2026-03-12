@@ -1,5 +1,7 @@
 """pyghidra-lite MCP server - capability-based toolset with auto-detection."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -16,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import re
+import secrets
 
 import click
 from mcp.server import Server
@@ -116,6 +119,11 @@ _worker_semaphore: asyncio.Semaphore | None = None  # initialized in serve, defa
 
 # Valid unit_id format: 16 lowercase hex chars (64-bit xxHash)
 _UNIT_ID_RE = re.compile(r'^[0-9a-f]{16}$')
+
+
+def _new_job_id() -> str:
+    """Generate a random 16-hex scan job ID (passes _UNIT_ID_RE)."""
+    return secrets.token_hex(8)
 
 
 @dataclass
@@ -514,6 +522,141 @@ def _get_handle(binary: str):
     raise McpError(ErrorData(code=INVALID_PARAMS, message=msg))
 
 
+def _handle_by_unit_id(backend: GhidraBackend, unit_id: str):
+    for handle in backend.programs.values():
+        if handle.unit_id == unit_id:
+            return handle
+    return None
+
+
+def _load_project_into_backend(
+    backend: GhidraBackend,
+    unit_id: str,
+    *,
+    update_capabilities: bool = False,
+    append_history: bool = False,
+):
+    """Load a completed on-disk project into the provided backend."""
+    handle = _handle_by_unit_id(backend, unit_id)
+    if handle is not None:
+        return handle
+
+    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
+    if not project_dir.exists():
+        return None
+
+    try:
+        from ghidra.base.project import GhidraProject
+        from ghidra.framework.model import ProjectLocator
+
+        project_str = str(project_dir.absolute())
+        locator = ProjectLocator(project_str, unit_id)
+        if not locator.exists():
+            logger.warning("Ghidra project missing for unit_id=%s at %s", unit_id, project_dir)
+            return None
+
+        project = GhidraProject.openProject(project_str, unit_id, True)
+        backend._projects[unit_id] = project
+
+        root_folder = project.getRootFolder()
+        for domain_file in root_folder.getFiles():
+            if str(domain_file.getContentType()) != "Program":
+                continue
+            prog_name = domain_file.getName()
+            program = project.openProgram("/", prog_name, False)
+            handle = backend._init_program_handle(program, prog_name, unit_id=unit_id)
+            handle.analyzed = True
+            backend.programs[prog_name] = handle
+            if update_capabilities:
+                _ensure_capabilities(handle)
+            if append_history:
+                binary_name = _read_status_file(unit_id).get("binary_name", prog_name)
+                _append_history(unit_id, binary_name)
+            logger.info("Loaded %s from project cache (unit_id=%s)", prog_name, unit_id)
+            return handle
+
+        logger.warning("No Program entries found in project %s", unit_id)
+        return None
+    except Exception as exc:
+        logger.error("Failed to load project %s into backend: %s", unit_id, exc)
+        return None
+
+
+def _resolve_bootstrap_handle(backend: GhidraBackend, bootstrap: str):
+    """Resolve a bootstrap source by program name, binary name, or unit_id."""
+    handle = _handle_by_unit_id(backend, bootstrap)
+    if handle is not None:
+        return handle
+
+    try:
+        return backend.get_program(bootstrap)
+    except ValueError:
+        pass
+
+    unit_id = bootstrap if _UNIT_ID_RE.match(bootstrap) else _find_on_disk(bootstrap)
+    if unit_id:
+        handle = _load_project_into_backend(backend, unit_id)
+        if handle is not None:
+            return handle
+        raise McpError(ErrorData(
+            code=INTERNAL_ERROR,
+            message=f"Bootstrap source {bootstrap!r} exists on disk but could not be loaded",
+        ))
+
+    loaded_names = list(backend.programs.keys())
+    on_disk = [
+        v.get("binary_name", k)
+        for k, v in _iter_disk_status()
+        if v.get("status") == "complete"
+        and k not in {h.unit_id for h in backend.programs.values()}
+    ]
+    msg = f"Bootstrap source not found: {bootstrap!r}. Loaded: {loaded_names}."
+    if on_disk:
+        msg += f" Available on disk: {on_disk}"
+    raise McpError(ErrorData(code=INVALID_PARAMS, message=msg))
+
+
+def _normalize_bootstrap_source(bootstrap: str, dest_unit_id: str) -> str:
+    """Resolve and validate bootstrap source, returning its canonical unit_id."""
+    source_handle = _resolve_bootstrap_handle(get_backend(), bootstrap)
+    if source_handle.unit_id == dest_unit_id:
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message="bootstrap source must differ from the destination binary",
+        ))
+    if not source_handle.analyzed:
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message=f"Bootstrap source {bootstrap!r} is not analyzed yet",
+        ))
+    return source_handle.unit_id
+
+
+def _apply_bootstrap_transfer(
+    backend: GhidraBackend,
+    source_binary: str,
+    dest_handle,
+) -> dict:
+    """Transfer names from a bootstrap source to the destination handle."""
+    source_handle = _resolve_bootstrap_handle(backend, source_binary)
+    if source_handle.unit_id == dest_handle.unit_id:
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message="bootstrap source must differ from the destination binary",
+        ))
+    if not source_handle.analyzed:
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message=f"Bootstrap source {source_binary!r} is not analyzed yet",
+        ))
+    if not dest_handle.analyzed:
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message="Destination binary must be analyzed before bootstrap can run",
+        ))
+    return backend.transfer_analysis(source_handle.name, dest_handle.name)
+
+
 def _ensure_capabilities(handle) -> BinaryCapabilities:
     with _backend_lock:
         caps = _capabilities.get(handle.unit_id)
@@ -524,54 +667,13 @@ def _ensure_capabilities(handle) -> BinaryCapabilities:
 
 
 def _available_tools(caps: BinaryCapabilities) -> list[str]:
-    tools = [
-        # Overview
-        "binary_info",
-        "triage_binary",
-        # Functions
-        "list_functions",
-        "get_function_info",
-        "function_context",
-        "disassemble",
-        "decompile",
-        "batch_decompile",
-        "call_graph",
-        # Search
-        "search_all",
-        "search_strings",
-        "search_strings_deep",
-        "batch_search_strings",
-        "search_symbols",
-        # Layer detection & blob extraction
-        "detect_embedded_runtime",
-        "extract_strings_from_blob",
-        # Xrefs
-        "get_xrefs",
-        "batch_xrefs",
-        "get_callees",
-        # Imports / exports
-        "list_imports",
-        "list_exports",
-        # Memory / data
-        "read_bytes",
-        "read_string",
-        "memory_map",
-        "find_bytes",
-        "entropy_map",
-    ]
+    """Return the 8 consolidated tools (always available regardless of capabilities).
 
-    if caps.is_elf:
-        tools.extend(["elf_info", "elf_sections", "elf_symbols", "elf_got_plt"])
-    if caps.is_macho:
-        tools.extend(["macho_info", "macho_segments", "macho_dylibs"])
-    if caps.has_swift:
-        tools.extend(["swift_info", "swift_functions", "swift_types", "swift_decompile", "demangle"])
-    if caps.has_objc:
-        tools.extend(["objc_info", "objc_classes", "objc_methods", "objc_decompile"])
-    if caps.has_hermes:
-        tools.extend(["hermes_info", "hermes_components", "hermes_endpoints"])
-
-    return tools
+    Capabilities are now auto-detected by each tool; format/language-specific
+    features are accessed via the `type` or `detail` parameters.
+    """
+    # All 8 consolidated tools are always available
+    return ["load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"]
 
 
 def _guarded_tool_call(action: str, op):
@@ -827,6 +929,38 @@ def _write_status_file(unit_id: str, data: dict):
     tmp.rename(status_file)
 
 
+def _write_job_result(job_id: str, data: dict):
+    """Atomic write of result.json for a scan job. Mirrors _write_status_file."""
+    d = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / job_id
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / "result.json.tmp"
+    tmp.write_text(json.dumps(data))
+    tmp.rename(d / "result.json")
+
+
+def _get_job_result(job_id: str) -> dict:
+    """Read result.json for a completed scan job.
+
+    Internal helper used by tests. For MCP clients, job results are
+    fetched via search() with the original query or binaries(jobs=True).
+    """
+    if not _UNIT_ID_RE.match(job_id):
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Invalid job_id: {job_id!r}"))
+    result_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / job_id / "result.json"
+    if not result_file.exists():
+        status = _active_jobs.get(job_id, {}).get("status", "not_found")
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message=f"Job {job_id!r} result not available (status={status!r}). "
+                    "Poll binaries(jobs=True) until complete.",
+        ))
+    try:
+        return json.loads(result_file.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR,
+                                 message=f"Failed to read result for {job_id!r}: {e}")) from e
+
+
 def _format_capabilities(caps: BinaryCapabilities) -> list[str]:
     """Convert BinaryCapabilities to a flat list of strings."""
     result = []
@@ -837,6 +971,73 @@ def _format_capabilities(caps: BinaryCapabilities) -> list[str]:
     if caps.has_objc: result.append("objc")
     if caps.has_hermes: result.append("hermes")
     return result
+
+
+def _compute_job_eta_sec(job: dict, status_data: dict) -> int | None:
+    """Return a live ETA based on current status data when available."""
+    status = status_data.get("status") or job.get("status")
+    if status == "complete":
+        return 0
+
+    estimated_total = job.get("eta_sec")
+    if estimated_total is None:
+        return None
+
+    elapsed = status_data.get("elapsed_seconds")
+    if not isinstance(elapsed, (int, float)):
+        elapsed = status_data.get("duration_seconds")
+    if not isinstance(elapsed, (int, float)):
+        return estimated_total
+
+    progress = status_data.get("progress")
+    if isinstance(progress, (int, float)) and 0 < progress < 1:
+        return max(0, int(round(elapsed * ((1 - progress) / progress))))
+
+    return max(0, int(round(estimated_total - elapsed)))
+
+
+def _merge_live_job_entry(unit_id: str, job: dict, *, include_jobs_meta: bool) -> dict:
+    """Build a binaries() entry from in-memory job data plus live status file fields."""
+    entry = {
+        "unit_id": unit_id,
+        "name": job.get("binary_name", unit_id),
+        "status": job.get("status", "unknown"),
+        "profile": job.get("profile"),
+    }
+    if job.get("bootstrap"):
+        entry["bootstrap"] = job.get("bootstrap")
+
+    if not include_jobs_meta:
+        return entry
+
+    status_data = _read_status_file(unit_id) if job.get("kind") != "scan" else {}
+    for key in (
+        "status",
+        "phase",
+        "done",
+        "total",
+        "progress",
+        "elapsed_seconds",
+        "duration_seconds",
+        "functions",
+        "capabilities",
+        "error",
+        "started_at",
+        "binary_size_bytes",
+        "binary_path",
+        "bootstrap",
+    ):
+        if key in status_data:
+            entry[key] = status_data[key]
+
+    eta_sec = _compute_job_eta_sec(job, status_data)
+    if eta_sec is not None:
+        entry["eta_sec"] = eta_sec
+
+    if job.get("kind") == "scan" and job.get("status") == "complete":
+        entry["hint"] = f"Call get_job_result('{unit_id}') for results"
+
+    return entry
 
 
 _TIME_CONSTANTS = {
@@ -891,6 +1092,8 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
             "--project-dir", str(_server_config.project_dir or DEFAULT_PROJECT_DIR),
             "--jvm-heap", f"{heap_mb}m",
         ]
+        if job.get("bootstrap"):
+            cmd.extend(["--bootstrap", str(job["bootstrap"])])
 
         if _server_config.ghidra_dir:
             cmd.extend(["--ghidra-dir", str(_server_config.ghidra_dir)])
@@ -927,6 +1130,27 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
         asyncio.get_running_loop().call_later(300, _active_jobs.pop, unit_id, None)
 
 
+async def _run_scan_task(job_id: str, job: dict, fn):
+    """Run a blocking scan function in the thread pool; write result.json on completion.
+
+    Used by batch_search_strings(background=True) and extract_bunfs().
+    On completion, job status transitions to "complete" and result is persisted to disk.
+    The model should poll analysis_status(unit_ids=[job_id]) then call get_job_result(job_id).
+    """
+    loop = asyncio.get_running_loop()
+    job["status"] = "running"
+    try:
+        result = await loop.run_in_executor(_import_executor, fn)
+        _write_job_result(job_id, {"status": "complete", **result})
+        job["status"] = "complete"
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)[:500]
+        _write_job_result(job_id, {"status": "error", "error": str(e)[:500]})
+    # Keep terminal state for 5 min so callers can poll after the task finishes.
+    loop.call_later(300, _active_jobs.pop, job_id, None)
+
+
 def _hot_load_blocking(unit_id: str) -> bool:
     """Load a completed project into the running backend (blocking, runs in thread pool).
 
@@ -936,48 +1160,13 @@ def _hot_load_blocking(unit_id: str) -> bool:
     with _backend_lock:
         if _backend is None:
             return False
-        # Already loaded (race guard)
-        if any(h.unit_id == unit_id for h in _backend.programs.values()):
-            return True
-
-        # Projects written by worker subprocesses live at base project_dir/unit_id,
-        # not at the session-scoped backend.project_dir used for in-process imports.
-        project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
-        if not project_dir.exists():
-            return False
-
-        try:
-            from ghidra.base.project import GhidraProject
-            from ghidra.framework.model import ProjectLocator
-
-            project_str = str(project_dir.absolute())
-            locator = ProjectLocator(project_str, unit_id)
-            if not locator.exists():
-                logger.warning(f"Ghidra project missing for hot-load: {project_dir}")
-                return False
-            project = GhidraProject.openProject(project_str, unit_id, True)
-            _backend._projects[unit_id] = project
-
-            root_folder = project.getRootFolder()
-            for domain_file in root_folder.getFiles():
-                if str(domain_file.getContentType()) == "Program":
-                    prog_name = domain_file.getName()
-                    program = project.openProgram("/", prog_name, False)
-                    handle = _backend._init_program_handle(
-                        program, prog_name, unit_id=unit_id
-                    )
-                    handle.analyzed = True
-                    _backend.programs[prog_name] = handle
-                    _ensure_capabilities(handle)
-                    logger.info(f"Hot-loaded {prog_name} (unit_id={unit_id})")
-                    binary_name = _read_status_file(unit_id).get("binary_name", prog_name)
-                    _append_history(unit_id, binary_name)
-                    return True  # One program per project
-            logger.warning(f"Hot-load: no programs found in project {unit_id}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to hot-load {unit_id}: {e}")
-            return False
+        handle = _load_project_into_backend(
+            _backend,
+            unit_id,
+            update_capabilities=True,
+            append_history=True,
+        )
+        return handle is not None
 
 
 async def _hot_load(unit_id: str) -> None:
@@ -1243,6 +1432,7 @@ def _do_import_blocking(
     analyze: bool,
     tracker: ProgressTracker,
     fresh: bool = False,
+    bootstrap: str | None = None,
 ) -> tuple:
     """Blocking import operation (runs in thread pool).
 
@@ -1269,37 +1459,43 @@ def _do_import_blocking(
         backend.analyze_program(handle.name, profile_enum)
         tracker.update(85, "Analysis complete")
 
+    bootstrap_stats = None
+    if bootstrap:
+        tracker.update(88, "Applying bootstrap")
+        with _backend_lock:
+            bootstrap_stats = _apply_bootstrap_transfer(get_backend(), bootstrap, handle)
+
     tracker.update(90, "Detecting capabilities")
     caps = _ensure_capabilities(handle)
     tracker.update(100, "Complete")
 
-    return handle, caps
+    return handle, caps, bootstrap_stats
 
+
+# =============================================================================
+# CONSOLIDATED TOOLS (8 tools replacing 58)
+# =============================================================================
 
 @mcp.tool()
-async def import_binary(
+async def load(
     path: str,
     ctx: Context,
     profile: str = "fast",
     analyze: bool = True,
-    list_tools: bool = False,
     fresh: bool = False,
+    bootstrap: str | None = None,
 ) -> dict:
     """Import and analyze a binary file.
 
-    For binaries under 10MB, blocks until analysis completes and returns results.
-    For binaries 10MB and above, automatically delegates to async analysis:
-    returns immediately with a unit_id and eta_sec so the agent can poll
-    analysis_status() without hitting MCP timeouts.
+    For binaries under 10MB, blocks until analysis completes.
+    For binaries 10MB+, runs async - poll list(jobs=True) for progress.
 
     Args:
         path: Path to binary file.
         profile: Analysis depth - "fast" (default), "default", or "deep".
-        analyze: Run analysis (set False to import without analyzing).
-        list_tools: Include available_tools list (default False, saves tokens).
-        fresh: If True, discard any cached/previous analysis for this binary
-               and re-import from scratch. Use when a prior run was corrupted,
-               used the wrong profile, or produced unexpected results.
+        analyze: Run analysis (False = import only, faster).
+        fresh: Discard cached analysis and re-import from scratch.
+        bootstrap: Name of analyzed binary to transfer names from (version tracking).
     """
     try:
         p = _resolve_import_path(path)
@@ -1321,11 +1517,17 @@ async def import_binary(
 
     kind = detect_binary_kind(p, header)
     file_size_mb = p.stat().st_size / (1024 * 1024)
+    unit_id = compute_unit_id_streaming(p)
+    bootstrap_source = None
+
+    if bootstrap:
+        _require_backend()
+        with _backend_lock:
+            bootstrap_source = _normalize_bootstrap_source(bootstrap, unit_id)
 
     # Auto-delegate large binaries to async analysis to avoid MCP timeouts.
     if analyze and file_size_mb >= _LARGE_BINARY_MB:
         _require_backend()
-        unit_id = compute_unit_id_streaming(p)
 
         # fresh=True: purge everything before any caching checks so the
         # subsequent import and worker spawn always start from a clean slate.
@@ -1348,7 +1550,7 @@ async def import_binary(
             for h in loaded_handles:
                 if h.unit_id == unit_id and h.analyzed:
                     caps = _ensure_capabilities(h)
-                    return {
+                    result = {
                         "unit_id": unit_id,
                         "binary_name": p.name,
                         "kind": kind,
@@ -1356,6 +1558,12 @@ async def import_binary(
                         "functions": h.program.getFunctionManager().getFunctionCount(),
                         "capabilities": _format_capabilities(caps),
                     }
+                    if bootstrap_source:
+                        with _backend_lock:
+                            result["bootstrap"] = _apply_bootstrap_transfer(
+                                get_backend(), bootstrap_source, h
+                            )
+                    return result
 
         # Check disk: already analyzed by a previous import run? (outside lock)
         project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
@@ -1392,6 +1600,13 @@ async def import_binary(
                         result["hot_load_error"] = hot_load_error
                     elif not hot_loaded:
                         result["hot_load_error"] = "Program not found in backend after load"
+                    if hot_loaded and bootstrap_source:
+                        with _backend_lock:
+                            dest_handle = _handle_by_unit_id(get_backend(), unit_id)
+                            if dest_handle is not None:
+                                result["bootstrap"] = _apply_bootstrap_transfer(
+                                    get_backend(), bootstrap_source, dest_handle
+                                )
                     return result
             except (json.JSONDecodeError, OSError):
                 pass
@@ -1401,16 +1616,22 @@ async def import_binary(
             if not fresh and unit_id in _active_jobs:
                 job = _active_jobs[unit_id]
                 if job.get("status") not in ("complete", "error"):
-                    return {
-                        "unit_id": unit_id,
-                        "binary_name": p.name,
-                        "status": job.get("status", "analyzing"),
-                        "eta_sec": job.get("eta_sec"),
-                        "message": (
-                            f"Analysis in progress ({file_size_mb:.0f}MB). "
-                            f"Poll with analysis_status(unit_ids=['{unit_id}'])"
-                        ),
-                    }
+                    if bootstrap_source and job.get("bootstrap") != bootstrap_source:
+                        raise McpError(ErrorData(
+                            code=INVALID_PARAMS,
+                            message=(
+                                f"Analysis already in progress for {p.name!r} without the "
+                                "requested bootstrap source. Wait for completion or retry "
+                                "with fresh=True."
+                            ),
+                        ))
+                    entry = _merge_live_job_entry(unit_id, job, include_jobs_meta=True)
+                    entry["binary_name"] = p.name
+                    entry["message"] = (
+                        f"Analysis in progress ({file_size_mb:.0f}MB). "
+                        f"Poll with analysis_status(unit_ids=['{unit_id}'])"
+                    )
+                    return entry
                 # Terminal state stale entry: fall through and re-queue.
 
             # Spawn async worker subprocess.
@@ -1422,11 +1643,12 @@ async def import_binary(
                 "eta_sec": estimated,
                 "profile": profile,
                 "pid": None,
+                "bootstrap": bootstrap_source,
             }
             with _jobs_mutex:
                 _active_jobs[unit_id] = job
             asyncio.create_task(_run_worker(p, unit_id, profile, job))
-            return {
+            result = {
                 "unit_id": unit_id,
                 "binary_name": p.name,
                 "kind": kind,
@@ -1437,6 +1659,9 @@ async def import_binary(
                     f"Poll with analysis_status(unit_ids=['{unit_id}'])"
                 ),
             }
+            if bootstrap_source:
+                result["bootstrap"] = bootstrap_source
+            return result
 
     logger.info(f"Importing {p.name} ({kind}, {file_size_mb:.1f}MB) with profile={profile_enum.value}")
 
@@ -1447,7 +1672,14 @@ async def import_binary(
     # Run blocking import in thread pool
     import_future = loop.run_in_executor(
         _import_executor,
-        lambda: _do_import_blocking(p, profile_enum, analyze, tracker, fresh=fresh)
+        lambda: _do_import_blocking(
+            p,
+            profile_enum,
+            analyze,
+            tracker,
+            fresh=fresh,
+            bootstrap=bootstrap_source,
+        )
     )
 
     # Report progress: every 10% change OR every 60s
@@ -1470,330 +1702,151 @@ async def import_binary(
             await asyncio.sleep(0.5)
 
         # Get result (raises if import failed)
-        handle, caps = await asyncio.wrap_future(import_future)
+        handle, caps, bootstrap_stats = await asyncio.wrap_future(import_future)
 
         # Final progress report
         await ctx.report_progress(100, 100, "Complete")
 
         result = {
             "name": handle.name,
+            "binary_name": p.name,
             "unit_id": handle.unit_id,
             "kind": kind,
             "capabilities": _format_capabilities(caps),
             "status": "ready",
         }
+        if bootstrap_stats:
+            result["bootstrap"] = bootstrap_stats
         if handle.was_preexisting:
             result["note"] = "already_analyzed"
 
-        # Only include tool list if requested (saves tokens)
-        if list_tools:
-            result["available_tools"] = _available_tools(caps)
-
         return result
+    except McpError:
+        raise
     except Exception as e:
         logger.error(f"Import failed: {e}")
         raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Import failed: {e}")) from e
 
 
 @mcp.tool()
-async def analyze_binary(
-    paths: list[str],
-    ctx: Context,
-    profile: str = "default",
-) -> list[dict]:
-    """Start async analysis of one or more binaries. Returns immediately with job status.
-
-    Unlike import_binary (which blocks until complete), this spawns isolated subprocess
-    workers and returns in <1 second. Poll with analysis_status() for progress.
+async def delete(name: str, ctx: Context) -> dict:
+    """Remove a binary, cancel any running analysis, and delete on-disk project.
 
     Args:
-        paths: List of file paths to analyze.
-        profile: Analysis depth - "fast", "default", or "deep".
+        name: Binary name or unit_id.
     """
-    _require_backend()
-    config = _server_config
+    def op():
+        backend = get_backend()
+        project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
 
-    try:
-        profile_enum = AnalysisProfile(profile)
-    except ValueError as exc:
-        raise McpError(ErrorData(
-            code=INVALID_PARAMS,
-            message=f"Invalid profile '{profile}'. Use: fast, default, deep"
-        )) from exc
-
-    results = []
-    for p in paths:
-        try:
-            path = _resolve_import_path(p)
-        except ValueError as exc:
-            results.append({"path": p, "status": "error", "error": str(exc)})
-            continue
-
-        if not path.exists():
-            results.append({"path": p, "status": "error", "error": f"Not found: {path}"})
-            continue
-
-        unit_id = compute_unit_id_streaming(path)
-        project_dir = Path(config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
-
-        # Case 1: Already loaded in memory
+        # Search loaded binaries without triggering auto-load
         handle = None
-        with _backend_lock:
-            loaded_handles = list(_backend.programs.values()) if _backend else []
-        for h in loaded_handles:
-            if h.unit_id == unit_id:
-                handle = h
-                break
+        exact = [h for h in backend.programs.values() if name in (h.name, h.unit_id)]
+        partial = [h for h in backend.programs.values() if name in h.name] if not exact else []
+        matches = exact or partial
+        if len(matches) > 1:
+            candidates = [f"{h.name} ({h.unit_id})" for h in matches]
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Ambiguous match for {name!r}: {candidates}. Use exact name or unit_id.",
+            ))
+        handle = matches[0] if matches else None
 
-        if handle:
-            caps = _ensure_capabilities(handle)
-            results.append({
-                "unit_id": unit_id,
-                "binary_name": path.name,
-                "status": "ready",
-                "functions": handle.program.getFunctionManager().getFunctionCount(),
-                "capabilities": _format_capabilities(caps),
-            })
-            continue
+        if handle is not None:
+            unit_id = handle.unit_id
+            _capabilities.pop(unit_id, None)
+            deleted = backend.delete_program(handle.name)
+            if not deleted:
+                raise McpError(ErrorData(
+                    code=INTERNAL_ERROR,
+                    message=f"Failed to delete {handle.name!r} from Ghidra project",
+                ))
+            _kill_job(unit_id)
+            shutil.rmtree(project_base / unit_id, ignore_errors=True)
+            return {"deleted": handle.name, "unit_id": unit_id}
 
-        # Case 2: Completed on disk but not loaded
-        gpr = project_dir / f"{unit_id}.gpr"
-        status_file = project_dir / ".analysis_status"
-        if gpr.exists() and status_file.exists():
-            try:
-                status = json.loads(status_file.read_text())
-                if status.get("status") == "complete":
-                    results.append({
-                        "unit_id": unit_id,
-                        "binary_name": path.name,
-                        "status": "ready",
-                        "functions": status.get("functions"),
-                        "capabilities": status.get("capabilities", []),
-                        "note": "on_disk, will load on first query",
-                    })
-                    continue
-            except (json.JSONDecodeError, FileNotFoundError):
-                pass
+        # Disk-only (errored, incomplete, never loaded)
+        unit_id = name
+        if not _UNIT_ID_RE.match(name):
+            binary_base = Path(name).name
+            candidates = [
+                uid for uid, data in _iter_disk_status()
+                if data.get("binary_name", "") == binary_base
+            ]
+            if not candidates:
+                raise McpError(ErrorData(
+                    code=INVALID_PARAMS,
+                    message=f"Not found: {name!r}. Use unit_id from list().",
+                ))
+            if len(candidates) > 1:
+                raise McpError(ErrorData(
+                    code=INVALID_PARAMS,
+                    message=f"Ambiguous name {name!r} matches {candidates}. Use unit_id.",
+                ))
+            unit_id = candidates[0]
 
-        async with (_active_jobs_lock or nullcontext()):
-            # Case 3: Already in progress
-            if unit_id in _active_jobs:
-                job = _active_jobs[unit_id]
-                results.append({
-                    "unit_id": unit_id,
-                    "binary_name": path.name,
-                    "status": job.get("status", "unknown"),
-                    "eta_sec": job.get("eta_sec"),
-                })
-                continue
+        project_dir = project_base / unit_id
+        if not project_dir.exists():
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Project not found: {unit_id!r}",
+            ))
 
-            # Case 4: New analysis — spawn worker subprocess
-            estimated = _estimate_analysis_time(path.stat().st_size, profile)
-            job = {
-                "unit_id": unit_id,
-                "binary_name": path.name,
-                "status": "queued",
-                "eta_sec": estimated,
-                "profile": profile,
-                "pid": None,
-            }
-            with _jobs_mutex:
-                _active_jobs[unit_id] = job
-            asyncio.create_task(_run_worker(path, unit_id, profile, job))
+        binary_name = _read_status_file(unit_id).get("binary_name", unit_id)
+        _kill_job(unit_id)
+        shutil.rmtree(project_dir)
+        return {"deleted": binary_name, "unit_id": unit_id}
 
-        results.append({
-            "unit_id": unit_id,
-            "binary_name": path.name,
-            "status": "queued",
-            "eta_sec": estimated,
-        })
-
-    return results
+    with _backend_lock:
+        return _guarded_tool_call("delete", op)
 
 
 @mcp.tool()
-async def analysis_status(
+async def binaries(
     ctx: Context,
-    unit_ids: list[str] | None = None,
-) -> list[dict]:
-    """Check status of analysis jobs. Returns progress, phase, and completion info.
-
-    On completion, the binary becomes available for querying via other tools.
-
-    Args:
-        unit_ids: Unit IDs to check. If omitted, returns status for all active jobs.
-    """
-    _require_backend()
-
-    results = []
-    if unit_ids:
-        for uid in unit_ids:
-            if not _UNIT_ID_RE.match(uid):
-                results.append({"unit_id": uid, "status": "invalid_id"})
-        unit_ids = [uid for uid in unit_ids if _UNIT_ID_RE.match(uid)]
-
-    async with (_active_jobs_lock or nullcontext()):
-        ids = unit_ids or list(_active_jobs.keys())
-    if not ids and not results:
-        return [{"status": "no_active_jobs"}]
-
-    # Fields the LLM agent actually needs from the status file
-    _STATUS_KEYS = {"status", "phase", "progress", "functions", "capabilities",
-                    "error", "binary_name", "done", "total"}
-
-    for uid in ids:
-        # Already loaded in memory
-        handle = None
-        with _backend_lock:
-            loaded_handles = list(_backend.programs.values()) if _backend else []
-        for h in loaded_handles:
-            if h.unit_id == uid:
-                handle = h
-                break
-
-        if handle:
-            caps = _ensure_capabilities(handle)
-            results.append({
-                "unit_id": uid,
-                "binary_name": handle.name,
-                "status": "ready",
-                "functions": handle.program.getFunctionManager().getFunctionCount(),
-                "capabilities": _format_capabilities(caps),
-            })
-            async with (_active_jobs_lock or nullcontext()):
-                with _jobs_mutex:
-                    _active_jobs.pop(uid, None)
-            continue
-
-        # Read status file from disk
-        raw = _read_status_file(uid)
-        if not raw:
-            # If worker has been queued but has not yet written status to disk,
-            # fall back to in-memory job state for immediate polling feedback.
-            async with (_active_jobs_lock or nullcontext()):
-                job = _active_jobs.get(uid)
-            if job:
-                results.append({
-                    "unit_id": uid,
-                    "binary_name": job.get("binary_name", uid),
-                    "status": job.get("status", "unknown"),
-                    "eta_sec": job.get("eta_sec"),
-                })
-            else:
-                results.append({"unit_id": uid, "status": "not_found"})
-            continue
-
-        # Auto hot-load on completion
-        hot_loaded = False
-        hot_load_error = None
-        if raw.get("status") == "complete":
-            try:
-                await _hot_load(uid)
-                hot_loaded = True
-            except Exception as e:
-                hot_load_error = str(e)
-
-        # Clean up terminal jobs from active tracking
-        if raw.get("status") in ("complete", "error", "cancelled"):
-            async with (_active_jobs_lock or nullcontext()):
-                _active_jobs.pop(uid, None)
-
-        # Return only agent-relevant fields
-        entry = {"unit_id": uid}
-        for k in _STATUS_KEYS:
-            if k in raw:
-                entry[k] = raw[k]
-        if hot_loaded:
-            entry["hot_loaded"] = True
-        if hot_load_error:
-            entry["hot_load_error"] = hot_load_error
-        results.append(entry)
-
-    return results
-
-
-@mcp.tool()
-async def cancel_analysis(unit_id: str, ctx: Context) -> dict:
-    """Kill the worker subprocess for a given analysis job.
+    jobs: bool = False,
+    rank_sources: bool = False,
+) -> "list[dict]":
+    """List all binaries - loaded, analyzing, queued, or on-disk.
 
     Args:
-        unit_id: The unit_id of the analysis to cancel.
+        jobs: Include active job status and results.
+        rank_sources: Rank binaries by transferable named functions (for bootstrap).
     """
-    _require_backend()
+    if rank_sources:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _import_executor,
+            lambda: _rank_sources_blocking(exclude_name=None),
+        )
 
-    if not _UNIT_ID_RE.match(unit_id):
-        return {"unit_id": unit_id, "status": "invalid_id"}
-
-    async with (_active_jobs_lock or nullcontext()):
-        if unit_id not in _active_jobs:
-            return {"unit_id": unit_id, "status": "not_found"}
-        job = _active_jobs[unit_id]
-        pid = job.get("pid")
-
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM)
-            # Wait up to 5 seconds for graceful termination
-            for _ in range(50):
-                await asyncio.sleep(0.1)
-                if not _pid_alive(pid):
-                    break
-            else:
-                # Process still alive after 5s - force kill
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        except ProcessLookupError:
-            pass  # Already dead
-
-    async with (_active_jobs_lock or nullcontext()):
-        _active_jobs.pop(unit_id, None)
-    _write_status_file(unit_id, {"status": "cancelled"})
-    return {"unit_id": unit_id, "status": "cancelled"}
-
-
-@mcp.tool()
-def list_binaries(ctx: Context, list_tools: bool = False) -> list[dict]:
-    """List all binaries - ready, analyzing, queued, or on-disk from previous runs.
-
-    Args:
-        list_tools: Include available_tools list per binary (default False, saves tokens).
-    """
     def op():
         backend = get_backend()
         results = []
         seen_uids = set()
+        with _jobs_mutex:
+            active_jobs_snapshot = list(_active_jobs.items())
 
-        # 1. Currently loaded in memory
-        for name in backend.list_programs():
-            handle = backend.get_program(name)
+        # Currently loaded in memory
+        for prog_name in backend.list_programs():
+            handle = backend.get_program(prog_name)
             seen_uids.add(handle.unit_id)
             caps = _ensure_capabilities(handle)
-            result = {
+            results.append({
                 "name": handle.name,
                 "unit_id": handle.unit_id,
                 "status": "ready",
                 "profile": handle.profile.value if handle.profile else None,
                 "capabilities": _format_capabilities(caps),
-            }
-            if list_tools:
-                result["available_tools"] = _available_tools(caps)
-            results.append(result)
+            })
 
-        # 2. In-progress analyses (not yet loaded)
-        for unit_id, job in _active_jobs.items():
+        # In-progress analyses
+        for unit_id, job in active_jobs_snapshot:
             if unit_id not in seen_uids:
                 seen_uids.add(unit_id)
-                results.append({
-                    "unit_id": unit_id,
-                    "name": job.get("binary_name", unit_id),
-                    "status": job.get("status", "unknown"),
-                    "profile": job.get("profile"),
-                    "eta_sec": job.get("eta_sec"),
-                })
+                results.append(_merge_live_job_entry(unit_id, job, include_jobs_meta=jobs))
 
-        # 3. On-disk projects not yet loaded (from previous runs, CLI imports)
+        # On-disk projects not yet loaded
         projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
         if projects_path.exists():
             for entry in projects_path.iterdir():
@@ -1804,1049 +1857,614 @@ def list_binaries(ctx: Context, list_tools: bool = False) -> list[dict]:
                     continue
                 seen_uids.add(uid)
                 status_data = _read_status_file(uid)
-                results.append({
+                disk_entry = {
                     "unit_id": uid,
                     "name": status_data.get("binary_name", uid),
                     "status": status_data.get("status", "on_disk"),
                     "functions": status_data.get("functions"),
                     "capabilities": status_data.get("capabilities", []),
-                })
+                }
+                if jobs:
+                    for key in (
+                        "phase",
+                        "done",
+                        "total",
+                        "progress",
+                        "elapsed_seconds",
+                        "duration_seconds",
+                        "error",
+                        "started_at",
+                        "binary_size_bytes",
+                        "binary_path",
+                        "bootstrap",
+                        "profile",
+                    ):
+                        if key in status_data:
+                            disk_entry[key] = status_data[key]
+                results.append(disk_entry)
 
         return results
 
     with _backend_lock:
-        return _guarded_tool_call("list_binaries", op)
+        return _guarded_tool_call("list", op)
 
 
 @mcp.tool()
-async def list_functions(
+def info(
     binary: str,
     ctx: Context,
-    pattern: str = "",
-    limit: int = 50,
-    sort_by: str = "name",
-    compact: bool = True,
-    include_metadata: bool = False,
-) -> list[FunctionInfo] | list[dict]:
-    """List functions in binary.
-
-    Args:
-        binary: Binary name.
-        pattern: Filter by name substring.
-        limit: Max results (default 50).
-        sort_by: "name", "refs_in" (importance), "refs_out" (complexity), "size".
-        compact: Return only name/address (default True, saves tokens).
-        include_metadata: Include refs_in/refs_out counts (slower, default False).
-    """
-    results = _with_handle(
-        "list_functions",
-        binary,
-        lambda handle: GhidraTools(handle).list_functions(
-            pattern=pattern, limit=limit, sort_by=sort_by,
-            include_metadata=include_metadata or sort_by in ("refs_in", "refs_out"),
-        ),
-    )
-    await _warn_if_limit_reached(
-        ctx, "list_functions", limit, len(results), suggest_compact=True
-    )
-    if compact:
-        return [{"name": f.name, "addr": f.address} for f in results]
-    return results
-
-
-@mcp.tool()
-def decompile(
-    binary: str,
-    function: str,
-    ctx: Context,
-    include_callees: bool = True,
-    include_strings: bool = True,
-    include_provenance: bool = False,
-) -> DecompiledFunction:
-    """Decompile a function.
-
-    Args:
-        binary: Binary name.
-        function: Function name or address (0x...).
-        include_callees: Include list of called functions (default True).
-        include_strings: Include string references (default True).
-        include_provenance: Include analysis metadata (default False, saves tokens).
-    """
-    return _with_handle(
-        "decompile",
-        binary,
-        lambda handle: GhidraTools(handle).decompile_function(
-            function,
-            include_callees=include_callees,
-            include_strings=include_strings,
-            include_provenance=include_provenance,
-        ),
-    )
-
-
-@mcp.tool()
-def search_strings(binary: str, query: str, ctx: Context, limit: int = 30) -> list[StringXref]:
-    """Find strings and what functions reference them.
-
-    Args:
-        binary: Binary name.
-        query: String pattern to search.
-        limit: Max results.
-    """
-    return _with_handle(
-        "search_strings",
-        binary,
-        lambda handle: GhidraTools(handle).search_strings(query, limit=limit),
-    )
-
-
-@mcp.tool()
-def list_imports(binary: str, ctx: Context, pattern: str = "", limit: int = 50) -> list[ImportInfo]:
-    """List imports with capability tags (crypto, network, file, etc).
-
-    Args:
-        binary: Binary name.
-        pattern: Filter by name/library.
-        limit: Max results.
-    """
-    return _with_handle(
-        "list_imports",
-        binary,
-        lambda handle: GhidraTools(handle).list_imports(pattern=pattern, limit=limit),
-    )
-
-
-@mcp.tool()
-async def list_exports(
-    binary: str,
-    ctx: Context,
-    pattern: str = "",
-    limit: int = 50,
-    compact: bool = True,
-) -> list[ExportInfo] | list[dict]:
-    """List exported symbols.
-
-    Args:
-        binary: Binary name.
-        pattern: Filter by name.
-        limit: Max results (default 50).
-        compact: Return only names to reduce tokens (default true).
-    """
-    results = _with_handle(
-        "list_exports",
-        binary,
-        lambda handle: GhidraTools(handle).list_exports(pattern=pattern, limit=limit),
-    )
-    await _warn_if_limit_reached(ctx, "list_exports", limit, len(results))
-    if compact:
-        return [{"name": e.name} for e in results]
-    return results
-
-
-@mcp.tool()
-def get_xrefs(binary: str, target: str, ctx: Context, limit: int = 50) -> list[CrossRef]:
-    """Get cross-references TO a target (who calls/uses this).
-
-    Args:
-        binary: Binary name.
-        target: Function name or address.
-        limit: Max results.
-    """
-    return _with_handle(
-        "get_xrefs",
-        binary,
-        lambda handle: GhidraTools(handle).get_xrefs(target, limit=limit),
-    )
-
-
-@mcp.tool()
-def read_bytes(
-    binary: str,
-    address: str,
-    size: int,
-    ctx: Context,
-    include_provenance: bool = False,
-) -> BytesResult:
-    """Read raw bytes at address.
-
-    Args:
-        binary: Binary name.
-        address: Hex address (0x...) or symbol name.
-        size: Bytes to read (1-4096).
-        include_provenance: Include analysis metadata (default False).
-    """
-    return _with_handle(
-        "read_bytes",
-        binary,
-        lambda handle: GhidraTools(handle).read_bytes(
-            address, size, include_provenance=include_provenance
-        ),
-    )
-
-
-@mcp.tool()
-def read_string(binary: str, address: str, ctx: Context) -> str:
-    """Read null-terminated string at address.
-
-    Args:
-        binary: Binary name.
-        address: Hex address (0x...).
-    """
-    return _with_handle(
-        "read_string",
-        binary,
-        lambda handle: GhidraTools(handle).read_string(address),
-    )
-
-
-@mcp.tool()
-def get_callees(binary: str, function: str, ctx: Context) -> list[str]:
-    """Get functions called BY this function.
-
-    Args:
-        binary: Binary name.
-        function: Function name or address.
-    """
-    return _with_handle(
-        "get_callees",
-        binary,
-        lambda handle: GhidraTools(handle).get_callees(function),
-    )
-
-
-@mcp.tool()
-def batch_decompile(
-    binary: str,
-    functions: list[str],
-    ctx: Context,
-    include_callees: bool = False,
-    include_strings: bool = False,
-) -> list[DecompiledFunction]:
-    """Decompile multiple functions in one call (reduces round trips).
-
-    Args:
-        binary: Binary name.
-        functions: List of function names or addresses.
-        include_callees: Include callee lists (increases response size).
-        include_strings: Include string references (increases response size).
-
-    Returns:
-        List of decompiled functions. Failed functions have error in code field.
-    """
-    return _with_handle(
-        "batch_decompile",
-        binary,
-        lambda handle: GhidraTools(handle).batch_decompile(
-            functions,
-            include_callees=include_callees,
-            include_strings=include_strings,
-        ),
-    )
-
-
-@mcp.tool()
-def call_graph(
-    binary: str,
-    function: str,
-    ctx: Context,
-    depth: int = 2,
-    direction: str = "both",
+    detail: str = "summary",
 ) -> dict:
-    """Get call graph centered on a function.
+    """Get binary overview with auto-detected format and language info.
 
     Args:
-        binary: Binary name.
-        function: Function name or address.
-        depth: How many levels to traverse (default 2, max 5).
-        direction: "callers", "callees", or "both".
-
-    Returns:
-        Dict with nodes (functions) and edges (call relationships).
-    """
-    if depth > 5:
-        depth = 5  # Cap depth to prevent huge graphs
-    return _with_handle(
-        "call_graph",
-        binary,
-        lambda handle: GhidraTools(handle).get_call_graph(
-            function, depth=depth, direction=direction
-        ),
-    )
-
-
-@mcp.tool()
-def memory_map(binary: str, ctx: Context) -> list[dict]:
-    """Get memory layout with sections and permissions.
-
-    Args:
-        binary: Binary name.
-
-    Returns:
-        List of memory regions with name, address, size, and permissions.
-    """
-    return _with_handle(
-        "memory_map",
-        binary,
-        lambda handle: GhidraTools(handle).get_memory_map(),
-    )
-
-
-# =============================================================================
-# OVERVIEW & INSPECTION TOOLS (cherry-picked from PR #4, additive)
-# =============================================================================
-
-@mcp.tool()
-def binary_info(binary: str, ctx: Context) -> dict:
-    """One-shot binary overview: format, arch, sections, capabilities, function/symbol counts.
-
-    Replaces a common sequence of elf_info/macho_info + memory_map.
-    Call this first after import to orient on an unfamiliar binary.
-
-    Args:
-        binary: Binary name.
+        binary: Binary name or unit_id.
+        detail: Level of detail:
+            - "summary" (default): basic info + capabilities
+            - "full": triage with top functions, imports, strings
+            - "format": raw format headers (ELF/Mach-O specific)
+            - "sections": memory/section layout
+            - "entropy": per-section entropy analysis
     """
     def op(handle):
         caps = _ensure_capabilities(handle)
         metadata = handle.metadata
         fm = handle.program.getFunctionManager()
         st = handle.program.getSymbolTable()
-        mem = handle.program.getMemory()
 
-        # Address size → bits
+        # Base info (always included)
         addr_size = metadata.get("Address Size", "")
         bits = 64 if "64" in addr_size else (32 if "32" in addr_size else None)
 
-        # Entry point: prefer symbol table lookup (O(1) per name) over full function scan
-        entry = None
-        st = handle.program.getSymbolTable()
-        for name in ("main", "_main", "_start", "start", "entry"):
-            syms = list(st.getGlobalSymbols(name))
-            if syms:
-                entry = str(syms[0].getAddress())
-                break
-
-        # Sections with permissions
-        sections = []
-        for block in mem.getBlocks():
-            perms = ""
-            if block.isRead():
-                perms += "r"
-            if block.isWrite():
-                perms += "w"
-            if block.isExecute():
-                perms += "x"
-            sections.append({
-                "name": block.getName(),
-                "size": int(block.getSize()),
-                "permissions": perms or "---",
-            })
-
-        return {
+        base = {
             "name": handle.name,
             "unit_id": handle.unit_id,
             "format": metadata.get("Executable Format", "unknown"),
             "arch": metadata.get("Processor", "unknown"),
             "bits": bits,
             "endian": metadata.get("Endian", "").lower() or None,
-            "entry_point": entry,
             "num_functions": fm.getFunctionCount(),
             "num_symbols": st.getNumSymbols(),
-            "sections": sections,
             "capabilities": _format_capabilities(caps),
         }
 
-    return _with_handle("binary_info", binary, op)
+        if detail == "summary":
+            return base
 
-
-@mcp.tool()
-def find_bytes(
-    binary: str,
-    pattern: str,
-    ctx: Context,
-    limit: int = 20,
-) -> list[dict]:
-    """Search for a hex byte pattern across all memory regions.
-
-    Useful for finding magic numbers, crypto constants, or specific sequences.
-
-    Args:
-        binary: Binary name.
-        pattern: Hex bytes (e.g., "cafebabe" or "ca fe ba be"). Max 128 bytes.
-        limit: Max results (default 20).
-    """
-    return _with_handle(
-        "find_bytes",
-        binary,
-        lambda handle: GhidraTools(handle).find_bytes(pattern, limit=limit),
-    )
-
-
-@mcp.tool()
-def entropy_map(binary: str, ctx: Context) -> list[dict]:
-    """Per-section Shannon entropy to identify packed or encrypted regions.
-
-    Entropy > 7.0 suggests encryption or compression.
-    Entropy < 1.0 is mostly zeros or padding.
-
-    Args:
-        binary: Binary name.
-    """
-    return _with_handle(
-        "entropy_map",
-        binary,
-        lambda handle: GhidraTools(handle).entropy_map(),
-    )
-
-
-@mcp.tool()
-def detect_embedded_runtime(binary: str, ctx: Context, compact: bool = True) -> dict:
-    """Detect embedded runtime payloads within the binary.
-
-    Call this before search_strings on any unfamiliar binary to determine which
-    layer holds application logic. Returns the runtime type and the recommended
-    strategy for finding strings.
-
-    Strategies:
-      - "external_tools": payload is compressed (e.g. Bun/BunFS); raw scanning
-        is useless. Use external tools to extract it first.
-      - "search_payload": payload is uncompressed; pass payload_offset to
-        extract_strings_from_blob() to scan it directly.
-      - "unpack_first": payload is packed (e.g. UPX); unpack before scanning.
-
-    Args:
-        binary: Binary name.
-        compact: Return minimal output (default True). Set False for magic_address
-                 and section details per runtime entry.
-    """
-    return _with_handle(
-        "detect_embedded_runtime",
-        binary,
-        lambda handle: GhidraTools(handle).detect_embedded_runtime(compact=compact),
-    )
-
-
-@mcp.tool()
-def search_strings_deep(
-    binary: str,
-    query: str,
-    ctx: Context,
-    min_length: int = 4,
-    sections: list[str] | None = None,
-    skip_high_entropy: bool = False,
-    compact: bool = True,
-    limit: int = 20,
-) -> list[dict]:
-    """Raw memory scan for strings, bypassing Ghidra's defined-string list.
-
-    Finds strings in sections that Ghidra hasn't fully analyzed. Unlike
-    search_strings(), this scans raw bytes for printable ASCII runs.
-
-    For compressed payloads (Bun/BunFS), use detect_embedded_runtime() first —
-    raw scanning won't find readable strings in compressed data.
-
-    Args:
-        binary: Binary name.
-        query: Case-insensitive substring filter.
-        min_length: Minimum string length (default 4).
-        sections: Only scan these sections (e.g., [".rodata"]). Default: all.
-        skip_high_entropy: Skip sections with entropy > 7.5 (default False).
-        compact: Return [{value, address, section}] (default True).
-        limit: Max results (default 20).
-    """
-    return _with_handle(
-        "search_strings_deep",
-        binary,
-        lambda handle: GhidraTools(handle).search_strings_deep(
-            query,
-            min_length=min_length,
-            sections=sections,
-            skip_high_entropy=skip_high_entropy,
-            compact=compact,
-            limit=limit,
-        ),
-    )
-
-
-@mcp.tool()
-def batch_search_strings(
-    binary: str,
-    queries: list[str],
-    ctx: Context,
-    mode: str = "deep",
-    min_length: int = 4,
-    skip_high_entropy: bool = False,
-    compact: bool = True,
-    limit_per_query: int = 5,
-) -> dict:
-    """Search for multiple string patterns in one call.
-
-    Reads memory once and scans all queries simultaneously. More efficient
-    than multiple search_strings_deep() calls when checking many terms.
-
-    Args:
-        binary: Binary name.
-        queries: List of search patterns (max 20).
-        mode: "deep" (raw memory scan, default) or "indexed" (defined strings only).
-        min_length: Minimum string length (default 4).
-        skip_high_entropy: Skip high-entropy sections (default False).
-        compact: Return {query: count} (default True). If False, returns
-                 {query: [{value, address, section}]}.
-        limit_per_query: Max hits per query (default 5).
-    """
-    return _with_handle(
-        "batch_search_strings",
-        binary,
-        lambda handle: GhidraTools(handle).batch_search_strings(
-            queries,
-            mode=mode,
-            min_length=min_length,
-            skip_high_entropy=skip_high_entropy,
-            compact=compact,
-            limit_per_query=limit_per_query,
-        ),
-    )
-
-
-@mcp.tool()
-def extract_strings_from_blob(
-    binary: str,
-    offset: str,
-    size: int,
-    ctx: Context,
-    query: str = "",
-    min_length: int = 6,
-    compact: bool = True,
-    limit: int = 20,
-) -> list[dict]:
-    """Extract strings from a raw memory region (no decompression).
-
-    Use this to scan uncompressed embedded payloads (ASAR, Node SEA).
-    Pass the payload_offset returned by detect_embedded_runtime().
-
-    Args:
-        binary: Binary name.
-        offset: Start address (hex, e.g., "0x1b20000").
-        size: Region size in bytes (max 50MB).
-        query: Case-insensitive filter (default: all strings).
-        min_length: Minimum string length (default 6).
-        compact: Return [{value, address}] (default True). If False, adds blob_offset.
-        limit: Max results (default 20).
-    """
-    return _with_handle(
-        "extract_strings_from_blob",
-        binary,
-        lambda handle: GhidraTools(handle).extract_strings_from_blob(
-            offset,
-            size,
-            query=query,
-            min_length=min_length,
-            compact=compact,
-            limit=limit,
-        ),
-    )
-
-
-@mcp.tool()
-def diff_symbols(binary_a: str, binary_b: str, ctx: Context) -> dict:
-    """Compare symbol tables of two binaries. Useful for patch diffing.
-
-    Args:
-        binary_a: First binary name (e.g., original version).
-        binary_b: Second binary name (e.g., patched version).
-    """
-    def op():
-        import heapq
-
-        backend = get_backend()
-        handle_a = backend.get_program(binary_a)
-        handle_b = backend.get_program(binary_b)
-
-        def _get_symbols(handle) -> set[str]:
-            st = handle.program.getSymbolTable()
-            return {sym.getName() for sym in st.getAllSymbols(True)}
-
-        syms_a = _get_symbols(handle_a)
-        syms_b = _get_symbols(handle_b)
-
-        diff_added = syms_b - syms_a
-        diff_removed = syms_a - syms_b
-
-        return {
-            "binary_a": handle_a.name,
-            "binary_b": handle_b.name,
-            "added": heapq.nsmallest(100, diff_added),
-            "removed": heapq.nsmallest(100, diff_removed),
-            "num_added": len(diff_added),
-            "num_removed": len(diff_removed),
-            "num_common": len(syms_a & syms_b),
-        }
-
-    with _backend_lock:
-        return _guarded_tool_call("diff_symbols", op)
-
-
-@mcp.tool()
-async def bootstrap_from_version(
-    dest_binary: str,
-    ctx: Context,
-    source_binary: str = "auto",
-    min_func_size: int = 16,
-    max_func_size: int = 4096,
-    label_fun_star: bool = False,
-) -> dict:
-    """Transfer function names from an analyzed reference binary to a new version.
-
-    Uses exact byte matching to find identical functions between two binaries
-    and copies names from source to dest. Equivalent to running Ghidra's
-    'Exact Match Bytes' version tracking correlator, without the full VT framework.
-
-    Typical workflow:
-        1. Have an analyzed reference binary (e.g., 2.1.59) already loaded.
-        2. Import the new binary without analyzing: import_binary(path, analyze=False).
-        3. Call bootstrap_from_version(dest="claude-<new>") — source auto-selects.
-        4. Run analyze_binary on the new binary — pre-labeled functions speed analysis.
-
-    When source_binary="auto" (default), all loaded binaries are ranked by their count
-    of transferable named functions and presented to the user for confirmation via the
-    MCP elicitation surface. The user can accept the top-ranked choice or enter a
-    different binary name to override.
-
-    A name is transferred only when the byte pattern is unique in the destination
-    and the match address is an auto-named (FUN_*) function entry point.
-    Only executable memory sections are searched to avoid data false-positives.
-
-    Args:
-        dest_binary: Name of the target binary to annotate.
-        source_binary: Name of the reference binary, or "auto" to rank and confirm.
-        min_func_size: Minimum function byte size to transfer (default 16).
-        max_func_size: Maximum function byte size to consider (default 4096).
-        label_fun_star: If True, also transfer FUN_* functions from source, renaming
-            them in dest as "{version}_{src_addr}" (e.g., "v2_1_59_02B4A120").
-            This creates a complete cross-version address map for all byte-identical
-            functions, not just the small set of named library symbols.
-    """
-    loop = asyncio.get_running_loop()
-
-    if source_binary == "auto":
-        ranked = await loop.run_in_executor(
-            _import_executor,
-            lambda: _rank_sources_blocking(exclude_name=dest_binary),
-        )
-
-        if not ranked:
-            raise McpError(ErrorData(
-                code=INVALID_PARAMS,
-                message="No analyzed binaries available as bootstrap sources. "
-                        "Import and analyze a reference binary first.",
-            ))
-
-        top = ranked[0]
-
-        lines = ["Ranked bootstrap sources (by transferable named functions):\n"]
-        for i, r in enumerate(ranked):
-            marker = "* " if i == 0 else "  "
-            lines.append(
-                f"  {marker}{i + 1}. {r['name']}"
-                f"  named={r['named_functions']:,}"
-                f"  total={r['total_functions']:,}"
-                f"  ({r['named_pct']}%)"
-            )
-        lines.append(f"\nAuto-selected: {top['name']}")
-        lines.append(
-            "Leave 'selected_source' blank to confirm, "
-            "or type a different binary name to override."
-        )
-
-        class _BootstrapConfirmation(BaseModel):
-            selected_source: str = ""
-
-        result = await ctx.elicit(message="\n".join(lines), schema=_BootstrapConfirmation)
-
-        if result.action in ("decline", "cancel"):
-            return {"status": "cancelled", "message": "Bootstrap cancelled by user."}
-
-        chosen = result.data.selected_source.strip()
-        source_binary = chosen if chosen else top["name"]
-
-    def _do_transfer():
-        def op():
-            # Derive a short version prefix from source name for label_fun_star mode.
-            # "2.1.59-7a4a6539" → "v2_1_59"; "claude-abc" → "claude_abc"
-            fun_star_prefix = ""
-            if label_fun_star:
-                tag = source_binary.split("-")[0].replace(".", "_")
-                fun_star_prefix = f"v{tag}"
-            return get_backend().transfer_analysis(
-                source_binary, dest_binary,
-                min_func_size=min_func_size,
-                max_func_size=max_func_size,
-                label_fun_star=label_fun_star,
-                fun_star_prefix=fun_star_prefix,
-            )
-        with _backend_lock:
-            return _guarded_tool_call("bootstrap_from_version", op)
-
-    return await loop.run_in_executor(_import_executor, _do_transfer)
-
-
-@mcp.tool()
-async def rank_bootstrap_sources(ctx: Context, dest_binary: str = "") -> list[dict]:
-    """Rank loaded binaries by their transferable named function count.
-
-    Use this to identify the best source binary for bootstrap_from_version.
-    The binary with the most non-FUN_* named functions will transfer the most
-    knowledge to a new version. Results are sorted descending.
-
-    Fields per entry:
-        name            - binary name as registered in pyghidra-lite
-        unit_id         - content-addressed ID
-        total_functions - total function count (including FUN_* auto-names)
-        named_functions - count of transferable named functions
-        named_pct       - named_functions as % of total
-
-    Args:
-        dest_binary: Optional. Exclude this binary from results (it's the target).
-    """
-    loop = asyncio.get_running_loop()
-    exclude = dest_binary.strip() or None
-    return await loop.run_in_executor(
-        _import_executor,
-        lambda: _rank_sources_blocking(exclude_name=exclude),
-    )
-
-
-@mcp.tool()
-def search_symbols(binary: str, query: str, ctx: Context, limit: int = 30) -> list[SymbolInfo]:
-    """Search symbols by name.
-
-    Args:
-        binary: Binary name.
-        query: Name substring (case-insensitive).
-        limit: Max results.
-    """
-    return _with_handle(
-        "search_symbols",
-        binary,
-        lambda handle: GhidraTools(handle).search_symbols(query, limit=limit),
-    )
-
-
-@mcp.tool()
-def get_function_info(binary: str, function: str, ctx: Context) -> dict:
-    """Get detailed info about a single function.
-
-    Args:
-        binary: Binary name.
-        function: Function name or address.
-    """
-    def op(handle):
-        fm = handle.program.getFunctionManager()
-        rm = handle.program.getReferenceManager()
-
-        # Find function
-        func = None
-        if function.startswith("0x"):
-            try:
-                addr = handle.program.getAddressFactory().getAddress(function.replace("0x", ""))
-                func = fm.getFunctionAt(addr)
-            except Exception:
-                pass
-
-        if not func:
-            for f in fm.getFunctions(True):
-                if f.getName() == function or function.lower() in f.getName().lower():
-                    func = f
-                    break
-
-        if not func:
-            raise ValueError(f"Function not found: {function}")
-
-        entry = func.getEntryPoint()
-        body = func.getBody()
-
-        # Get callers
-        callers = []
-        for ref in rm.getReferencesTo(entry):
-            caller = fm.getFunctionContaining(ref.getFromAddress())
-            if caller and caller.getName() not in callers:
-                callers.append(caller.getName())
-
-        # Get callees
-        callees = [f.getName() for f in func.getCalledFunctions(None)]
-
-        return {
-            "name": func.getName(),
-            "address": str(entry),
-            "size": int(body.getNumAddresses()),
-            "is_thunk": func.isThunk(),
-            "is_external": func.isExternal(),
-            "calling_convention": str(func.getCallingConventionName()),
-            "stack_frame_size": (
-                func.getStackFrame().getFrameSize() if func.getStackFrame() else None
-            ),
-            "num_params": func.getParameterCount(),
-            "callers": callers[:20],
-            "callees": callees[:20],
-            "num_callers": len(list(rm.getReferencesTo(entry))),
-            "num_callees": len(callees),
-        }
-
-    return _with_handle("get_function_info", binary, op)
-
-
-@mcp.tool()
-def disassemble(binary: str, function: str, ctx: Context, limit: int = 100) -> list[dict]:
-    """Get assembly instructions for a function.
-
-    Args:
-        binary: Binary name.
-        function: Function name or address.
-        limit: Max instructions to return.
-    """
-    def op(handle):
-        fm = handle.program.getFunctionManager()
-        listing = handle.program.getListing()
-
-        # Find function
-        func = None
-        if function.startswith("0x"):
-            try:
-                addr = handle.program.getAddressFactory().getAddress(function.replace("0x", ""))
-                func = fm.getFunctionAt(addr)
-            except Exception:
-                pass
-
-        if not func:
-            for f in fm.getFunctions(True):
-                if f.getName() == function or function.lower() in f.getName().lower():
-                    func = f
-                    break
-
-        if not func:
-            raise ValueError(f"Function not found: {function}")
-
-        instructions = []
-        body = func.getBody()
-
-        for addr in body.getAddresses(True):
-            instr = listing.getInstructionAt(addr)
-            if instr:
-                # Get operands
-                operands = []
-                for i in range(instr.getNumOperands()):
-                    operands.append(str(instr.getDefaultOperandRepresentation(i)))
-
-                instructions.append({
-                    "addr": str(addr),
-                    "mnemonic": str(instr.getMnemonicString()),
-                    "operands": operands,
-                    "bytes": instr.getBytes().hex() if instr.getBytes() else None,
-                })
-
-                if len(instructions) >= limit:
-                    break
-
-        return instructions
-
-    return _with_handle("disassemble", binary, op)
-
-
-# =============================================================================
-# AGENT-EFFICIENCY TOOLS (multi-call patterns collapsed to single calls)
-# =============================================================================
-
-@mcp.tool()
-def triage_binary(binary: str, ctx: Context, limit: int = 15) -> dict:
-    """Full binary triage in one call. Best first-call after import.
-
-    Replaces: binary_info + list_functions + list_imports + search_strings + entropy_map.
-    Reduces first-investigation from 5+ calls to 1 call.
-
-    Returns format, top functions by reference count, top imports (suspicious first),
-    notable strings (URLs, keys, paths), high-entropy sections, and capabilities.
-
-    Args:
-        binary: Binary name.
-        limit: Max items per category (default 15, capped at 100).
-    """
-    limit = min(limit, 100)  # Prevent response amplification
-
-    def op(handle):
         tools = GhidraTools(handle)
-        fm = handle.program.getFunctionManager()
-        caps = _ensure_capabilities(handle)
+
+        if detail == "entropy":
+            try:
+                entropy_data = tools.entropy_map()
+                base["entropy"] = entropy_data
+                base["high_entropy_sections"] = [
+                    s for s in entropy_data if s.get("entropy", 0) > 7.0
+                ]
+            except Exception as e:
+                base["entropy_error"] = str(e)
+            return base
+
+        if detail == "sections":
+            mem = handle.program.getMemory()
+            sections = []
+            for block in mem.getBlocks():
+                perms = ""
+                if block.isRead(): perms += "r"
+                if block.isWrite(): perms += "w"
+                if block.isExecute(): perms += "x"
+                sections.append({
+                    "name": block.getName(),
+                    "addr": hex(int(block.getStart().getOffset())),
+                    "size": int(block.getSize()),
+                    "permissions": perms or "---",
+                })
+            base["sections"] = sections
+            return base
+
+        if detail == "format":
+            if caps.is_elf:
+                from pyghidra_lite.formats import ElfTools
+                elf_info = ElfTools(handle).get_elf_info()
+                base["elf"] = {
+                    "bits": elf_info.bits,
+                    "endian": elf_info.endian,
+                    "machine": elf_info.machine,
+                    "num_sections": elf_info.num_sections,
+                    "num_symbols": elf_info.num_symbols,
+                    "has_debug": elf_info.has_debug,
+                    "is_stripped": elf_info.is_stripped,
+                }
+            elif caps.is_macho:
+                from pyghidra_lite.formats import MachOTools
+                macho_info = MachOTools(handle).get_macho_info()
+                base["macho"] = {
+                    "cpu_type": macho_info.cpu_type,
+                    "num_segments": macho_info.num_segments,
+                    "num_sections": macho_info.num_sections,
+                    "num_dylibs": macho_info.num_dylibs,
+                    "has_code_signature": macho_info.has_code_signature,
+                    "entrypoint": macho_info.entrypoint,
+                }
+            return base
+
+        # detail == "full" - triage mode
+        limit = 15
 
         # Top functions by refs_in
         funcs = tools.list_functions(limit=limit * 2, sort_by="refs_in", include_metadata=True)
-        top_functions = [
-            {"name": f.name, "address": f.address, "refs_in": f.refs_in, "size": f.size}
+        base["top_functions"] = [
+            {"name": f.name, "address": f.address, "refs_in": f.refs_in}
             for f in funcs[:limit]
         ]
 
-        # Imports — suspicious (tagged) first
+        # Imports (suspicious first)
         imports = tools.list_imports(limit=limit * 3)
         suspicious = [i for i in imports if i.tags]
         normal = [i for i in imports if not i.tags]
-        top_imports = [
+        base["top_imports"] = [
             {"name": i.name, "tags": i.tags or []}
             for i in (suspicious + normal)[:limit]
         ]
 
-        # Notable strings (URLs, keys, paths, errors)
+        # Notable strings
         strings = tools.search_strings("", limit=limit * 3)
-        notable = [
+        base["notable_strings"] = [
             {"value": s.value, "type": s.looks_like, "address": s.address}
             for s in strings
             if s.looks_like in ("url", "key", "path", "error")
         ][:limit]
 
-        # High-entropy sections
+        # Embedded runtimes
         try:
-            entropy = tools.entropy_map()
-            hot_sections = [s for s in entropy if s.get("entropy") and s["entropy"] > 7.0]
-        except Exception as _e:
-            logger.warning("triage_binary: entropy_map failed for %s: %s", handle.name, _e)
-            hot_sections = []
+            rt_info = tools.detect_embedded_runtime(compact=True)
+            if rt_info.get("runtimes"):
+                base["runtimes"] = rt_info["runtimes"]
+                base["strategy"] = rt_info.get("strategy")
+        except Exception:
+            pass
 
-        return {
-            "name": handle.name,
-            "unit_id": handle.unit_id,
-            "format": handle.metadata.get("Executable Format", "unknown"),
-            "arch": handle.metadata.get("Processor", "unknown"),
-            "analyzed": handle.analyzed,
-            "profile": handle.profile.value if handle.profile else None,
-            "capabilities": _format_capabilities(caps),
-            "num_functions": fm.getFunctionCount(),
-            "top_functions": top_functions,
-            "top_imports": top_imports,
-            "notable_strings": notable,
-            "high_entropy_sections": hot_sections,
-        }
-
-    return _with_handle("triage_binary", binary, op)
-
-
-@mcp.tool()
-def function_context(binary: str, function: str, ctx: Context) -> dict:
-    """Decompile a function and return full context in one call.
-
-    Returns decompiled code, callers (who calls this), callees (what this calls),
-    and strings referenced. Replaces separate decompile + get_xrefs calls.
-
-    Args:
-        binary: Binary name.
-        function: Function name or address.
-    """
-    def op(handle):
-        tools = GhidraTools(handle)
-        dec = tools.decompile_function(
-            function, include_callees=True, include_strings=True
-        )
-        callers = tools.get_xrefs(function, limit=10)
-        return {
-            "name": dec.name,
-            "address": dec.address,
-            "signature": dec.signature,
-            "decompiled": dec.code,
-            "callers": [
-                {"name": r.from_func, "address": r.from_addr}
-                for r in callers
-                if r.type == "call"
-            ],
-            "callees": dec.callees or [],
-            "strings_used": dec.strings_used or [],
-        }
-
-    return _with_handle("function_context", binary, op)
-
-
-@mcp.tool()
-def decompile_with_cfg(binary: str, function: str, ctx: Context) -> dict:
-    """Decompile a function and return its control flow graph.
-
-    Returns pseudo-code alongside basic block structure (addresses, sizes,
-    edges). The CFG gives structural context that helps with type inference
-    and understanding control flow without needing the expensive Decompiler
-    Parameter ID analyzer pass.
-
-    Args:
-        binary: Binary name.
-        function: Function name or address.
-    """
-    def op(handle):
-        tools = GhidraTools(handle)
-        dec = tools.decompile_function(
-            function, include_callees=True, include_strings=True
-        )
-        cfg = tools.get_cfg(function)
-        return {
-            "name": dec.name,
-            "address": dec.address,
-            "signature": dec.signature,
-            "decompiled": dec.code,
-            "cfg": cfg,
-            "num_blocks": len(cfg),
-            "callees": dec.callees or [],
-            "strings_used": dec.strings_used or [],
-        }
-
-    return _with_handle("decompile_with_cfg", binary, op)
-
-
-@mcp.tool()
-def batch_xrefs(
-    binary: str,
-    targets: list[str],
-    ctx: Context,
-    limit: int = 20,
-) -> dict:
-    """Get cross-references for multiple targets in one call.
-
-    More efficient than N individual get_xrefs() calls when investigating
-    a set of related functions.
-
-    Args:
-        binary: Binary name.
-        targets: Function/symbol names or addresses (max 20).
-        limit: Max refs per target (default 20).
-    """
-    if not targets:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message="targets must not be empty"))
-    if len(targets) > 20:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message="Max 20 targets per call"))
-
-    def op(handle):
-        tools = GhidraTools(handle)
-        result = {}
-        for target in targets:
+        # Language-specific info
+        if caps.has_swift:
+            from pyghidra_lite.lang import SwiftTools
             try:
-                refs = tools.get_xrefs(target, limit=limit)
-                result[target] = [
-                    {"from_func": r.from_func, "from_addr": r.from_addr, "type": r.type}
-                    for r in refs
-                ]
-            except Exception as _e:
-                logger.debug("batch_xrefs: failed for target %r: %s", target, _e)
-                result[target] = []
+                swift_info = SwiftTools(handle).get_swift_info()
+                base["swift"] = {
+                    "module_name": swift_info.module_name,
+                    "num_swift_functions": swift_info.num_swift_functions,
+                }
+            except Exception:
+                pass
+
+        if caps.has_objc:
+            from pyghidra_lite.lang import ObjCTools
+            try:
+                objc_info = ObjCTools(handle).get_objc_info()
+                base["objc"] = {
+                    "num_classes": objc_info.num_classes,
+                    "num_selectors": objc_info.num_selectors,
+                    "has_arc": objc_info.has_arc,
+                }
+            except Exception:
+                pass
+
+        return base
+
+    return _with_handle("info", binary, op)
+
+
+@mcp.tool()
+async def functions(
+    binary: str,
+    ctx: Context,
+    query: str = "",
+    type: str = "all",
+    limit: int = 50,
+    demangle: str = "",
+) -> list[dict]:
+    """List or search functions by type.
+
+    Args:
+        binary: Binary name or unit_id.
+        query: Filter by name substring (searches demangled names for Swift/ObjC).
+        type: Function type filter:
+            - "all" (default): all functions
+            - "swift": Swift functions only (demangled)
+            - "objc": Objective-C methods only
+            - "imports": imported symbols
+            - "exports": exported symbols
+            - "types": Swift types (metadata)
+            - "got": GOT/PLT entries (ELF)
+            - "dylibs": linked dynamic libraries (Mach-O)
+        limit: Max results (default 50).
+        demangle: If provided, demangle this single Swift symbol name.
+    """
+    # Single symbol demangle shortcut
+    if demangle:
+        from pyghidra_lite.lang import demangle_swift
+        return [{"mangled": demangle, "demangled": demangle_swift(demangle)}]
+
+    def op(handle):
+        tools = GhidraTools(handle)
+        caps = _ensure_capabilities(handle)
+
+        if type == "swift":
+            if not caps.has_swift:
+                return [{"error": "Binary has no Swift code"}]
+            from pyghidra_lite.lang import SwiftTools
+            swift_tools = SwiftTools(handle)
+            results = swift_tools.list_swift_functions(pattern=query, limit=limit)
+            return [
+                {"demangled": f.demangled, "address": f.address, "kind": f.kind}
+                for f in results
+            ]
+
+        if type == "objc":
+            if not caps.has_objc:
+                return [{"error": "Binary has no Objective-C code"}]
+            from pyghidra_lite.lang import ObjCTools
+            objc_tools = ObjCTools(handle)
+            methods = objc_tools.list_methods(pattern=query, limit=limit)
+            return [
+                {"signature": m.signature, "class": m.class_name, "address": m.impl_address}
+                for m in methods
+            ]
+
+        if type == "imports":
+            imports = tools.list_imports(pattern=query, limit=limit)
+            return [
+                {"name": i.name, "library": i.library, "tags": i.tags or []}
+                for i in imports
+            ]
+
+        if type == "exports":
+            exports = tools.list_exports(pattern=query, limit=limit)
+            return [{"name": e.name, "address": e.address} for e in exports]
+
+        if type == "types":
+            if not caps.has_swift:
+                return [{"error": "Binary has no Swift code"}]
+            from pyghidra_lite.lang import SwiftTools
+            swift_tools = SwiftTools(handle)
+            types = swift_tools.list_swift_types(limit=limit)
+            return [
+                {"name": t.name, "module": t.module, "kind": t.kind}
+                for t in types
+            ]
+
+        if type == "got":
+            if not caps.is_elf:
+                return [{"error": "GOT/PLT only available for ELF binaries"}]
+            from pyghidra_lite.formats import ElfTools
+            return ElfTools(handle).get_got_plt()
+
+        if type == "dylibs":
+            if not caps.is_macho:
+                return [{"error": "dylibs only available for Mach-O binaries"}]
+            from pyghidra_lite.formats import MachOTools
+            return [{"name": d.name} for d in MachOTools(handle).list_dylibs()]
+
+        # Default: all functions
+        funcs = tools.list_functions(pattern=query, limit=limit)
+        return [{"name": f.name, "addr": f.address} for f in funcs]
+
+    results = _with_handle("functions", binary, op)
+    await _warn_if_limit_reached(ctx, "functions", limit, len(results))
+    return results
+
+
+@mcp.tool()
+def code(
+    binary: str,
+    target: str | list[str],
+    ctx: Context,
+    what: str = "decompile",
+    cfg: bool = False,
+) -> dict | list[dict]:
+    """Decompile or disassemble function(s).
+
+    Args:
+        binary: Binary name or unit_id.
+        target: Function name/address, or list of function names for batch.
+        what: Output type:
+            - "decompile" (default): C pseudocode
+            - "asm": assembly instructions
+            - "bytes": raw bytes at address (requires address and size in target)
+            - "string": null-terminated string at address
+        cfg: Include control flow graph (blocks and edges).
+    """
+    def op(handle):
+        tools = GhidraTools(handle)
+
+        # Handle batch decompile
+        if isinstance(target, list):
+            results = tools.batch_decompile(
+                target, include_callees=True, include_strings=True
+            )
+            return [
+                {
+                    "name": r.name,
+                    "address": r.address,
+                    "code": r.code,
+                    "callees": r.callees,
+                    "strings": r.strings_used,
+                }
+                for r in results
+            ]
+
+        # Single target
+        if what == "asm":
+            fm = handle.program.getFunctionManager()
+            listing = handle.program.getListing()
+
+            func = None
+            if target.startswith("0x"):
+                try:
+                    addr = handle.program.getAddressFactory().getAddress(target.replace("0x", ""))
+                    func = fm.getFunctionAt(addr)
+                except Exception:
+                    pass
+
+            if not func:
+                for f in fm.getFunctions(True):
+                    if f.getName() == target or target.lower() in f.getName().lower():
+                        func = f
+                        break
+
+            if not func:
+                raise ValueError(f"Function not found: {target}")
+
+            instructions = []
+            body = func.getBody()
+            limit = 100
+
+            for addr in body.getAddresses(True):
+                instr = listing.getInstructionAt(addr)
+                if instr:
+                    operands = [str(instr.getDefaultOperandRepresentation(i))
+                                for i in range(instr.getNumOperands())]
+                    instructions.append({
+                        "addr": str(addr),
+                        "mnemonic": str(instr.getMnemonicString()),
+                        "operands": operands,
+                    })
+                    if len(instructions) >= limit:
+                        break
+
+            return {"function": func.getName(), "instructions": instructions}
+
+        if what == "bytes":
+            # target format: "addr,size" or just address
+            parts = target.split(",")
+            addr = parts[0].strip()
+            size = int(parts[1].strip()) if len(parts) > 1 else 16
+            result = tools.read_bytes(addr, size)
+            return {"address": result.address, "hex": result.hex, "ascii": result.ascii}
+
+        if what == "string":
+            return {"address": target, "value": tools.read_string(target)}
+
+        # Default: decompile
+        dec = tools.decompile_function(
+            target, include_callees=True, include_strings=True
+        )
+
+        result = {
+            "name": dec.name,
+            "address": dec.address,
+            "signature": dec.signature,
+            "code": dec.code,
+            "callees": dec.callees,
+            "strings": dec.strings_used,
+        }
+
+        if cfg:
+            cfg_data = tools.get_cfg(target)
+            result["cfg"] = cfg_data
+            result["num_blocks"] = len(cfg_data)
+
+        # Get callers for context
+        callers = tools.get_xrefs(target, limit=10)
+        result["callers"] = [
+            {"name": r.from_func, "address": r.from_addr}
+            for r in callers if r.type == "call"
+        ]
+
         return result
 
-    return _with_handle("batch_xrefs", binary, op)
+    return _with_handle("code", binary, op)
 
 
 @mcp.tool()
-def search_all(binary: str, query: str, ctx: Context, limit: int = 10) -> dict:
-    """Search functions, symbols, and strings simultaneously.
-
-    Replaces: list_functions(pattern=q) + search_symbols(q) + search_strings(q).
-    Reduces 3 calls to 1.
+def xrefs(
+    binary: str,
+    target: str | list[str],
+    ctx: Context,
+    direction: str = "to",
+    depth: int = 1,
+    diff: bool = False,
+) -> dict:
+    """Get cross-references, call graph, or symbol diff.
 
     Args:
-        binary: Binary name.
-        query: Search term (case-insensitive substring match).
-        limit: Max results per category (default 10).
+        binary: Binary name or unit_id.
+        target: Function/symbol name or address, or list for batch, or binary name for diff.
+        direction: Reference direction:
+            - "to" (default): who calls/uses this target
+            - "from": what this target calls/uses
+        depth: Call graph depth (default 1, max 5). Use depth>1 for full call graph.
+        diff: If True, compare symbols between binary and target (another binary name).
     """
-    def op(handle):
+    def op():
+        backend = get_backend()
+
+        # Symbol diff mode
+        if diff:
+            import heapq
+            handle_a = backend.get_program(binary)
+            handle_b = backend.get_program(target if isinstance(target, str) else target[0])
+
+            def _get_symbols(handle) -> set[str]:
+                st = handle.program.getSymbolTable()
+                return {sym.getName() for sym in st.getAllSymbols(True)}
+
+            syms_a = _get_symbols(handle_a)
+            syms_b = _get_symbols(handle_b)
+
+            return {
+                "binary_a": handle_a.name,
+                "binary_b": handle_b.name,
+                "added": heapq.nsmallest(100, syms_b - syms_a),
+                "removed": heapq.nsmallest(100, syms_a - syms_b),
+                "num_added": len(syms_b - syms_a),
+                "num_removed": len(syms_a - syms_b),
+                "num_common": len(syms_a & syms_b),
+            }
+
+        handle = backend.get_program(binary)
         tools = GhidraTools(handle)
+
+        # Batch xrefs
+        if isinstance(target, list):
+            if len(target) > 20:
+                raise McpError(ErrorData(code=INVALID_PARAMS, message="Max 20 targets per call"))
+            result = {}
+            for t in target:
+                try:
+                    refs = tools.get_xrefs(t, limit=20)
+                    result[t] = [
+                        {"from_func": r.from_func, "from_addr": r.from_addr, "type": r.type}
+                        for r in refs
+                    ]
+                except Exception:
+                    result[t] = []
+            return {"xrefs": result}
+
+        # Call graph (depth > 1)
+        if depth > 1:
+            depth = min(depth, 5)
+            graph_direction = "both" if direction == "to" else direction
+            if direction == "from":
+                graph_direction = "callees"
+            elif direction == "to":
+                graph_direction = "callers"
+            else:
+                graph_direction = "both"
+            return tools.get_call_graph(target, depth=depth, direction=graph_direction)
+
+        # Simple xrefs
+        if direction == "from":
+            callees = tools.get_callees(target)
+            return {"function": target, "callees": callees}
+
+        refs = tools.get_xrefs(target, limit=50)
+        return {
+            "target": target,
+            "references": [
+                {"from_func": r.from_func, "from_addr": r.from_addr, "type": r.type}
+                for r in refs
+            ],
+        }
+
+    with _backend_lock:
+        return _guarded_tool_call("xrefs", op)
+
+
+@mcp.tool()
+async def search(
+    binary: str,
+    query: str | list[str],
+    ctx: Context,
+    type: str = "strings",
+    mode: str = "indexed",
+    limit: int = 30,
+    bg: bool = False,
+) -> dict:
+    """Search for strings, bytes, symbols, or all.
+
+    Args:
+        binary: Binary name or unit_id.
+        query: Search pattern, or list for batch search.
+        type: What to search:
+            - "strings" (default): string references
+            - "symbols": symbol names
+            - "bytes": hex byte pattern (e.g., "cafebabe")
+            - "all": functions, symbols, and strings simultaneously
+            - "blob": extract strings from raw memory region (query="offset,size")
+            - "extract": extract bunfs filesystem (Bun binaries only)
+        mode: Search mode for strings:
+            - "indexed" (default): Ghidra's defined strings (fast)
+            - "deep": raw memory scan (finds strings Ghidra missed)
+        limit: Max results per query (default 30).
+        bg: Run in background (returns job_id to poll).
+    """
+    handle = _get_handle(binary)
+    tools = GhidraTools(handle)
+
+    # Batch search
+    if isinstance(query, list):
+        if bg:
+            job_id = _new_job_id()
+            job: dict = {"kind": "scan", "label": "batch_search",
+                         "binary": binary, "status": "queued", "job_id": job_id}
+            with _jobs_mutex:
+                _active_jobs[job_id] = job
+
+            fn = lambda: {"results": tools.batch_search_strings(
+                query, mode=mode, limit_per_query=limit,
+            )}
+            asyncio.create_task(_run_scan_task(job_id, job, fn))
+            return {
+                "job_id": job_id,
+                "status": "queued",
+                "hint": f"Poll: list(jobs=True). On complete: get results via list().",
+            }
+
+        results = tools.batch_search_strings(query, mode=mode, limit_per_query=limit)
+        return {"queries": query, "results": results}
+
+    # Single query searches
+    if type == "extract":
+        # BunFS extraction - always background
+        status = _read_status_file(handle.unit_id)
+        binary_path_str = status.get("binary_path", handle.name)
+        stem = Path(binary_path_str).stem
+        out = Path(binary_path_str).parent / f"{stem}_bunfs_extracted"
+
+        job_id = _new_job_id()
+        job = {"kind": "scan", "label": "extract_bunfs",
+               "binary": binary, "status": "queued", "job_id": job_id}
+        with _jobs_mutex:
+            _active_jobs[job_id] = job
+
+        asyncio.create_task(_run_scan_task(job_id, job, lambda: _extract_bunfs_blocking(handle, out)))
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "hint": f"Poll: list(jobs=True). On complete: get results via list().",
+        }
+
+    if type == "blob":
+        parts = query.split(",")
+        offset = parts[0].strip()
+        size = int(parts[1].strip()) if len(parts) > 1 else 1024
+        results = tools.extract_strings_from_blob(offset, size, limit=limit)
+        return {"offset": offset, "size": size, "strings": results}
+
+    if type == "bytes":
+        results = tools.find_bytes(query, limit=limit)
+        return {"pattern": query, "matches": results}
+
+    if type == "symbols":
+        results = tools.search_symbols(query, limit=limit)
+        return {
+            "query": query,
+            "symbols": [
+                {"name": s.name, "address": s.address, "type": s.type}
+                for s in results
+            ],
+        }
+
+    if type == "all":
         return {
             "query": query,
             "functions": [
@@ -2863,476 +2481,53 @@ def search_all(binary: str, query: str, ctx: Context, limit: int = 10) -> dict:
             ],
         }
 
-    return _with_handle("search_all", binary, op)
+    # Default: strings
+    if mode == "deep":
+        results = tools.search_strings_deep(query, limit=limit)
+        return {"query": query, "mode": "deep", "strings": results}
 
-
-# =============================================================================
-# ELF TOOLS (Linux binaries)
-# =============================================================================
-
-@mcp.tool()
-def elf_info(binary: str, ctx: Context) -> dict:
-    """Get ELF binary structure summary.
-
-    Args:
-        binary: Binary name.
-    """
-    from pyghidra_lite.formats import ElfTools
-
-    def op(handle):
-        info = ElfTools(handle).get_elf_info()
-        return {
-            "is_elf": info.is_elf,
-            "bits": info.bits,
-            "endian": info.endian,
-            "machine": info.machine,
-            "num_sections": info.num_sections,
-            "num_symbols": info.num_symbols,
-            "has_debug": info.has_debug,
-            "is_stripped": info.is_stripped,
-        }
-
-    return _with_handle("elf_info", binary, op)
-
-
-@mcp.tool()
-def elf_sections(binary: str, ctx: Context) -> list[dict]:
-    """List ELF sections (.text, .data, .bss, etc).
-
-    Args:
-        binary: Binary name.
-    """
-    from pyghidra_lite.formats import ElfTools
-
-    return _with_handle(
-        "elf_sections",
-        binary,
-        lambda handle: [
-            {
-                "name": s.name,
-                "type": s.type,
-                "addr": hex(s.addr),
-                "size": s.size,
-                "flags": s.flags,
-            }
-            for s in ElfTools(handle).list_sections()
+    results = tools.search_strings(query, limit=limit)
+    return {
+        "query": query,
+        "strings": [
+            {"value": s.value, "address": s.address, "refs": s.refs}
+            for s in results
         ],
-    )
-
-
-@mcp.tool()
-async def elf_symbols(
-    binary: str,
-    ctx: Context,
-    pattern: str = "",
-    limit: int = 50,
-    compact: bool = True,
-) -> list[dict]:
-    """List ELF symbols (functions, objects).
-
-    Args:
-        binary: Binary name.
-        pattern: Filter by name.
-        limit: Max results (default 50).
-        compact: Return only name/address to reduce tokens (default true).
-    """
-    from pyghidra_lite.formats import ElfTools
-
-    symbols = _with_handle(
-        "elf_symbols",
-        binary,
-        lambda handle: ElfTools(handle).list_symbols(pattern=pattern, limit=limit),
-    )
-    await _warn_if_limit_reached(ctx, "elf_symbols", limit, len(symbols), suggest_compact=True)
-    if compact:
-        return [{"name": s.name, "addr": hex(s.addr)} for s in symbols]
-    return [
-        {
-            "name": s.name,
-            "addr": hex(s.addr),
-            "size": s.size,
-            "type": s.type,
-            "bind": s.bind,
-        }
-        for s in symbols
-    ]
-
-
-@mcp.tool()
-def elf_got_plt(binary: str, ctx: Context) -> list[dict]:
-    """Get GOT/PLT entries (dynamic linking).
-
-    Args:
-        binary: Binary name.
-    """
-    from pyghidra_lite.formats import ElfTools
-
-    return _with_handle(
-        "elf_got_plt",
-        binary,
-        lambda handle: ElfTools(handle).get_got_plt(),
-    )
+    }
 
 
 # =============================================================================
-# MACH-O TOOLS
+# LEGACY TOOL ALIASES (hidden from model, route to consolidated tools)
 # =============================================================================
 
-@mcp.tool()
-def macho_info(binary: str, ctx: Context) -> dict:
-    """Get Mach-O binary structure (segments, dylibs, code signature).
-
-    Args:
-        binary: Binary name.
-    """
-    from pyghidra_lite.formats import MachOTools
-
-    def op(handle):
-        info = MachOTools(handle).get_macho_info()
-        return {
-            "cpu_type": info.cpu_type,
-            "num_segments": info.num_segments,
-            "num_sections": info.num_sections,
-            "num_dylibs": info.num_dylibs,
-            "has_code_signature": info.has_code_signature,
-            "entrypoint": info.entrypoint,
-        }
-
-    return _with_handle("macho_info", binary, op)
-
-
-@mcp.tool()
-def macho_segments(binary: str, ctx: Context) -> list[dict]:
-    """List Mach-O segments and sections.
-
-    Args:
-        binary: Binary name.
-    """
-    from pyghidra_lite.formats import MachOTools
-
-    return _with_handle(
-        "macho_segments",
-        binary,
-        lambda handle: [
-            {
-                "name": seg.name,
-                "vmaddr": hex(seg.vmaddr),
-                "vmsize": seg.vmsize,
-                "sections": [
-                    {"name": s.name, "addr": hex(s.addr), "size": s.size} for s in seg.sections
-                ],
-            }
-            for seg in MachOTools(handle).list_segments()
-        ],
-    )
-
-
-@mcp.tool()
-def macho_dylibs(binary: str, ctx: Context) -> list[str]:
-    """List linked dynamic libraries.
-
-    Args:
-        binary: Binary name.
-    """
-    from pyghidra_lite.formats import MachOTools
-
-    return _with_handle(
-        "macho_dylibs",
-        binary,
-        lambda handle: [d.name for d in MachOTools(handle).list_dylibs()],
-    )
+# The old tool names are no longer registered as @mcp.tool() but can still
+# be called via the alias routing in consolidated.py. When list_tools is
+# called, only the 8 consolidated tools are returned.
 
 
 # =============================================================================
-# SWIFT TOOLS (Available when swift capability detected)
+# REMOVED: Old tool registrations
 # =============================================================================
-
-@mcp.tool()
-async def swift_functions(
-    binary: str,
-    ctx: Context,
-    pattern: str = "",
-    kind: str | None = None,
-    limit: int = 50,
-    compact: bool = True,
-) -> list[dict]:
-    """List Swift functions with demangled names.
-
-    Args:
-        binary: Binary name.
-        pattern: Filter by demangled name.
-        kind: Filter by kind (function, initializer, getter, setter, witness).
-        limit: Max results (default 50).
-        compact: Return only demangled name/address to reduce tokens (default true).
-    """
-    from pyghidra_lite.lang import SwiftTools
-
-    symbols = _with_handle(
-        "swift_functions",
-        binary,
-        lambda handle: SwiftTools(handle).list_swift_functions(
-            pattern=pattern, kind=kind, limit=limit
-        ),
-    )
-    await _warn_if_limit_reached(
-        ctx, "swift_functions", limit, len(symbols), suggest_compact=True
-    )
-    if compact:
-        return [{"demangled": f.demangled, "address": f.address} for f in symbols]
-    return [
-        {
-            "demangled": f.demangled,
-            "mangled": f.mangled,
-            "address": f.address,
-            "kind": f.kind,
-            "module": f.module,
-        }
-        for f in symbols
-    ]
-
-
-@mcp.tool()
-def swift_types(binary: str, ctx: Context, limit: int = 50) -> list[dict]:
-    """List Swift types from metadata.
-
-    Args:
-        binary: Binary name.
-        limit: Max results.
-    """
-    from pyghidra_lite.lang import SwiftTools
-
-    return _with_handle(
-        "swift_types",
-        binary,
-        lambda handle: [
-            {"name": t.name, "module": t.module, "kind": t.kind}
-            for t in SwiftTools(handle).list_swift_types(limit=limit)
-        ],
-    )
-
-
-@mcp.tool()
-def swift_decompile(binary: str, function: str, ctx: Context) -> dict:
-    """Decompile Swift function with demangled callees.
-
-    Args:
-        binary: Binary name.
-        function: Function name (mangled or demangled) or address.
-    """
-    from pyghidra_lite.lang import SwiftTools
-
-    return _with_handle(
-        "swift_decompile",
-        binary,
-        lambda handle: SwiftTools(handle).decompile_swift(function),
-    )
-
-
-@mcp.tool()
-def demangle(name: str, ctx: Context) -> str:
-    """Demangle a Swift symbol name.
-
-    Args:
-        name: Mangled Swift symbol (e.g., _$s...).
-    """
-    from pyghidra_lite.lang import demangle_swift
-    return demangle_swift(name)
-
-
-@mcp.tool()
-def swift_info(binary: str, ctx: Context) -> dict:
-    """Swift binary overview: version, module name, type and protocol counts.
-
-    Faster than calling swift_functions + swift_types separately for a first look.
-
-    Args:
-        binary: Binary name.
-    """
-    from pyghidra_lite.lang import SwiftTools
-
-    def op(handle):
-        info = SwiftTools(handle).get_swift_info()
-        return {
-            "is_swift": info.is_swift,
-            "swift_version": info.swift_version,
-            "module_name": info.module_name,
-            "num_types": info.num_types,
-            "num_protocols": info.num_protocols,
-            "num_swift_functions": info.num_swift_functions,
-            "sections": info.sections,
-        }
-
-    return _with_handle("swift_info", binary, op)
+# The following tools have been consolidated:
+# - import_binary, analyze_binary, reanalyze -> load
+# - delete_binary, cancel_analysis -> delete
+# - list_binaries, analysis_status, get_job_result -> list
+# - binary_info, triage_binary, elf_info, macho_info, swift_info, objc_info,
+#   hermes_info, detect_embedded_runtime, entropy_map, memory_map,
+#   elf_sections, macho_segments -> info
+# - list_functions, swift_functions, objc_methods, objc_classes, get_function_info,
+#   list_imports, list_exports, elf_symbols, elf_got_plt, macho_dylibs,
+#   swift_types, demangle -> functions
+# - decompile, swift_decompile, objc_decompile, decompile_with_cfg,
+#   function_context, batch_decompile, disassemble, read_bytes, read_string -> code
+# - get_xrefs, get_callees, batch_xrefs, call_graph, diff_symbols -> xrefs
+# - search_strings, search_strings_deep, batch_search_strings, search_symbols,
+#   search_all, find_bytes, extract_strings_from_blob, extract_bunfs,
+#   hermes_endpoints, hermes_components -> search
 
 
 # =============================================================================
-# OBJECTIVE-C TOOLS (Available when objc capability detected)
-# =============================================================================
-
-@mcp.tool()
-def objc_classes(binary: str, ctx: Context, pattern: str = "", limit: int = 50) -> list[dict]:
-    """List Objective-C classes.
-
-    Args:
-        binary: Binary name.
-        pattern: Filter by class name.
-        limit: Max results.
-    """
-    from pyghidra_lite.lang import ObjCTools
-
-    return _with_handle(
-        "objc_classes",
-        binary,
-        lambda handle: [
-            {
-                "name": c.name,
-                "address": c.address,
-                "num_methods": len(c.methods),
-            }
-            for c in ObjCTools(handle).list_classes(pattern=pattern, limit=limit)
-        ],
-    )
-
-
-@mcp.tool()
-def objc_methods(
-    binary: str,
-    ctx: Context,
-    class_name: str | None = None,
-    pattern: str = "",
-    limit: int = 50,
-) -> list[dict]:
-    """List Objective-C methods.
-
-    Args:
-        binary: Binary name.
-        class_name: Filter by class.
-        pattern: Filter by selector.
-        limit: Max results.
-    """
-    from pyghidra_lite.lang import ObjCTools
-
-    return _with_handle(
-        "objc_methods",
-        binary,
-        lambda handle: [
-            {
-                "signature": m.signature,
-                "class": m.class_name,
-                "selector": m.selector,
-                "is_class_method": m.is_class_method,
-                "address": m.impl_address,
-            }
-            for m in ObjCTools(handle).list_methods(
-                class_name=class_name, pattern=pattern, limit=limit
-            )
-        ],
-    )
-
-
-@mcp.tool()
-def objc_info(binary: str, ctx: Context) -> dict:
-    """Objective-C binary overview: class, method, protocol counts, ARC status.
-
-    Faster than calling objc_classes + objc_methods separately for a first look.
-
-    Args:
-        binary: Binary name.
-    """
-    from pyghidra_lite.lang import ObjCTools
-
-    def op(handle):
-        info = ObjCTools(handle).get_objc_info()
-        return {
-            "has_objc": info.has_objc,
-            "num_classes": info.num_classes,
-            "num_categories": info.num_categories,
-            "num_protocols": info.num_protocols,
-            "num_selectors": info.num_selectors,
-            "has_arc": info.has_arc,
-            "frameworks": info.frameworks,
-        }
-
-    return _with_handle("objc_info", binary, op)
-
-
-@mcp.tool()
-def objc_decompile(binary: str, signature: str, ctx: Context) -> dict:
-    """Decompile an Objective-C method.
-
-    Args:
-        binary: Binary name.
-        signature: Method signature like "-[NSObject init]".
-    """
-    from pyghidra_lite.lang import ObjCTools
-
-    return _with_handle(
-        "objc_decompile",
-        binary,
-        lambda handle: ObjCTools(handle).decompile_method(signature),
-    )
-
-
-# =============================================================================
-# HERMES / REACT NATIVE TOOLS
-# =============================================================================
-
-@mcp.tool()
-def hermes_info(binary: str, ctx: Context) -> dict:
-    """Check for Hermes bytecode (React Native).
-
-    Args:
-        binary: Binary name.
-    """
-    from pyghidra_lite.hermes import HermesTools
-
-    def op(handle):
-        info = HermesTools(handle).get_hermes_info()
-        return {
-            "is_hermes": info.is_hermes,
-            "num_strings": info.num_strings,
-            "bundle_size": info.bundle_size,
-        }
-
-    return _with_handle("hermes_info", binary, op)
-
-
-@mcp.tool()
-def hermes_components(binary: str, ctx: Context, limit: int = 50) -> list[dict]:
-    """Find React component names in bundle.
-
-    Args:
-        binary: Binary name.
-        limit: Max results.
-    """
-    from pyghidra_lite.hermes import HermesTools
-
-    return _with_handle(
-        "hermes_components",
-        binary,
-        lambda handle: HermesTools(handle).find_react_components(limit=limit),
-    )
-
-
-@mcp.tool()
-def hermes_endpoints(binary: str, ctx: Context, limit: int = 50) -> list[dict]:
-    """Find API endpoints and URLs in React Native bundle.
-
-    Args:
-        binary: Binary name.
-        limit: Max results.
-    """
-    from pyghidra_lite.hermes import HermesTools
-
-    return _with_handle(
-        "hermes_endpoints",
-        binary,
-        lambda handle: HermesTools(handle).extract_api_endpoints(limit=limit),
-    )
-
-
-# =============================================================================
-# PROJECT MANAGEMENT
+# PROJECT MANAGEMENT HELPERS (kept for delete tool)
 # =============================================================================
 
 def _kill_job(unit_id: str) -> None:
@@ -3348,121 +2543,48 @@ def _kill_job(unit_id: str) -> None:
                 pass
 
 
-@mcp.tool()
-def delete_binary(binary: str, ctx: Context) -> str:
-    """Remove a binary, its on-disk project, and any running analysis worker.
+# Keep _extract_bunfs_blocking for search(type="extract")
+def _extract_bunfs_blocking(handle, out: Path) -> dict:
+    """Extract the bunfs filesystem from a Bun binary into readable JS files."""
+    rt_info = GhidraTools(handle).detect_embedded_runtime(compact=False)
+    bun_rt = next((r for r in rt_info.get("runtimes", []) if r["type"] == "bunfs"), None)
+    if not bun_rt:
+        raise ValueError("No bunfs payload detected.")
 
-    Works for loaded programs, completed on-disk projects, and errored/incomplete
-    analyses. Pass a unit_id (from list_binaries) to delete projects that failed
-    or never finished loading.
+    status = _read_status_file(handle.unit_id)
+    binary_path_str = status.get("binary_path")
+    if not binary_path_str:
+        raise ValueError("binary_path not recorded in status file.")
+    binary_path = Path(binary_path_str)
+    if not binary_path.exists():
+        raise FileNotFoundError(f"Original binary not found at: {binary_path}")
 
-    Args:
-        binary: Binary name, unit_id, or partial name match.
-    """
-    def op():
-        backend = get_backend()
-        project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    out.mkdir(parents=True, exist_ok=True)
+    strategy_used = None
 
-        # --- Path 1: loaded in memory — search without triggering auto-load ---
-        handle = None
-        exact   = [h for h in backend.programs.values() if binary in (h.name, h.unit_id)]
-        partial = [h for h in backend.programs.values() if binary in h.name] if not exact else []
-        matches = exact or partial
-        if len(matches) > 1:
-            candidates = [f"{h.name} ({h.unit_id})" for h in matches]
-            raise McpError(ErrorData(
-                code=INVALID_PARAMS,
-                message=f"Ambiguous match for {binary!r}: {candidates}. Use exact name or unit_id.",
-            ))
-        handle = matches[0] if matches else None
+    bun_exe = shutil.which("bun")
+    if bun_exe:
+        try:
+            result = subprocess.run(
+                [bun_exe, "x", "bun-extract-bundled", str(binary_path), str(out)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0:
+                strategy_used = "bun-extract-bundled"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
 
-        if handle is not None:
-            unit_id = handle.unit_id
-            _capabilities.pop(unit_id, None)
-            deleted = backend.delete_program(handle.name)
-            if not deleted:
-                raise McpError(ErrorData(
-                    code=INTERNAL_ERROR,
-                    message=f"Failed to delete {handle.name!r} from Ghidra project",
-                ))
-            _kill_job(unit_id)
-            shutil.rmtree(project_base / unit_id, ignore_errors=True)
-            return f"Deleted {handle.name} ({unit_id})"
+    if strategy_used is None:
+        raise RuntimeError("bunfs extraction failed. Install bun and retry.")
 
-        # --- Path 2: disk-only (errored, incomplete, never loaded) ---
-        # Resolve a filename to a unit_id if needed
-        unit_id = binary
-        if not _UNIT_ID_RE.match(binary):
-            binary_base = Path(binary).name
-            candidates = [
-                uid for uid, data in _iter_disk_status()
-                if data.get("binary_name", "") == binary_base
-            ]
-            if not candidates:
-                raise McpError(ErrorData(
-                    code=INVALID_PARAMS,
-                    message=f"Not found: {binary!r}. Use unit_id from list_binaries().",
-                ))
-            if len(candidates) > 1:
-                raise McpError(ErrorData(
-                    code=INVALID_PARAMS,
-                    message=f"Ambiguous name {binary!r} matches {candidates}. Use unit_id.",
-                ))
-            unit_id = candidates[0]
-
-        project_dir = project_base / unit_id
-        if not project_dir.exists():
-            raise McpError(ErrorData(
-                code=INVALID_PARAMS,
-                message=f"Project not found: {unit_id!r}",
-            ))
-
-        binary_name = _read_status_file(unit_id).get("binary_name", unit_id)
-        _kill_job(unit_id)
-        shutil.rmtree(project_dir)
-        return f"Deleted {binary_name} ({unit_id})"
-
-    with _backend_lock:
-        return _guarded_tool_call("delete_binary", op)
-
-
-@mcp.tool()
-def reanalyze(binary: str, ctx: Context, profile: str = "deep", list_tools: bool = False) -> dict:
-    """Re-run analysis with different profile. Re-detects capabilities.
-
-    Args:
-        binary: Binary name.
-        profile: New profile - "fast", "default", or "deep".
-        list_tools: Include available_tools list (default False, saves tokens).
-    """
-    try:
-        profile_enum = AnalysisProfile(profile)
-    except ValueError as exc:
-        raise McpError(ErrorData(
-            code=INVALID_PARAMS,
-            message=f"Invalid profile '{profile}'. Use: fast, default, deep"
-        )) from exc
-
-    def op():
-        backend = get_backend()
-        handle = backend.get_program(binary)
-        backend.analyze_program(handle.name, profile_enum)
-
-        # Re-detect capabilities after deeper analysis
-        caps = detect_capabilities(handle)
-        _capabilities[handle.unit_id] = caps
-
-        result = {
-            "name": handle.name,
-            "profile": profile,
-            "capabilities": _format_capabilities(caps),
-        }
-        if list_tools:
-            result["available_tools"] = _available_tools(caps)
-        return result
-
-    with _backend_lock:
-        return _guarded_tool_call("reanalyze", op)
+    files = list(out.rglob("*"))
+    js_files = [f for f in files if f.suffix in (".js", ".ts", ".json")]
+    return {
+        "output_dir": str(out),
+        "files_extracted": len([f for f in files if f.is_file()]),
+        "js_files": len(js_files),
+        "strategy_used": strategy_used,
+    }
 
 
 # =============================================================================
@@ -3470,13 +2592,8 @@ def reanalyze(binary: str, ctx: Context, profile: str = "deep", list_tools: bool
 # =============================================================================
 
 class DefaultGroup(click.Group):
-    """Routes unrecognized first args to the 'serve' subcommand for backward compat.
+    """Routes unrecognized first args to the 'serve' subcommand for backward compat."""
 
-    This ensures existing MCP configs (e.g. `pyghidra-lite --allow-any-path`)
-    continue to work without requiring `pyghidra-lite serve --allow-any-path`.
-    """
-
-    # Group-level flags that should NOT be routed to serve
     _group_flags = frozenset({"-v", "--version", "--help", "-h"})
 
     def parse_args(self, ctx, args):
@@ -3584,7 +2701,7 @@ def serve_cmd(
     with _backend_lock:
         _backend = _init_backend(eager_load=eager_load)
 
-    # Detect capabilities for all pre-loaded (eager-loaded) binaries
+    # Detect capabilities for all pre-loaded binaries
     for prog_name in _backend.list_programs():
         handle = _backend.get_program(prog_name)
         _ensure_capabilities(handle)
@@ -3607,7 +2724,6 @@ def serve_cmd(
 
     logger.info(f"Ready. {len(_backend.programs)} programs loaded.")
 
-    # mcp.run() triggers server_lifespan which starts watcher, recovery, and stale monitor
     try:
         mcp.run(transport="stdio")
     finally:
@@ -3635,7 +2751,9 @@ def serve_cmd(
 )
 @click.option("--jvm-heap", default=None,
               help="JVM max heap (e.g. '4g'). Auto-sized if not set.")
-def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_heap):
+@click.option("--bootstrap", default=None,
+              help="Name or unit_id of analyzed binary to transfer names from.")
+def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_heap, bootstrap):
     """Import and analyze binaries offline. No MCP server started."""
     if not binaries:
         click.echo("No binaries specified.", err=True)
@@ -3646,7 +2764,6 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
 
     if jvm_heap:
         _upsert_jvm_option("_JAVA_OPTIONS", "-Xmx", f"-Xmx{jvm_heap}")
-        # Set initial heap = max heap to avoid GC resizing overhead on startup
         _upsert_jvm_option("_JAVA_OPTIONS", "-Xms", f"-Xms{jvm_heap}")
 
     profile_enum = AnalysisProfile(profile)
@@ -3664,43 +2781,49 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
         unit_id = compute_unit_id_streaming(path)
         project_dir_path = Path(project_dir) / unit_id
 
-        # Always write .analysis_status so MCP analyze_binary can recognise
-        # pre-analyzed binaries on disk and skip re-analysis.
         status_path = project_dir_path / ".analysis_status"
         status_path.parent.mkdir(parents=True, exist_ok=True)
         listener = AnalysisProgressListener(
-            status_path, path.name, profile, path.stat().st_size
+            status_path, path.name, profile, path.stat().st_size,
+            binary_path=str(path),
         )
 
         try:
+            current_phase = "import"
             listener.set_phase("importing")
 
             def _on_progress(func_count: int) -> None:
-                # Total unknown during analyzeAll; 0 signals "in progress, unknown total"
                 listener.set_progress(func_count, 0, "analyzing")
 
             handle = backend.import_binary(
                 path, profile_enum, analyze=True, on_progress=_on_progress
             )
 
+            bootstrap_stats = None
+            if bootstrap:
+                current_phase = "bootstrap"
+                bootstrap_stats = _apply_bootstrap_transfer(backend, bootstrap, handle)
+
             caps = detect_capabilities(handle)
             cap_list = _format_capabilities(caps)
 
             func_count = handle.program.getFunctionManager().getFunctionCount()
             if not handle.was_preexisting:
-                listener.complete(func_count, cap_list)
-            # For was_preexisting: status file is already accurate from original run
+                listener.complete(func_count, cap_list, bootstrap=bootstrap_stats)
 
             if handle.was_preexisting:
                 click.echo(f"  {path.name}: already analyzed "
                            f"(unit_id={unit_id}, {func_count} functions)")
             else:
-                click.echo(f"  {path.name}: {func_count} functions, "
+                message = (f"  {path.name}: {func_count} functions, "
                            f"[{', '.join(cap_list) or 'generic'}] "
                            f"(unit_id={unit_id}, profile={profile})")
+                if bootstrap_stats:
+                    message += f", bootstrap transferred={bootstrap_stats['transferred']}"
+                click.echo(message)
 
         except Exception as e:
-            listener.error(str(e), "import")
+            listener.error(str(e), current_phase)
             click.echo(f"  {path.name}: ERROR - {e}", err=True)
 
     backend.close()
@@ -3764,9 +2887,10 @@ class AnalysisProgressListener:
     """Writes analysis progress to a JSON status file for subprocess worker consumption."""
 
     def __init__(self, status_path: Path, binary_name: str,
-                 profile: str, binary_size: int):
+                 profile: str, binary_size: int, binary_path: str | None = None):
         self.status_path = status_path
         self.binary_name = binary_name
+        self.binary_path = binary_path
         self.profile = profile
         self.binary_size = binary_size
         self.started = time.time()
@@ -3792,15 +2916,17 @@ class AnalysisProgressListener:
             data["progress"] = round(current / total, 3)
         self._write(data)
 
-    def complete(self, functions: int, capabilities: list[str]):
+    def complete(self, functions: int, capabilities: list[str], bootstrap: dict | None = None):
         actual = int(time.time() - self.started)
-        self._write({
+        data = {
             "status": "complete",
             "functions": functions,
             "capabilities": capabilities,
             "duration_seconds": actual,
-        })
-        # Self-calibration: log estimation accuracy for future tuning
+        }
+        if bootstrap:
+            data["bootstrap"] = bootstrap
+        self._write(data)
         estimated = _estimate_analysis_time(self.binary_size, self.profile)
         ratio = actual / max(estimated, 1)
         logger.info(
@@ -3828,6 +2954,8 @@ class AnalysisProgressListener:
                 self.started, tz=timezone.utc
             ).isoformat(),
         })
+        if self.binary_path:
+            data["binary_path"] = self.binary_path
         tmp = self.status_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=None))
         tmp.rename(self.status_path)
@@ -3840,3 +2968,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# =============================================================================
+# OLD TOOLS REMOVED - DO NOT ADD BELOW THIS LINE
+# =============================================================================
+# All 58 original tools have been consolidated into 8 tools above:
+#   load, delete, list, info, functions, code, xrefs, search
+#
+# Old tool names are mapped via TOOL_ALIASES in consolidated.py for
+# backwards compatibility with programmatic callers.
