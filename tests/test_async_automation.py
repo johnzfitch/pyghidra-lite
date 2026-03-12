@@ -140,6 +140,11 @@ class TestPhase1CLI:
         params = {p.name for p in server.import_cmd.params}
         assert "bootstrap" in params
 
+    def test_import_cmd_has_bootstrap_mode(self):
+        """import should accept --bootstrap-mode."""
+        params = {p.name for p in server.import_cmd.params}
+        assert "bootstrap_mode" in params
+
     def test_serve_cmd_has_max_workers(self):
         """serve should accept --max-workers."""
         params = {p.name for p in server.serve_cmd.params}
@@ -591,6 +596,7 @@ class TestWorkerConfig:
         assert "--project-dir" in source
         assert "--profile" in source
         assert "--bootstrap" in source
+        assert "--bootstrap-mode" in source
 
     def test_run_worker_cmd_via_mock(self, tmp_path, monkeypatch):
         """_run_worker should pass bootstrap/profile/project-dir, never --status-file."""
@@ -609,7 +615,12 @@ class TestWorkerConfig:
         fake_path = tmp_path / "test.bin"
         fake_path.write_bytes(b"\x00" * (1024 * 1024))  # 1 MB dummy binary
 
-        job: dict = {"status": "queued", "pid": None, "bootstrap_source": "b" * 16}
+        job: dict = {
+            "status": "queued",
+            "pid": None,
+            "bootstrap_source": "b" * 16,
+            "bootstrap_mode": "all",
+        }
         unit_id = "a" * 16
 
         async def run():
@@ -623,6 +634,8 @@ class TestWorkerConfig:
         assert "--project-dir" in cmd
         assert "--bootstrap" in cmd
         assert "b" * 16 in cmd
+        assert "--bootstrap-mode" in cmd
+        assert "all" in cmd
         assert "--status-file" not in cmd, "--status-file must not be passed to worker"
         assert "--jvm-heap" in cmd
 

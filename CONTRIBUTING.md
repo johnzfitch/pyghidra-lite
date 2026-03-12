@@ -69,7 +69,7 @@ uv venv
 source .venv/bin/activate  # or .venv/Scripts/activate on Windows
 
 # Install in development mode
-uv pip install -e ".[dev]"
+uv sync --extra dev
 
 # Install Ghidra (required)
 # Set GHIDRA_INSTALL_DIR environment variable
@@ -87,13 +87,13 @@ uv pip install -e ".[dev]"
 
 ```bash
 # Run all tests
-pytest tests/
+uv run pytest tests/
 
 # Run specific test
-pytest tests/test_server.py
+uv run pytest tests/test_server.py
 
 # With coverage
-pytest --cov=pyghidra_lite tests/
+uv run pytest --cov=pyghidra_lite tests/
 ```
 
 ## Adding New Tools
@@ -107,17 +107,22 @@ When adding MCP tools:
    - Use `include_metadata=False` by default
 
 2. **Follow naming conventions**
-   - Verb-noun format: `list_functions`, `get_xrefs`
-   - Format-specific prefix: `elf_`, `macho_`, `swift_`, `objc_`
+   - Keep the public MCP surface consolidated: `load`, `delete`, `binaries`, `info`, `functions`, `code`, `xrefs`, `search`
+   - Prefer adding capability-specific behavior behind constrained parameters instead of creating new public tool names
 
 3. **Document parameters**
    - Clear descriptions
    - Mention defaults
    - Explain token implications
+   - Publish enum/range constraints in the MCP input schema using type annotations so `tools/list` is precise
 
 4. **Add capability detection**
    - Update `detect_capabilities()` if needed
-   - Add to `_available_tools()` list
+   - Prefer exposing new behavior through existing `type`, `detail`, `what`, `direction`, or `mode` selectors when possible
+
+5. **Follow MCP error conventions**
+   - Let malformed request/schema failures be handled by MCP/FastMCP validation
+   - Return semantic input validation and business-rule failures as tool execution errors (`isError: true`), not JSON-RPC `INVALID_PARAMS`
 
 ## Documentation
 

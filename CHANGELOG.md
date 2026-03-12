@@ -5,6 +5,19 @@ All notable changes to pyghidra-lite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-03-12
+
+### Changed
+- Public MCP surface remains the 8 consolidated tools: `load`, `delete`, `binaries`, `info`, `functions`, `code`, `xrefs`, `search`
+- Tool docstrings now describe the current consolidated workflows exposed through `tools/list`
+- MCP input schemas now publish enum/range constraints for `load.profile`, `load.bootstrap_mode`, `info.detail`, `functions.type`, `code.what`, `xrefs.direction`, `xrefs.depth`, `xrefs.target[]`, `search.type`, `search.mode`, and `search.query`
+
+### Fixed
+- Semantic validation and business-rule failures now surface as MCP tool execution errors instead of being modeled like JSON-RPC parameter errors
+- Invalid enum values no longer silently fall back to default behaviors in `info`, `functions`, `code`, `xrefs`, and `search`
+- Capability-mismatch failures in `functions()` now fail as real tool errors instead of returning `{"error": ...}` inside successful payloads
+- Removed the dead `src/pyghidra_lite/consolidated.py` alias layer and synced technical docs to the actual 8-tool server
+
 ## [0.5.0] - 2026-03-03
 
 ### Added

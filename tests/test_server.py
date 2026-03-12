@@ -3,8 +3,7 @@ import os
 from pathlib import Path
 
 import pytest
-from mcp.shared.exceptions import McpError
-from mcp.types import INVALID_PARAMS
+from mcp import types
 
 from pyghidra_lite import server
 
@@ -93,16 +92,12 @@ def test_upsert_jvm_option_preserves_existing_flags(monkeypatch: pytest.MonkeyPa
     assert "-Xmx4g" in opts
 
 
-def test_guarded_tool_call_maps_invalid_params() -> None:
+def test_guarded_tool_call_preserves_validation_errors() -> None:
     def op():
         raise ValueError("bad")
 
-    with pytest.raises(McpError) as exc:
+    with pytest.raises(ValueError, match="bad"):
         server._guarded_tool_call("test", op)
-
-    error = getattr(exc.value, "error", None) or getattr(exc.value, "data", None)
-    assert error is not None
-    assert error.code == INVALID_PARAMS
 
 
 def test_available_tools_always_returns_8_consolidated() -> None:
@@ -121,6 +116,120 @@ def test_available_tools_always_returns_8_consolidated() -> None:
     # (info(detail="format"), functions(type="swift"), etc.)
     expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"}
     assert set(tools) == expected
+
+
+def test_load_tool_schema_exposes_bootstrap_mode_enum() -> None:
+    """load tool should publish bootstrap_mode as an enum in its MCP schema."""
+    tool = server.mcp._tool_manager._tools["load"]
+    schema = tool.parameters
+    bootstrap_mode = schema["properties"]["bootstrap_mode"]
+
+    assert bootstrap_mode["type"] == "string"
+    assert bootstrap_mode["default"] == "named"
+    assert bootstrap_mode["enum"] == ["named", "all"]
+
+
+def test_tool_schemas_publish_enum_and_bounds() -> None:
+    """MCP tool schemas should expose constrained enums and numeric/list bounds."""
+    info_schema = server.mcp._tool_manager._tools["info"].parameters
+    functions_schema = server.mcp._tool_manager._tools["functions"].parameters
+    code_schema = server.mcp._tool_manager._tools["code"].parameters
+    xrefs_schema = server.mcp._tool_manager._tools["xrefs"].parameters
+    search_schema = server.mcp._tool_manager._tools["search"].parameters
+
+    assert info_schema["properties"]["detail"]["enum"] == [
+        "summary", "full", "format", "sections", "entropy"
+    ]
+    assert functions_schema["properties"]["type"]["enum"] == [
+        "all", "swift", "objc", "imports", "exports", "types", "got", "dylibs"
+    ]
+    assert code_schema["properties"]["what"]["enum"] == ["decompile", "asm", "bytes", "string"]
+    assert xrefs_schema["properties"]["direction"]["enum"] == ["to", "from"]
+    assert xrefs_schema["properties"]["depth"]["maximum"] == 5
+    assert xrefs_schema["properties"]["target"]["anyOf"][1]["maxItems"] == 20
+    assert search_schema["required"] == ["binary", "query"]
+    assert search_schema["properties"]["type"]["enum"] == [
+        "strings", "symbols", "bytes", "all", "blob", "extract"
+    ]
+    assert search_schema["properties"]["mode"]["enum"] == ["indexed", "deep"]
+
+
+def test_load_validation_failure_returns_mcp_tool_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Semantic tool failures should surface as CallToolResult(isError=True)."""
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELFvalidation")
+
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(allow_any_path=True))
+    handler = server.mcp._mcp_server.request_handlers[types.CallToolRequest]
+
+    req = types.CallToolRequest(
+        method="tools/call",
+        params=types.CallToolRequestParams(
+            name="load",
+            arguments={"path": str(binary), "bootstrap_mode": "all"},
+        ),
+    )
+
+    result = asyncio.run(handler(req)).root
+
+    assert result.isError is True
+    assert "bootstrap_mode requires bootstrap" in result.content[0].text
+
+
+def test_load_deep_bootstrap_keeps_existing_fast_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requesting a deep analysis should not reuse or delete an existing fast cache."""
+    from unittest.mock import MagicMock
+
+    class DummyCtx:
+        async def report_progress(self, *_args):
+            return None
+
+    binary = tmp_path / "2.1.74"
+    binary.write_bytes(b"\x7fELF" + b"\0" * (11 * 1024 * 1024))
+
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(
+        allow_any_path=True,
+        project_dir=tmp_path / "projects",
+    ))
+    monkeypatch.setattr(server, "_backend", MagicMock())
+
+    unit_id = server.compute_unit_id_streaming(binary)
+    fast_project = server._server_config.project_dir / unit_id
+    fast_project.mkdir(parents=True)
+    (fast_project / ".analysis_status").write_text(
+        '{"status":"complete","binary_name":"2.1.74","profile":"fast","functions":10}'
+    )
+    (fast_project / f"{unit_id}.gpr").touch()
+
+    created = []
+
+    def _capture_task(coro):
+        created.append(coro)
+        coro.close()
+        return MagicMock()
+
+    monkeypatch.setattr(asyncio, "create_task", _capture_task)
+    monkeypatch.setattr(server, "_normalize_bootstrap_source", lambda *_args: "1e5c1011ec899ef0-deep")
+
+    result = asyncio.run(
+        server.load(
+            str(binary),
+            DummyCtx(),
+            profile="deep",
+            bootstrap="2.1.70-1e5c1011-deep",
+        )
+    )
+
+    assert result["status"] == "queued"
+    assert result["unit_id"] == unit_id
+    assert result["analysis_id"] == f"{unit_id}-deep"
+    assert result["bootstrap"]["source_analysis_id"] == "1e5c1011ec899ef0-deep"
+    assert fast_project.exists(), "existing fast project should remain untouched"
+    assert len(created) == 1, "deep analysis should queue a new worker instead of reusing fast cache"
 
 
 # =============================================================================
@@ -268,7 +377,14 @@ def test_total_tool_count_is_8() -> None:
 # Tests added for 0.5.1 bootstrap / version-tracking fixes (PR #8 follow-up)
 # =============================================================================
 
-def _make_mock_handle(name: str, unit_id: str, named: int, total: int, analyzed: bool = True):
+def _make_mock_handle(
+    name: str,
+    unit_id: str,
+    named: int,
+    total: int,
+    analyzed: bool = True,
+    synthetic: int = 0,
+):
     """Build a minimal mock ProgramHandle for bootstrap tests (no JVM)."""
     from unittest.mock import MagicMock
 
@@ -287,7 +403,11 @@ def _make_mock_handle(name: str, unit_id: str, named: int, total: int, analyzed:
             f = MagicMock()
             f.getName.return_value = f"real_func_{i}"
             funcs.append(f)
-        for i in range(total - named):
+        for i in range(synthetic):
+            f = MagicMock()
+            f.getName.return_value = f"{server._BOOTSTRAP_AUTO_PREFIX}_{i:08X}"
+            funcs.append(f)
+        for i in range(total - named - synthetic):
             f = MagicMock()
             f.getName.return_value = f"FUN_{i:08x}"
             funcs.append(f)
@@ -299,7 +419,7 @@ def _make_mock_handle(name: str, unit_id: str, named: int, total: int, analyzed:
 
 
 def test_rank_bootstrap_sources_sorted_descending(monkeypatch: pytest.MonkeyPatch) -> None:
-    """rank_bootstrap_sources (via _rank_sources_blocking) returns list sorted by named_functions desc."""
+    """rank_bootstrap_sources sorts by transferable_functions descending."""
     from unittest.mock import MagicMock
 
     handle_a = _make_mock_handle("claude-old", "a" * 16, named=800, total=1000)
@@ -315,11 +435,13 @@ def test_rank_bootstrap_sources_sorted_descending(monkeypatch: pytest.MonkeyPatc
 
     assert len(result) == 2
     assert result[0]["name"] == "claude-old"
+    assert result[0]["transferable_functions"] == 800
     assert result[0]["named_functions"] == 800
     assert result[1]["name"] == "claude-new"
+    assert result[1]["transferable_functions"] == 200
     assert result[1]["named_functions"] == 200
     # Descending order
-    assert result[0]["named_functions"] >= result[1]["named_functions"]
+    assert result[0]["transferable_functions"] >= result[1]["transferable_functions"]
 
 
 def test_rank_bootstrap_sources_excludes_dest(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -353,6 +475,26 @@ def test_rank_bootstrap_sources_named_pct(monkeypatch: pytest.MonkeyPatch) -> No
 
     result = server._rank_sources_blocking()
     assert result[0]["named_pct"] == 25.0
+    assert result[0]["transferable_pct"] == 25.0
+
+
+def test_rank_bootstrap_sources_counts_synthetic_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Synthetic bootstrap labels improve transferability without inflating named_functions."""
+    from unittest.mock import MagicMock
+
+    handle = _make_mock_handle("binary", "a" * 16, named=2, synthetic=3, total=10)
+    backend = MagicMock()
+    backend.programs = {"a" * 16: handle}
+    monkeypatch.setattr(server, "_backend", backend)
+    monkeypatch.setattr(server, "get_backend", lambda: backend)
+
+    result = server._rank_sources_blocking()
+
+    assert result[0]["named_functions"] == 2
+    assert result[0]["synthetic_bootstrap_functions"] == 3
+    assert result[0]["transferable_functions"] == 5
+    assert result[0]["named_pct"] == 20.0
+    assert result[0]["transferable_pct"] == 50.0
 
 
 def test_apply_bootstrap_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -377,7 +519,44 @@ def test_apply_bootstrap_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch)
     result = server._apply_bootstrap_transfer(backend, "source", dest)
 
     assert result["transferred"] == 7
-    backend.transfer_analysis.assert_called_once_with("source-prog", "dest-prog")
+    assert result["mode"] == "named"
+    backend.transfer_analysis.assert_called_once_with(
+        "source-prog",
+        "dest-prog",
+        label_fun_star=False,
+        fun_star_prefix=server._BOOTSTRAP_AUTO_PREFIX,
+    )
+
+
+def test_apply_bootstrap_transfer_all_mode_labels_fun_star(monkeypatch: pytest.MonkeyPatch) -> None:
+    """all mode should request synthetic labels for FUN_* source functions."""
+    from unittest.mock import MagicMock
+
+    source = MagicMock()
+    source.name = "source-prog"
+    source.unit_id = "a" * 16
+    source.analyzed = True
+
+    dest = MagicMock()
+    dest.name = "dest-prog"
+    dest.unit_id = "b" * 16
+    dest.analyzed = True
+
+    backend = MagicMock()
+    backend.transfer_analysis.return_value = {"transferred": 7}
+
+    monkeypatch.setattr(server, "_resolve_bootstrap_handle", lambda _backend, _bootstrap: source)
+
+    result = server._apply_bootstrap_transfer(backend, "source", dest, mode="all")
+
+    assert result["mode"] == "all"
+    assert result["synthetic_prefix"] == server._BOOTSTRAP_AUTO_PREFIX
+    backend.transfer_analysis.assert_called_once_with(
+        "source-prog",
+        "dest-prog",
+        label_fun_star=True,
+        fun_star_prefix=server._BOOTSTRAP_AUTO_PREFIX,
+    )
 
 
 def test_apply_bootstrap_transfer_rejects_same_binary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -398,18 +577,14 @@ def test_apply_bootstrap_transfer_rejects_same_binary(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(server, "_resolve_bootstrap_handle", lambda _backend, _bootstrap: source)
 
-    with pytest.raises(McpError) as exc:
+    with pytest.raises(ValueError, match="bootstrap source must differ"):
         server._apply_bootstrap_transfer(backend, "source", dest)
-
-    error = getattr(exc.value, "error", None) or getattr(exc.value, "data", None)
-    assert error is not None
-    assert error.code == INVALID_PARAMS
 
 
 def test_load_forwards_bootstrap_to_import_blocking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """load() should pass the canonical bootstrap source into the blocking import path."""
+    """load() should pass the canonical bootstrap source and mode into the blocking import path."""
     from unittest.mock import MagicMock
 
     class DummyCtx:
@@ -434,21 +609,68 @@ def test_load_forwards_bootstrap_to_import_blocking(
         tracker,
         fresh=False,
         bootstrap=None,
+        bootstrap_mode="named",
     ):
         captured["bootstrap"] = bootstrap
-        return handle, caps, {"transferred": 5}
+        captured["bootstrap_mode"] = bootstrap_mode
+        return handle, caps, {"transferred": 5, "mode": bootstrap_mode}
 
     monkeypatch.setattr(server, "_server_config", server.ServerConfig(allow_any_path=True))
     monkeypatch.setattr(server, "_backend", MagicMock())
     monkeypatch.setattr(server, "_normalize_bootstrap_source", lambda _bootstrap, _dest: "a" * 16)
     monkeypatch.setattr(server, "_do_import_blocking", fake_do_import_blocking)
 
-    result = asyncio.run(server.load(str(binary), DummyCtx(), bootstrap="source-bin"))
+    result = asyncio.run(
+        server.load(
+            str(binary),
+            DummyCtx(),
+            bootstrap="source-bin",
+            bootstrap_mode="all",
+        )
+    )
 
     assert captured["bootstrap"] == "a" * 16
+    assert captured["bootstrap_mode"] == "all"
     assert result["bootstrap"]["source_unit_id"] == "a" * 16
     assert result["bootstrap"]["stats"]["transferred"] == 5
+    assert result["bootstrap"]["mode"] == "all"
     assert result["binary_name"] == "sample.bin"
+
+
+def test_load_rejects_bootstrap_mode_without_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """load() should reject non-default bootstrap_mode when bootstrap is absent."""
+
+    class DummyCtx:
+        async def report_progress(self, *_args):
+            return None
+
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELForphaned-mode")
+
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(allow_any_path=True))
+
+    with pytest.raises(ValueError, match="bootstrap_mode requires bootstrap"):
+        asyncio.run(server.load(str(binary), DummyCtx(), bootstrap_mode="all"))
+
+
+def test_load_rejects_invalid_bootstrap_mode_even_without_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """load() should validate bootstrap_mode regardless of whether bootstrap is set."""
+
+    class DummyCtx:
+        async def report_progress(self, *_args):
+            return None
+
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELFinvalid-mode")
+
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(allow_any_path=True))
+
+    with pytest.raises(ValueError, match="Invalid bootstrap_mode"):
+        asyncio.run(server.load(str(binary), DummyCtx(), bootstrap_mode="garbage"))
 
 
 def test_kill_job_acquires_jobs_mutex() -> None:
@@ -479,10 +701,9 @@ def test_kill_job_sends_sigterm(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_delete_ambiguous_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """delete raises INVALID_PARAMS when multiple handles share the substring."""
+    """delete should reject ambiguous partial matches."""
     import asyncio
     from unittest.mock import MagicMock
-    from mcp.types import INVALID_PARAMS
 
     handle_a = MagicMock()
     handle_a.name = "claude-aaaaaaaaaaaaaaa1"
@@ -500,11 +721,6 @@ def test_delete_ambiguous_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     config = server.ServerConfig(allow_any_path=True)
     monkeypatch.setattr(server, "_server_config", config)
 
-    with pytest.raises(McpError) as exc:
+    with pytest.raises(ValueError, match="Ambiguous"):
         # "claude" is a substring of both handle names
         asyncio.run(server.delete("claude", None))
-
-    error = getattr(exc.value, "error", None) or getattr(exc.value, "data", None)
-    assert error is not None
-    assert error.code == INVALID_PARAMS
-    assert "Ambiguous" in error.message

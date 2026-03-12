@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated, Literal
 
 import re
 import secrets
@@ -23,7 +24,7 @@ import secrets
 import click
 from mcp.server import Server
 from mcp.server.fastmcp import Context, FastMCP
-from pydantic import BaseModel
+from pydantic import Field
 from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
 
@@ -36,6 +37,8 @@ from pyghidra_lite.backend import (
     GhidraBackend,
     compute_unit_id_streaming,
     find_ghidra_install,
+    make_analysis_id,
+    parse_analysis_id,
 )
 from pyghidra_lite.models import (
     AnalysisProfile,
@@ -108,7 +111,7 @@ _backend: GhidraBackend | None = None
 _capabilities: dict[str, BinaryCapabilities] = {}
 _backend_lock = threading.RLock()
 
-# Binaries above this threshold are auto-delegated to async analysis in import_binary
+# Binaries above this threshold are auto-delegated to async analysis in load()
 _LARGE_BINARY_MB = 10
 
 # Async job tracking for analyze_binary
@@ -119,6 +122,35 @@ _worker_semaphore: asyncio.Semaphore | None = None  # initialized in serve, defa
 
 # Valid unit_id format: 16 lowercase hex chars (64-bit xxHash)
 _UNIT_ID_RE = re.compile(r'^[0-9a-f]{16}$')
+_BOOTSTRAP_MODES = {"named", "all"}
+_BOOTSTRAP_AUTO_PREFIX = "BTFN"
+_INFO_DETAILS = ("summary", "full", "format", "sections", "entropy")
+_FUNCTION_TYPES = ("all", "swift", "objc", "imports", "exports", "types", "got", "dylibs")
+_CODE_WHATS = ("decompile", "asm", "bytes", "string")
+_XREF_DIRECTIONS = ("to", "from")
+_SEARCH_TYPES = ("strings", "symbols", "bytes", "all", "blob", "extract")
+_SEARCH_MODES = ("indexed", "deep")
+_MAX_BATCH_XREF_TARGETS = 20
+_MAX_BATCH_SEARCH_QUERIES = 20
+
+NonEmptyStr = Annotated[str, Field(min_length=1)]
+LoadProfileArg = Literal["fast", "default", "deep"]
+BootstrapModeArg = Literal["named", "all"]
+InfoDetailArg = Literal["summary", "full", "format", "sections", "entropy"]
+FunctionsTypeArg = Literal["all", "swift", "objc", "imports", "exports", "types", "got", "dylibs"]
+CodeWhatArg = Literal["decompile", "asm", "bytes", "string"]
+XrefsDirectionArg = Literal["to", "from"]
+SearchTypeArg = Literal["strings", "symbols", "bytes", "all", "blob", "extract"]
+SearchModeArg = Literal["indexed", "deep"]
+CodeTargetArg = NonEmptyStr | Annotated[list[NonEmptyStr], Field(min_length=1)]
+XrefsTargetArg = NonEmptyStr | Annotated[list[NonEmptyStr], Field(
+    min_length=1,
+    max_length=_MAX_BATCH_XREF_TARGETS,
+)]
+SearchQueryArg = str | Annotated[list[str], Field(
+    min_length=1,
+    max_length=_MAX_BATCH_SEARCH_QUERIES,
+)]
 
 
 def _new_job_id() -> str:
@@ -269,9 +301,23 @@ def get_backend() -> GhidraBackend:
 
 
 def _require_backend():
-    """Raise McpError if backend not initialized."""
+    """Raise when the backend has not been initialized yet."""
     if _backend is None:
-        raise McpError(ErrorData(code=INTERNAL_ERROR, message="Backend not initialized"))
+        raise RuntimeError("Backend not initialized")
+
+
+def _validate_choice(name: str, value: str, allowed: tuple[str, ...]) -> str:
+    """Validate an enum-like string argument for direct Python callers."""
+    if value not in allowed:
+        raise ValueError(f"Invalid {name}. Use: {', '.join(allowed)}")
+    return value
+
+
+def _validate_minimum(name: str, value: int, minimum: int) -> int:
+    """Validate a numeric lower bound for direct Python callers."""
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
 
 
 def _check_prerequisites(ghidra_dir: str | None) -> None:
@@ -363,31 +409,53 @@ def _resolve_import_path(path: str) -> Path:
 
 
 def _iter_disk_status():
-    """Yield (unit_id, status_dict) for every valid .analysis_status file on disk."""
+    """Yield (project_id, enriched_status_dict) for every valid .analysis_status file on disk."""
     projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
     if not projects_path.exists():
         return
     for entry in projects_path.iterdir():
-        if not entry.is_dir() or not _UNIT_ID_RE.match(entry.name):
+        if not entry.is_dir():
             continue
         status_file = entry / ".analysis_status"
         if not status_file.exists():
             continue
         try:
-            yield entry.name, json.loads(status_file.read_text())
+            status = json.loads(status_file.read_text())
         except (json.JSONDecodeError, OSError):
             continue
+        project_id = entry.name
+        parsed = parse_analysis_id(project_id)
+        profile = status.get("profile")
+        if parsed is not None:
+            unit_id = parsed[0]
+            profile = profile or parsed[1]
+            analysis_id = project_id
+        elif _UNIT_ID_RE.match(project_id):
+            unit_id = project_id
+            profile = profile or AnalysisProfile.FAST.value
+            analysis_id = make_analysis_id(unit_id, profile)
+        else:
+            continue
+
+        enriched = dict(status)
+        enriched.setdefault("unit_id", unit_id)
+        enriched.setdefault("analysis_id", analysis_id)
+        enriched.setdefault("project_id", project_id)
+        enriched.setdefault("profile", profile)
+        yield project_id, enriched
 
 
 def _history_path() -> Path:
     return Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / "history.jsonl"
 
 
-def _append_history(unit_id: str, binary_name: str) -> None:
+def _append_history(analysis_id: str, binary_name: str) -> None:
     """Append one open event to history.jsonl (non-blocking, best-effort)."""
     from datetime import datetime, timezone
+    parsed = parse_analysis_id(analysis_id)
     entry = {
-        "unit_id": unit_id,
+        "analysis_id": analysis_id,
+        "unit_id": parsed[0] if parsed is not None else analysis_id,
         "binary_name": binary_name,
         "opened_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -400,8 +468,8 @@ def _append_history(unit_id: str, binary_name: str) -> None:
         logger.debug("Failed to write history: %s", e)
 
 
-def _last_opened_by_unit_id() -> dict[str, str]:
-    """Read history.jsonl and return {unit_id: most_recent_opened_at ISO string}."""
+def _last_opened_by_analysis_id() -> dict[str, str]:
+    """Read history.jsonl and return {analysis_id: most_recent_opened_at ISO string}."""
     result: dict[str, str] = {}
     path = _history_path()
     if not path.exists():
@@ -412,11 +480,11 @@ def _last_opened_by_unit_id() -> dict[str, str]:
                 continue
             try:
                 entry = json.loads(line)
-                uid = entry.get("unit_id", "")
+                analysis_id = entry.get("analysis_id") or entry.get("unit_id", "")
                 opened_at = entry.get("opened_at", "")
                 # Lines are chronological; later lines overwrite earlier ones
-                if uid and opened_at:
-                    result[uid] = opened_at
+                if analysis_id and opened_at:
+                    result[analysis_id] = opened_at
             except json.JSONDecodeError:
                 continue
     except OSError:
@@ -424,10 +492,12 @@ def _last_opened_by_unit_id() -> dict[str, str]:
     return result
 
 
-def _find_on_disk(binary: str) -> str | None:
-    """Return unit_id for a completed on-disk project matching binary (unit_id hex or filename).
+def _find_on_disk(binary: str, profile: str | None = None) -> dict | None:
+    """Return metadata for a completed on-disk project matching binary.
 
-    Raises McpError for in-progress/errored unit_ids.
+    Accepts exact analysis_id, unit_id, or binary filename.
+    When profile is provided, it is used to disambiguate multiple analyses of the same binary.
+    Raises ValueError for in-progress/errored unit_ids.
     For ambiguous filename matches, logs a warning and selects never-opened first,
     then most-recently-opened.
     Used by _get_handle to auto-lazy-load programs that exist on disk but aren't loaded.
@@ -436,90 +506,156 @@ def _find_on_disk(binary: str) -> str | None:
     if not projects_path.exists():
         return None
 
-    # Fast path: exact unit_id match
-    if _UNIT_ID_RE.match(binary):
-        status_file = projects_path / binary / ".analysis_status"
-        if status_file.exists():
-            try:
-                data = json.loads(status_file.read_text())
-            except (json.JSONDecodeError, OSError):
-                return None
+    parsed = parse_analysis_id(binary)
+    if parsed is not None:
+        unit_id, parsed_profile = parsed
+        for _project_id, data in _iter_disk_status():
+            if data.get("analysis_id") != binary:
+                continue
             status = data.get("status")
             if status == "complete":
-                return binary
-            # Exists but not ready — give a specific error rather than "not found"
+                return data
+            msg = f"Analysis {binary!r} found but status={status!r}"
+            if status in ("analyzing", "queued"):
+                msg += ". Poll binaries(jobs=True) and match analysis_id for progress."
+            elif status == "error":
+                msg += f": {data.get('error', 'unknown error')}"
+            raise ValueError(msg)
+
+    # Fast path: exact unit_id match
+    if _UNIT_ID_RE.match(binary):
+        matches: list[dict] = []
+        for _project_id, data in _iter_disk_status():
+            if data.get("unit_id") != binary:
+                continue
+            if profile is not None and data.get("profile") != profile:
+                continue
+            status = data.get("status")
+            if status == "complete":
+                matches.append(data)
+                continue
             msg = f"Unit {binary!r} found but status={status!r}"
             if status in ("analyzing", "queued"):
                 msg += ". Poll binaries(jobs=True) and match unit_id for progress."
             elif status == "error":
                 msg += f": {data.get('error', 'unknown error')}"
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=msg))
+            raise ValueError(msg)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            if profile is not None:
+                raise ValueError(f"Multiple analyses found for unit {binary!r} and profile {profile!r}")
+            raise ValueError(
+                f"Multiple analyses found for unit {binary!r}. Use analysis_id or full program name from binaries()."
+            )
         return None
 
     # Slow path: exact basename match against binary_name
     binary_base = Path(binary).name
-    matches: list[tuple[str, dict]] = []
-    for unit_id, data in _iter_disk_status():
+    matches: list[dict] = []
+    for _project_id, data in _iter_disk_status():
+        if profile is not None and data.get("profile") != profile:
+            continue
         if data.get("status") == "complete" and data.get("binary_name", "") == binary_base:
-            matches.append((unit_id, data))
+            matches.append(data)
 
     if len(matches) > 1:
         # Sort: never-opened (brand new) first, then by most recently opened per history.
-        last_opened = _last_opened_by_unit_id()
+        last_opened = _last_opened_by_analysis_id()
         matches.sort(
-            key=lambda t: (last_opened.get(t[0]) is None, last_opened.get(t[0]) or ""),
+            key=lambda t: (
+                last_opened.get(t["analysis_id"]) is None,
+                last_opened.get(t["analysis_id"]) or "",
+            ),
             reverse=True,
         )
-        chosen = matches[0][0]
-        others = [uid for uid, _ in matches[1:]]
+        chosen = matches[0]["analysis_id"]
+        others = [data["analysis_id"] for data in matches[1:]]
         logger.warning(
             "Ambiguous name %r: %d projects match. Picking preferred project %r"
             " (never-opened first, then most recently opened). Others: %s",
             binary, len(matches), chosen, others,
         )
-        return chosen
-    return matches[0][0] if matches else None
+        return matches[0]
+    return matches[0] if matches else None
 
 
-def _get_handle(binary: str):
+def _handle_by_analysis_id(backend: GhidraBackend, analysis_id: str):
+    for handle in backend.programs.values():
+        if _handle_analysis_id(handle) == analysis_id:
+            return handle
+    return None
+
+
+def _handle_analysis_id(handle) -> str:
+    """Best-effort profile-scoped id for real and mocked ProgramHandles."""
+    analysis_id = getattr(handle, "analysis_id", None)
+    if isinstance(analysis_id, str) and analysis_id:
+        return analysis_id
+
+    unit_id = getattr(handle, "unit_id", None)
+    if not isinstance(unit_id, str) or not unit_id:
+        return ""
+
+    profile = getattr(handle, "profile", None)
+    if isinstance(profile, AnalysisProfile):
+        return make_analysis_id(unit_id, profile)
+    if isinstance(profile, str) and profile:
+        return make_analysis_id(unit_id, profile)
+    return unit_id
+
+
+def _get_handle(binary: str, profile: str | None = None):
     backend = get_backend()
+    handle = _handle_by_analysis_id(backend, binary)
+    if handle is not None:
+        return handle
+
+    if _UNIT_ID_RE.match(binary):
+        loaded_matches = [
+            handle for handle in backend.programs.values()
+            if handle.unit_id == binary and (profile is None or handle.profile.value == profile)
+        ]
+        if len(loaded_matches) == 1:
+            return loaded_matches[0]
+        if len(loaded_matches) > 1:
+            raise ValueError(
+                f"Multiple loaded analyses found for unit {binary!r}. Use analysis_id or full program name from binaries()."
+            )
+
     try:
         return backend.get_program(binary)
     except ValueError:
         pass
 
-    # Auto-lazy-load: find a completed project on disk by unit_id or filename
-    # (raises McpError for in-progress/ambiguous — let that propagate)
-    unit_id = _find_on_disk(binary)
-    if unit_id:
-        loaded = _hot_load_blocking(unit_id)  # RLock allows reentry; one-time cost per session
-        # Resolve by unit_id — avoids re-triggering ambiguity on the original input string
-        for handle in backend.programs.values():
-            if handle.unit_id == unit_id:
-                return handle
+    # Auto-lazy-load: find a completed project on disk by analysis_id, unit_id, or filename
+    # (raises ValueError for in-progress/ambiguous — let that propagate)
+    disk_match = _find_on_disk(binary, profile=profile)
+    if disk_match:
+        analysis_id = disk_match["analysis_id"]
+        loaded = _hot_load_blocking(analysis_id)  # RLock allows reentry; one-time cost per session
+        handle = _handle_by_analysis_id(backend, analysis_id)
+        if handle is not None:
+            return handle
         if loaded:
-            raise McpError(ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"Hot-loaded {unit_id!r} but program not found in backend; "
-                        "internal name mismatch — try the full program name from list_binaries()",
-            ))
-        raise McpError(ErrorData(
-            code=INTERNAL_ERROR,
-            message=f"Hot-load failed for {unit_id!r}; check server logs",
-        ))
+            raise RuntimeError(
+                f"Hot-loaded {analysis_id!r} but program not found in backend; "
+                "internal name mismatch — try the full program name from binaries()"
+            )
+        raise RuntimeError(f"Hot-load failed for {analysis_id!r}; check server logs")
 
     # Nothing found — list what's available
     loaded_names = list(backend.programs.keys())
     on_disk = [
-        v.get("binary_name", k)
-        for k, v in _iter_disk_status()
+        f"{v.get('binary_name', v['analysis_id'])} [{v.get('profile')}]"
+        for _project_id, v in _iter_disk_status()
         if v.get("status") == "complete"
-        and k not in {h.unit_id for h in backend.programs.values()}
+        and v["analysis_id"] not in {getattr(h, "analysis_id", "") for h in backend.programs.values()}
     ]
     msg = f"Binary not found: {binary!r}. Loaded: {loaded_names}."
     if on_disk:
         msg += f" Available on disk (auto-loads on tool call): {on_disk}"
-    raise McpError(ErrorData(code=INVALID_PARAMS, message=msg))
+    raise ValueError(msg)
 
 
 def _handle_by_unit_id(backend: GhidraBackend, unit_id: str):
@@ -531,17 +667,23 @@ def _handle_by_unit_id(backend: GhidraBackend, unit_id: str):
 
 def _load_project_into_backend(
     backend: GhidraBackend,
-    unit_id: str,
+    analysis_id: str,
     *,
     update_capabilities: bool = False,
     append_history: bool = False,
 ):
     """Load a completed on-disk project into the provided backend."""
-    handle = _handle_by_unit_id(backend, unit_id)
+    handle = _handle_by_analysis_id(backend, analysis_id)
     if handle is not None:
         return handle
 
-    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
+    status = _find_on_disk(analysis_id)
+    if status is None:
+        return None
+    project_id = status["project_id"]
+    unit_id = status["unit_id"]
+    profile = AnalysisProfile(status["profile"])
+    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id
     if not project_dir.exists():
         return None
 
@@ -550,13 +692,13 @@ def _load_project_into_backend(
         from ghidra.framework.model import ProjectLocator
 
         project_str = str(project_dir.absolute())
-        locator = ProjectLocator(project_str, unit_id)
+        locator = ProjectLocator(project_str, project_id)
         if not locator.exists():
-            logger.warning("Ghidra project missing for unit_id=%s at %s", unit_id, project_dir)
+            logger.warning("Ghidra project missing for analysis_id=%s at %s", analysis_id, project_dir)
             return None
 
-        project = GhidraProject.openProject(project_str, unit_id, True)
-        backend._projects[unit_id] = project
+        project = GhidraProject.openProject(project_str, project_id, True)
+        backend._projects[analysis_id] = project
 
         root_folder = project.getRootFolder()
         for domain_file in root_folder.getFiles():
@@ -564,26 +706,30 @@ def _load_project_into_backend(
                 continue
             prog_name = domain_file.getName()
             program = project.openProgram("/", prog_name, False)
-            handle = backend._init_program_handle(program, prog_name, unit_id=unit_id)
+            handle = backend._init_program_handle(program, prog_name, profile=profile, unit_id=unit_id)
             handle.analyzed = True
             backend.programs[prog_name] = handle
             if update_capabilities:
                 _ensure_capabilities(handle)
             if append_history:
-                binary_name = _read_status_file(unit_id).get("binary_name", prog_name)
-                _append_history(unit_id, binary_name)
-            logger.info("Loaded %s from project cache (unit_id=%s)", prog_name, unit_id)
+                binary_name = status.get("binary_name", prog_name)
+                _append_history(analysis_id, binary_name)
+            logger.info("Loaded %s from project cache (analysis_id=%s)", prog_name, analysis_id)
             return handle
 
-        logger.warning("No Program entries found in project %s", unit_id)
+        logger.warning("No Program entries found in project %s", analysis_id)
         return None
     except Exception as exc:
-        logger.error("Failed to load project %s into backend: %s", unit_id, exc)
+        logger.error("Failed to load project %s into backend: %s", analysis_id, exc)
         return None
 
 
 def _resolve_bootstrap_handle(backend: GhidraBackend, bootstrap: str):
-    """Resolve a bootstrap source by program name, binary name, or unit_id."""
+    """Resolve a bootstrap source by program name, analysis_id, binary name, or unit_id."""
+    handle = _handle_by_analysis_id(backend, bootstrap)
+    if handle is not None:
+        return handle
+
     handle = _handle_by_unit_id(backend, bootstrap)
     if handle is not None:
         return handle
@@ -593,68 +739,71 @@ def _resolve_bootstrap_handle(backend: GhidraBackend, bootstrap: str):
     except ValueError:
         pass
 
-    unit_id = bootstrap if _UNIT_ID_RE.match(bootstrap) else _find_on_disk(bootstrap)
-    if unit_id:
-        handle = _load_project_into_backend(backend, unit_id)
+    disk_match = _find_on_disk(bootstrap)
+    if disk_match:
+        handle = _load_project_into_backend(backend, disk_match["analysis_id"])
         if handle is not None:
             return handle
-        raise McpError(ErrorData(
-            code=INTERNAL_ERROR,
-            message=f"Bootstrap source {bootstrap!r} exists on disk but could not be loaded",
-        ))
+        raise RuntimeError(f"Bootstrap source {bootstrap!r} exists on disk but could not be loaded")
 
     loaded_names = list(backend.programs.keys())
     on_disk = [
-        v.get("binary_name", k)
-        for k, v in _iter_disk_status()
+        f"{v.get('binary_name', v['analysis_id'])} [{v.get('profile')}]"
+        for _project_id, v in _iter_disk_status()
         if v.get("status") == "complete"
-        and k not in {h.unit_id for h in backend.programs.values()}
+        and v["analysis_id"] not in {getattr(h, "analysis_id", "") for h in backend.programs.values()}
     ]
     msg = f"Bootstrap source not found: {bootstrap!r}. Loaded: {loaded_names}."
     if on_disk:
         msg += f" Available on disk: {on_disk}"
-    raise McpError(ErrorData(code=INVALID_PARAMS, message=msg))
+    raise ValueError(msg)
 
 
-def _normalize_bootstrap_source(bootstrap: str, dest_unit_id: str) -> str:
-    """Resolve and validate bootstrap source, returning its canonical unit_id."""
+def _normalize_bootstrap_mode(mode: str) -> str:
+    """Validate bootstrap mode."""
+    return _validate_choice("bootstrap_mode", mode, ("named", "all"))
+
+
+def _is_bootstrap_auto_name(name: str) -> bool:
+    """True when a function name is a synthetic bootstrap label."""
+    return name.startswith(f"{_BOOTSTRAP_AUTO_PREFIX}_")
+
+
+def _normalize_bootstrap_source(bootstrap: str, dest_analysis_id: str) -> str:
+    """Resolve and validate bootstrap source, returning its canonical analysis_id."""
     source_handle = _resolve_bootstrap_handle(get_backend(), bootstrap)
-    if source_handle.unit_id == dest_unit_id:
-        raise McpError(ErrorData(
-            code=INVALID_PARAMS,
-            message="bootstrap source must differ from the destination binary",
-        ))
+    if _handle_analysis_id(source_handle) == dest_analysis_id:
+        raise ValueError("bootstrap source must differ from the destination binary")
     if not source_handle.analyzed:
-        raise McpError(ErrorData(
-            code=INVALID_PARAMS,
-            message=f"Bootstrap source {bootstrap!r} is not analyzed yet",
-        ))
-    return source_handle.unit_id
+        raise ValueError(f"Bootstrap source {bootstrap!r} is not analyzed yet")
+    return _handle_analysis_id(source_handle)
 
 
 def _apply_bootstrap_transfer(
     backend: GhidraBackend,
     source_binary: str,
     dest_handle,
+    mode: str = "named",
 ) -> dict:
     """Transfer names from a bootstrap source to the destination handle."""
+    mode = _normalize_bootstrap_mode(mode)
     source_handle = _resolve_bootstrap_handle(backend, source_binary)
-    if source_handle.unit_id == dest_handle.unit_id:
-        raise McpError(ErrorData(
-            code=INVALID_PARAMS,
-            message="bootstrap source must differ from the destination binary",
-        ))
+    if _handle_analysis_id(source_handle) == _handle_analysis_id(dest_handle):
+        raise ValueError("bootstrap source must differ from the destination binary")
     if not source_handle.analyzed:
-        raise McpError(ErrorData(
-            code=INVALID_PARAMS,
-            message=f"Bootstrap source {source_binary!r} is not analyzed yet",
-        ))
+        raise ValueError(f"Bootstrap source {source_binary!r} is not analyzed yet")
     if not dest_handle.analyzed:
-        raise McpError(ErrorData(
-            code=INVALID_PARAMS,
-            message="Destination binary must be analyzed before bootstrap can run",
-        ))
-    return backend.transfer_analysis(source_handle.name, dest_handle.name)
+        raise ValueError("Destination binary must be analyzed before bootstrap can run")
+    stats = backend.transfer_analysis(
+        source_handle.name,
+        dest_handle.name,
+        label_fun_star=(mode == "all"),
+        fun_star_prefix=_BOOTSTRAP_AUTO_PREFIX,
+    )
+    stats["mode"] = mode
+    if mode == "all":
+        stats["synthetic_prefix"] = _BOOTSTRAP_AUTO_PREFIX
+    return stats
 
 
 def _ensure_capabilities(handle) -> BinaryCapabilities:
@@ -679,13 +828,11 @@ def _available_tools(caps: BinaryCapabilities) -> list[str]:
 def _guarded_tool_call(action: str, op):
     try:
         return op()
-    except McpError:
+    except (ValueError, RuntimeError):
         raise
-    except ValueError as exc:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(exc))) from exc
     except Exception as exc:
         logger.exception("%s failed", action)
-        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"{action} failed: {exc}")) from exc
+        raise RuntimeError(f"{action} failed: {exc}") from exc
 
 
 def _with_handle(action: str, binary: str, op):
@@ -696,8 +843,9 @@ def _with_handle(action: str, binary: str, op):
 def _rank_sources_blocking(exclude_name: str | None = None) -> list[dict]:
     """Rank loaded+analyzed binaries by transferable named function count.
 
-    Counts functions whose names are not auto-generated (FUN_* / thunk_FUN_*),
-    since those are the only names that bootstrap_from_version can transfer.
+    Tracks both meaningful names and synthetic bootstrap labels. Sorting uses the
+    transferable count, which includes either category and therefore better
+    reflects how useful a source binary is for future bootstrap runs.
     Results are sorted descending — index 0 is the richest source.
 
     Lock is held only to snapshot the handles list; JVM enumeration runs unlocked.
@@ -712,19 +860,29 @@ def _rank_sources_blocking(exclude_name: str | None = None) -> list[dict]:
             continue
         fm = handle.program.getFunctionManager()
         total = fm.getFunctionCount()
-        named = sum(
-            1 for f in fm.getFunctions(True)
-            if not f.getName().startswith(("FUN_", "thunk_FUN_"))
-        )
+        meaningful_named = 0
+        synthetic_named = 0
+        for func in fm.getFunctions(True):
+            name = func.getName()
+            if name.startswith(("FUN_", "thunk_FUN_")):
+                continue
+            if _is_bootstrap_auto_name(name):
+                synthetic_named += 1
+            else:
+                meaningful_named += 1
+        transferable = meaningful_named + synthetic_named
         results.append({
             "name": handle.name,
             "unit_id": handle.unit_id,
             "total_functions": total,
-            "named_functions": named,
-            "named_pct": round(named / total * 100, 1) if total else 0.0,
+            "named_functions": meaningful_named,
+            "synthetic_bootstrap_functions": synthetic_named,
+            "transferable_functions": transferable,
+            "named_pct": round(meaningful_named / total * 100, 1) if total else 0.0,
+            "transferable_pct": round(transferable / total * 100, 1) if total else 0.0,
         })
 
-    results.sort(key=lambda r: r["named_functions"], reverse=True)
+    results.sort(key=lambda r: (r["transferable_functions"], r["named_functions"]), reverse=True)
     return results
 
 
@@ -908,9 +1066,9 @@ mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
 # ASYNC ANALYSIS HELPERS
 # =============================================================================
 
-def _read_status_file(unit_id: str) -> dict:
-    """Read .analysis_status for a unit_id, returning {} on any failure."""
-    status_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / unit_id / ".analysis_status"
+def _read_status_file(project_id: str) -> dict:
+    """Read .analysis_status for an on-disk project directory, returning {} on failure."""
+    status_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
     if not status_file.exists():
         return {}
     try:
@@ -919,9 +1077,9 @@ def _read_status_file(unit_id: str) -> dict:
         return {}
 
 
-def _write_status_file(unit_id: str, data: dict):
-    """Atomic write of .analysis_status for a unit_id."""
-    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / unit_id
+def _write_status_file(project_id: str, data: dict):
+    """Atomic write of .analysis_status for a project directory."""
+    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
     status_file = project_dir / ".analysis_status"
     tmp = status_file.with_suffix(".tmp")
@@ -961,13 +1119,27 @@ def _get_job_result(job_id: str) -> dict:
                                  message=f"Failed to read result for {job_id!r}: {e}")) from e
 
 
-def _bootstrap_meta(source_unit_id: str | None, stats: dict | None = None) -> dict | None:
+def _bootstrap_meta(
+    source_analysis_id: str | None,
+    stats: dict | None = None,
+    mode: str | None = None,
+) -> dict | None:
     """Return a stable bootstrap payload for MCP responses."""
-    if not source_unit_id:
+    if not source_analysis_id:
         return None
-    result = {"source_unit_id": source_unit_id}
+    parsed = parse_analysis_id(source_analysis_id)
+    result = {"source_analysis_id": source_analysis_id}
+    if parsed is not None:
+        result["source_unit_id"] = parsed[0]
+        result["source_profile"] = parsed[1]
+    elif _UNIT_ID_RE.match(source_analysis_id):
+        result["source_unit_id"] = source_analysis_id
+    if mode:
+        result["mode"] = mode
     if stats:
         result["stats"] = stats
+        if "mode" in stats:
+            result["mode"] = stats["mode"]
     return result
 
 
@@ -1006,22 +1178,26 @@ def _compute_job_eta_sec(job: dict, status_data: dict) -> int | None:
     return max(0, int(round(estimated_total - elapsed)))
 
 
-def _merge_live_job_entry(unit_id: str, job: dict, *, include_jobs_meta: bool) -> dict:
+def _merge_live_job_entry(analysis_id: str, job: dict, *, include_jobs_meta: bool) -> dict:
     """Build a binaries() entry from in-memory job data plus live status file fields."""
     entry = {
-        "unit_id": unit_id,
-        "name": job.get("binary_name", unit_id),
+        "unit_id": job.get("unit_id") or analysis_id,
+        "analysis_id": analysis_id,
+        "name": job.get("binary_name", analysis_id),
         "status": job.get("status", "unknown"),
         "profile": job.get("profile"),
     }
-    bootstrap_meta = _bootstrap_meta(job.get("bootstrap_source"))
+    bootstrap_meta = _bootstrap_meta(
+        job.get("bootstrap_source"),
+        mode=job.get("bootstrap_mode"),
+    )
     if bootstrap_meta:
         entry["bootstrap"] = bootstrap_meta
 
     if not include_jobs_meta:
         return entry
 
-    status_data = _read_status_file(unit_id) if job.get("kind") != "scan" else {}
+    status_data = _read_status_file(job.get("project_id", analysis_id)) if job.get("kind") != "scan" else {}
     for key in (
         "status",
         "phase",
@@ -1042,11 +1218,16 @@ def _merge_live_job_entry(unit_id: str, job: dict, *, include_jobs_meta: bool) -
 
     status_bootstrap = status_data.get("bootstrap")
     if isinstance(status_bootstrap, dict):
-        status_source = status_bootstrap.get("source_unit_id") or job.get("bootstrap_source")
+        status_source = (
+            status_bootstrap.get("source_analysis_id")
+            or status_bootstrap.get("source_unit_id")
+            or job.get("bootstrap_source")
+        )
         status_stats = status_bootstrap.get("stats")
-        if status_stats is None and "source_unit_id" not in status_bootstrap:
+        status_mode = status_bootstrap.get("mode") or job.get("bootstrap_mode")
+        if status_stats is None and "source_unit_id" not in status_bootstrap and "source_analysis_id" not in status_bootstrap:
             status_stats = status_bootstrap
-        entry["bootstrap"] = _bootstrap_meta(status_source, status_stats)
+        entry["bootstrap"] = _bootstrap_meta(status_source, status_stats, mode=status_mode)
     elif bootstrap_meta:
         entry["bootstrap"] = bootstrap_meta
 
@@ -1056,7 +1237,7 @@ def _merge_live_job_entry(unit_id: str, job: dict, *, include_jobs_meta: bool) -
 
     if job.get("kind") == "scan" and job.get("status") == "complete":
         try:
-            entry["result"] = _get_job_result(unit_id)
+            entry["result"] = _get_job_result(analysis_id)
         except McpError:
             entry["result_available"] = False
         else:
@@ -1097,7 +1278,7 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
-async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
+async def _run_worker(path: Path, analysis_id: str, profile: str, job: dict):
     """Acquire semaphore slot, spawn import subprocess, track completion."""
     global _worker_semaphore
     if _worker_semaphore is None:
@@ -1120,6 +1301,7 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
         ]
         if job.get("bootstrap_source"):
             cmd.extend(["--bootstrap", str(job["bootstrap_source"])])
+            cmd.extend(["--bootstrap-mode", str(job.get("bootstrap_mode", "named"))])
 
         if _server_config.ghidra_dir:
             cmd.extend(["--ghidra-dir", str(_server_config.ghidra_dir)])
@@ -1143,7 +1325,7 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
                 stderr = (stderr_bytes or b"").decode(errors="replace")
                 if not stderr.strip():
                     # Fallback: worker may have recorded error in status file.
-                    status_data = _read_status_file(unit_id)
+                    status_data = _read_status_file(job.get("project_id", analysis_id))
                     stderr = str(status_data.get("error", "Worker exited with non-zero status"))
                 job["status"] = "error"
                 job["error"] = stderr[-500:]
@@ -1153,7 +1335,7 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
             job["error"] = str(e)
 
         # Deferred pop: keep terminal status available for 5 min so callers can poll.
-        asyncio.get_running_loop().call_later(300, _active_jobs.pop, unit_id, None)
+        asyncio.get_running_loop().call_later(300, _active_jobs.pop, analysis_id, None)
 
 
 async def _run_scan_task(job_id: str, job: dict, fn):
@@ -1177,7 +1359,7 @@ async def _run_scan_task(job_id: str, job: dict, fn):
     loop.call_later(300, _active_jobs.pop, job_id, None)
 
 
-def _hot_load_blocking(unit_id: str) -> bool:
+def _hot_load_blocking(analysis_id: str) -> bool:
     """Load a completed project into the running backend (blocking, runs in thread pool).
 
     Returns True if the program is now in backend.programs (loaded here or already loaded),
@@ -1188,17 +1370,17 @@ def _hot_load_blocking(unit_id: str) -> bool:
             return False
         handle = _load_project_into_backend(
             _backend,
-            unit_id,
+            analysis_id,
             update_capabilities=True,
             append_history=True,
         )
         return handle is not None
 
 
-async def _hot_load(unit_id: str) -> None:
+async def _hot_load(analysis_id: str) -> None:
     """Async wrapper: hot-load a completed project into the backend."""
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(_import_executor, _hot_load_blocking, unit_id)
+    await loop.run_in_executor(_import_executor, _hot_load_blocking, analysis_id)
 
     # Notify MCP client that tool list may have changed
     # (new capabilities = new format-specific tools available)
@@ -1259,48 +1441,59 @@ class ProjectWatcher:
         if status.get("status") != "complete":
             return
 
-        unit_id = resolved_status.parent.name
-        # Validate unit_id format (should be 16-char hex hash, or 40-char for SHA256)
-        if not unit_id or not all(c in '0123456789abcdef' for c in unit_id.lower()):
-            logger.warning(f"Invalid unit_id format in watcher: {unit_id}")
+        project_id = resolved_status.parent.name
+        analysis_id = status.get("analysis_id")
+        profile = status.get("profile")
+        if not analysis_id:
+            parsed = parse_analysis_id(project_id)
+            if parsed is not None:
+                analysis_id = project_id
+            elif _UNIT_ID_RE.match(project_id):
+                profile = profile or AnalysisProfile.FAST.value
+                analysis_id = make_analysis_id(project_id, profile)
+            else:
+                analysis_id = project_id
+
+        if not analysis_id:
             return
 
         with _backend_lock:
             if self.backend and any(
-                h.unit_id == unit_id for h in list(self.backend.programs.values())
+                _handle_analysis_id(h) == analysis_id or getattr(h, "unit_id", None) == project_id
+                for h in list(self.backend.programs.values())
             ):
                 return  # Already loaded
 
-        if unit_id in self._pending_hot_loads:
+        if analysis_id in self._pending_hot_loads:
             return
 
-        self._pending_hot_loads.add(unit_id)
+        self._pending_hot_loads.add(analysis_id)
         try:
             # Schedule callback first; create coroutine/task on event loop thread.
-            self.loop.call_soon_threadsafe(self._schedule_hot_load, unit_id)
+            self.loop.call_soon_threadsafe(self._schedule_hot_load, analysis_id)
         except RuntimeError as e:
-            self._pending_hot_loads.discard(unit_id)
-            logger.debug(f"Failed to schedule hot-load for {unit_id}: {e}")
+            self._pending_hot_loads.discard(analysis_id)
+            logger.debug(f"Failed to schedule hot-load for {analysis_id}: {e}")
 
-    def _schedule_hot_load(self, unit_id: str) -> None:
+    def _schedule_hot_load(self, analysis_id: str) -> None:
         if self.loop.is_closed():
-            self._pending_hot_loads.discard(unit_id)
+            self._pending_hot_loads.discard(analysis_id)
             return
         try:
-            task = asyncio.create_task(self._async_hot_load(unit_id))
-            task.add_done_callback(lambda _t: self._pending_hot_loads.discard(unit_id))
+            task = asyncio.create_task(self._async_hot_load(analysis_id))
+            task.add_done_callback(lambda _t: self._pending_hot_loads.discard(analysis_id))
         except RuntimeError as e:
-            self._pending_hot_loads.discard(unit_id)
-            logger.debug(f"Failed to create hot-load task for {unit_id}: {e}")
+            self._pending_hot_loads.discard(analysis_id)
+            logger.debug(f"Failed to create hot-load task for {analysis_id}: {e}")
 
-    async def _async_hot_load(self, unit_id: str):
+    async def _async_hot_load(self, analysis_id: str):
         try:
-            await _hot_load(unit_id)
-            logger.info(f"Watcher hot-loaded {unit_id}")
+            await _hot_load(analysis_id)
+            logger.info(f"Watcher hot-loaded {analysis_id}")
         except Exception as e:
-            logger.error(f"Watcher failed to hot-load {unit_id}: {e}")
+            logger.error(f"Watcher failed to hot-load {analysis_id}: {e}")
         finally:
-            self._pending_hot_loads.discard(unit_id)
+            self._pending_hot_loads.discard(analysis_id)
 
 
 def start_project_watcher(
@@ -1346,15 +1539,29 @@ async def _recover_in_progress_jobs():
         if not status_file.exists():
             continue
 
-        uid = entry.name
+        project_id = entry.name
         with _backend_lock:
-            if _backend and any(h.unit_id == uid for h in list(_backend.programs.values())):
+            status = _read_status_file(project_id)
+            analysis_id = status.get("analysis_id")
+            profile = status.get("profile")
+            if not analysis_id:
+                parsed = parse_analysis_id(project_id)
+                if parsed is not None:
+                    analysis_id = project_id
+                elif _UNIT_ID_RE.match(project_id):
+                    analysis_id = make_analysis_id(project_id, profile or AnalysisProfile.FAST.value)
+            if _backend and any(
+                _handle_analysis_id(h) == analysis_id or getattr(h, "unit_id", None) == project_id
+                for h in list(_backend.programs.values())
+            ):
                 continue  # Already loaded by eager_load
 
         try:
             status = json.loads(status_file.read_text())
         except json.JSONDecodeError:
             continue
+        analysis_id = status.get("analysis_id") or analysis_id or project_id
+        unit_id = status.get("unit_id") or (parse_analysis_id(analysis_id)[0] if parse_analysis_id(analysis_id) else project_id)
 
         if status.get("status") == "complete":
             continue  # Loaded lazily on first tool call via _get_handle/_find_on_disk
@@ -1364,23 +1571,26 @@ async def _recover_in_progress_jobs():
 
         if status.get("status") == "analyzing" and alive:
             # Worker still running from before restart -- track it
-            entry = {
-                "unit_id": uid,
-                "binary_name": status.get("binary_name", uid),
+            job_entry = {
+                "analysis_id": analysis_id,
+                "unit_id": unit_id,
+                "project_id": project_id,
+                "binary_name": status.get("binary_name", unit_id),
+                "profile": status.get("profile"),
                 "status": "analyzing",
                 "pid": pid,
                 "recovered": True,
             }
             async with (_active_jobs_lock or nullcontext()):
-                _active_jobs[uid] = entry
-            logger.info(f"Recovered in-progress job {uid} (pid={pid})")
+                _active_jobs[analysis_id] = job_entry
+            logger.info(f"Recovered in-progress job {analysis_id} (pid={pid})")
 
         elif status.get("status") in ("analyzing", "queued"):
             # Worker died -- mark failed
             status["status"] = "error"
             status["error"] = f"Worker process {pid} died (server restarted)"
-            _write_status_file(uid, status)
-            logger.warning(f"Marked stale job {uid} as error (pid={pid})")
+            _write_status_file(project_id, status)
+            logger.warning(f"Marked stale job {analysis_id} as error (pid={pid})")
 
 
 async def _autopurge_stale_projects() -> None:
@@ -1397,27 +1607,28 @@ async def _autopurge_stale_projects() -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     cutoff_str = cutoff.isoformat()
 
-    last_opened = _last_opened_by_unit_id()
+    last_opened = _last_opened_by_analysis_id()
     project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
 
     purged = []
-    for uid, data in _iter_disk_status():
+    for project_id, data in _iter_disk_status():
         if data.get("status") != "complete":
             continue
-        last_open = last_opened.get(uid)
+        analysis_id = data["analysis_id"]
+        last_open = last_opened.get(analysis_id)
         if last_open is None:
             continue  # Never opened — brand new, skip
         if last_open < cutoff_str:  # ISO UTC strings compare lexicographically
             try:
                 with _backend_lock:
                     active_ids = set(get_backend()._projects.keys()) if _backend else set()
-                if uid in active_ids:
+                if analysis_id in active_ids:
                     continue  # in-use — skip purge
-                shutil.rmtree(project_base / uid)
-                purged.append((uid, data.get("binary_name", uid)))
-                logger.info("Autopurged %s (%s), last opened %s", data.get("binary_name", uid), uid, last_open)
+                shutil.rmtree(project_base / project_id)
+                purged.append((analysis_id, data.get("binary_name", analysis_id)))
+                logger.info("Autopurged %s (%s), last opened %s", data.get("binary_name", analysis_id), analysis_id, last_open)
             except OSError as e:
-                logger.warning("Failed to autopurge %s: %s", uid, e)
+                logger.warning("Failed to autopurge %s: %s", analysis_id, e)
 
     if purged:
         logger.info("Autopurge complete: removed %d project(s)", len(purged))
@@ -1428,24 +1639,24 @@ async def _stale_job_monitor(interval: int = 30):
     while True:
         await asyncio.sleep(interval)
         async with (_active_jobs_lock or nullcontext()):
-            for uid, job in list(_active_jobs.items()):
+            for analysis_id, job in list(_active_jobs.items()):
                 if job.get("status") != "analyzing":
                     continue
                 pid = job.get("pid")
                 if pid and not _pid_alive(pid):
-                    status_data = _read_status_file(uid)
+                    status_data = _read_status_file(job.get("project_id", analysis_id))
                     # Check if it actually completed (status file might say "complete")
                     if status_data.get("status") == "complete":
                         job["status"] = "complete"
                         continue
-                    logger.warning(f"Stale job {uid}: pid {pid} dead")
-                    _write_status_file(uid, {
+                    logger.warning(f"Stale job {analysis_id}: pid {pid} dead")
+                    _write_status_file(job.get("project_id", analysis_id), {
                         "status": "error",
                         "error": f"Worker process {pid} died unexpectedly",
                         "phase": "unknown",
                     })
                     with _jobs_mutex:
-                        _active_jobs.pop(uid, None)
+                        _active_jobs.pop(analysis_id, None)
 
 
 # =============================================================================
@@ -1459,6 +1670,7 @@ def _do_import_blocking(
     tracker: ProgressTracker,
     fresh: bool = False,
     bootstrap: str | None = None,
+    bootstrap_mode: str = "named",
 ) -> tuple:
     """Blocking import operation (runs in thread pool).
 
@@ -1489,7 +1701,12 @@ def _do_import_blocking(
     if bootstrap:
         tracker.update(88, "Applying bootstrap")
         with _backend_lock:
-            bootstrap_stats = _apply_bootstrap_transfer(get_backend(), bootstrap, handle)
+            bootstrap_stats = _apply_bootstrap_transfer(
+                get_backend(),
+                bootstrap,
+                handle,
+                mode=bootstrap_mode,
+            )
 
     tracker.update(90, "Detecting capabilities")
     caps = _ensure_capabilities(handle)
@@ -1504,17 +1721,39 @@ def _do_import_blocking(
 
 @mcp.tool()
 async def load(
-    path: str,
+    path: NonEmptyStr,
     ctx: Context,
-    profile: str = "fast",
+    profile: LoadProfileArg = "fast",
     analyze: bool = True,
     fresh: bool = False,
-    bootstrap: str | None = None,
+    bootstrap: NonEmptyStr | None = None,
+    bootstrap_mode: BootstrapModeArg = "named",
 ) -> dict:
-    """Import and analyze a binary file.
+    """Load a binary into pyghidra-lite for reverse engineering. This is always
+    the first tool to call - no other tool works until a binary is loaded.
 
-    For binaries under 10MB, blocks until analysis completes.
-    For binaries 10MB+, runs async - poll binaries(jobs=True) and match unit_id.
+    Small binaries (<10MB) block until analysis finishes and return full results.
+    Large binaries (>=10MB) return immediately with a unit_id; poll progress with
+    binaries(jobs=True).
+
+    If you load a path that was previously analyzed, it returns from cache instantly
+    with status="ready". To throw away a stale or wrong-profile analysis and start
+    clean, pass fresh=True.
+
+    Profile selection matters:
+      - "fast" (default): skips 20 slow Ghidra analyzers. Good enough for function
+        listing, string search, and on-demand decompilation. Use this for first contact.
+      - "default": enables all analyzers except Decompiler Parameter ID. Better
+        decompilation quality, ~10x slower than fast.
+      - "deep": full Ghidra analysis including aggressive instruction finding. Use
+        for obfuscated or packed binaries where fast/default miss functions.
+
+    Version tracking: if you have a previously-analyzed reference binary loaded
+    (e.g., an older version of the same app), pass bootstrap="reference-binary-name"
+    to transfer function names via exact byte matching before analysis runs. This
+    pre-labels known functions so the agent starts with meaningful names instead of
+    FUN_* addresses. Use bootstrap_mode="all" to also create stable synthetic labels
+    for unnamed functions - useful for tracking unnamed code across versions.
 
     Args:
         path: Path to binary file.
@@ -1522,21 +1761,18 @@ async def load(
         analyze: Run analysis (False = import only, faster).
         fresh: Discard cached analysis and re-import from scratch.
         bootstrap: Name of analyzed binary to transfer names from (version tracking).
+        bootstrap_mode: "named" (default) transfers only semantic names; "all"
+            also synthesizes stable labels for FUN_* functions.
     """
     try:
         p = _resolve_import_path(path)
-    except ValueError as exc:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(exc))) from exc
+    except ValueError:
+        raise
     if not p.exists():
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Not found: {p}"))
+        raise ValueError(f"Not found: {p}")
 
-    try:
-        profile_enum = AnalysisProfile(profile)
-    except ValueError as exc:
-        raise McpError(ErrorData(
-            code=INVALID_PARAMS,
-            message="Invalid profile. Use: fast, default, deep"
-        )) from exc
+    profile = _validate_choice("profile", profile, ("fast", "default", "deep"))
+    profile_enum = AnalysisProfile(profile)
 
     with open(p, "rb") as f:
         header = f.read(16)
@@ -1544,12 +1780,17 @@ async def load(
     kind = detect_binary_kind(p, header)
     file_size_mb = p.stat().st_size / (1024 * 1024)
     unit_id = compute_unit_id_streaming(p)
+    analysis_id = make_analysis_id(unit_id, profile)
     bootstrap_source = None
+    bootstrap_mode = _normalize_bootstrap_mode(bootstrap_mode)
+
+    if bootstrap is None and bootstrap_mode != "named":
+        raise ValueError("bootstrap_mode requires bootstrap")
 
     if bootstrap:
         _require_backend()
         with _backend_lock:
-            bootstrap_source = _normalize_bootstrap_source(bootstrap, unit_id)
+            bootstrap_source = _normalize_bootstrap_source(bootstrap, analysis_id)
 
     # Auto-delegate large binaries to async analysis to avoid MCP timeouts.
     if analyze and file_size_mb >= _LARGE_BINARY_MB:
@@ -1560,26 +1801,29 @@ async def load(
         if fresh:
             with _backend_lock:
                 if _backend:
-                    _backend._purge_binary(unit_id)
-            project_dir_fresh = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
-            proj_path = project_dir_fresh / unit_id
-            if proj_path.exists():
-                shutil.rmtree(proj_path, ignore_errors=True)
+                    _backend._purge_analysis(analysis_id)
+            disk_match = _find_on_disk(unit_id, profile=profile)
+            if disk_match:
+                proj_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / disk_match["project_id"]
+                if proj_path.exists():
+                    shutil.rmtree(proj_path, ignore_errors=True)
             async with (_active_jobs_lock or nullcontext()):
-                _kill_job(unit_id)
-            logger.info("fresh=True: purged all cached state for unit_id=%s", unit_id)
+                _kill_job(analysis_id)
+            logger.info("fresh=True: purged all cached state for analysis_id=%s", analysis_id)
 
         # Already loaded in memory?
         if not fresh:
             with _backend_lock:
                 loaded_handles = list(_backend.programs.values()) if _backend else []
             for h in loaded_handles:
-                if h.unit_id == unit_id and h.analyzed:
+                if h.analysis_id == analysis_id and h.analyzed:
                     caps = _ensure_capabilities(h)
                     result = {
                         "unit_id": unit_id,
+                        "analysis_id": analysis_id,
                         "binary_name": p.name,
                         "kind": kind,
+                        "profile": h.profile.value,
                         "status": "ready",
                         "functions": h.program.getFunctionManager().getFunctionCount(),
                         "capabilities": _format_capabilities(caps),
@@ -1587,23 +1831,21 @@ async def load(
                     if bootstrap_source:
                         with _backend_lock:
                             stats = _apply_bootstrap_transfer(
-                                get_backend(), bootstrap_source, h
+                                get_backend(), bootstrap_source, h, mode=bootstrap_mode
                             )
                         result["bootstrap"] = _bootstrap_meta(bootstrap_source, stats)
                     return result
 
         # Check disk: already analyzed by a previous import run? (outside lock)
-        project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
-        gpr = project_dir / unit_id / f"{unit_id}.gpr"
-        status_file = project_dir / unit_id / ".analysis_status"
-        if not fresh and gpr.exists() and status_file.exists():
+        disk_match = _find_on_disk(unit_id, profile=profile) if not fresh else None
+        if not fresh and disk_match is not None:
             try:
-                status_data = json.loads(status_file.read_text())
+                status_data = dict(disk_match)
                 if status_data.get("status") == "complete":
                     # Hot-load into memory so it's immediately available
                     hot_load_error = None
                     try:
-                        await _hot_load(unit_id)
+                        await _hot_load(disk_match["analysis_id"])
                     except Exception as e:
                         hot_load_error = str(e)
                     # Verify program actually loaded (hot-load can silently fail)
@@ -1611,12 +1853,14 @@ async def load(
                     with _backend_lock:
                         if _backend:
                             hot_loaded = any(
-                                h.unit_id == unit_id for h in _backend.programs.values()
+                                h.analysis_id == disk_match["analysis_id"] for h in _backend.programs.values()
                             )
                     result = {
                         "unit_id": unit_id,
+                        "analysis_id": disk_match["analysis_id"],
                         "binary_name": p.name,
                         "kind": kind,
+                        "profile": status_data.get("profile"),
                         "status": "ready" if hot_loaded else "load_failed",
                         "functions": status_data.get("functions"),
                         "capabilities": status_data.get("capabilities", []),
@@ -1629,10 +1873,13 @@ async def load(
                         result["hot_load_error"] = "Program not found in backend after load"
                     if hot_loaded and bootstrap_source:
                         with _backend_lock:
-                            dest_handle = _handle_by_unit_id(get_backend(), unit_id)
+                            dest_handle = _handle_by_analysis_id(get_backend(), disk_match["analysis_id"])
                             if dest_handle is not None:
                                 stats = _apply_bootstrap_transfer(
-                                    get_backend(), bootstrap_source, dest_handle
+                                    get_backend(),
+                                    bootstrap_source,
+                                    dest_handle,
+                                    mode=bootstrap_mode,
                                 )
                                 result["bootstrap"] = _bootstrap_meta(bootstrap_source, stats)
                     return result
@@ -1641,23 +1888,26 @@ async def load(
 
         async with (_active_jobs_lock or nullcontext()):
             # Already in progress? (skip check when fresh — we just cleared the job)
-            if not fresh and unit_id in _active_jobs:
-                job = _active_jobs[unit_id]
+            if not fresh and analysis_id in _active_jobs:
+                job = _active_jobs[analysis_id]
                 if job.get("status") not in ("complete", "error"):
                     if bootstrap_source and job.get("bootstrap_source") != bootstrap_source:
-                        raise McpError(ErrorData(
-                            code=INVALID_PARAMS,
-                            message=(
-                                f"Analysis already in progress for {p.name!r} without the "
-                                "requested bootstrap source. Wait for completion or retry "
-                                "with fresh=True."
-                            ),
-                        ))
-                    entry = _merge_live_job_entry(unit_id, job, include_jobs_meta=True)
+                        raise ValueError(
+                            f"Analysis already in progress for {p.name!r} without the "
+                            "requested bootstrap source. Wait for completion or retry "
+                            "with fresh=True."
+                        )
+                    if bootstrap_source and job.get("bootstrap_mode", "named") != bootstrap_mode:
+                        raise ValueError(
+                            f"Analysis already in progress for {p.name!r} with "
+                            f"bootstrap_mode={job.get('bootstrap_mode', 'named')!r}. "
+                            "Wait for completion or retry with fresh=True."
+                        )
+                    entry = _merge_live_job_entry(analysis_id, job, include_jobs_meta=True)
                     entry["binary_name"] = p.name
                     entry["message"] = (
                         f"Analysis in progress ({file_size_mb:.0f}MB). "
-                        f"Poll binaries(jobs=True) and match unit_id='{unit_id}'"
+                        f"Poll binaries(jobs=True) and match analysis_id='{analysis_id}'"
                     )
                     return entry
                 # Terminal state stale entry: fall through and re-queue.
@@ -1665,6 +1915,8 @@ async def load(
             # Spawn async worker subprocess.
             estimated = _estimate_analysis_time(p.stat().st_size, profile)
             job: dict = {
+                "analysis_id": analysis_id,
+                "project_id": analysis_id,
                 "unit_id": unit_id,
                 "binary_name": p.name,
                 "status": "queued",
@@ -1672,22 +1924,25 @@ async def load(
                 "profile": profile,
                 "pid": None,
                 "bootstrap_source": bootstrap_source,
+                "bootstrap_mode": bootstrap_mode,
             }
             with _jobs_mutex:
-                _active_jobs[unit_id] = job
-            asyncio.create_task(_run_worker(p, unit_id, profile, job))
+                _active_jobs[analysis_id] = job
+            asyncio.create_task(_run_worker(p, analysis_id, profile, job))
             result = {
                 "unit_id": unit_id,
+                "analysis_id": analysis_id,
                 "binary_name": p.name,
                 "kind": kind,
+                "profile": profile,
                 "status": "queued",
                 "eta_sec": estimated,
                 "message": (
                     f"Binary is {file_size_mb:.0f}MB; analysis runs in background. "
-                    f"Poll binaries(jobs=True) and match unit_id='{unit_id}'"
+                    f"Poll binaries(jobs=True) and match analysis_id='{analysis_id}'"
                 ),
             }
-            bootstrap_meta = _bootstrap_meta(bootstrap_source)
+            bootstrap_meta = _bootstrap_meta(bootstrap_source, mode=bootstrap_mode)
             if bootstrap_meta:
                 result["bootstrap"] = bootstrap_meta
             return result
@@ -1706,10 +1961,11 @@ async def load(
             profile_enum,
             analyze,
             tracker,
-            fresh=fresh,
-            bootstrap=bootstrap_source,
+                fresh=fresh,
+                bootstrap=bootstrap_source,
+                bootstrap_mode=bootstrap_mode,
+            )
         )
-    )
 
     # Report progress: every 10% change OR every 60s
     last_reported_bucket = -1
@@ -1740,7 +1996,9 @@ async def load(
             "name": handle.name,
             "binary_name": p.name,
             "unit_id": handle.unit_id,
+            "analysis_id": handle.analysis_id,
             "kind": kind,
+            "profile": handle.profile.value,
             "capabilities": _format_capabilities(caps),
             "status": "ready",
         }
@@ -1751,16 +2009,19 @@ async def load(
             result["note"] = "already_analyzed"
 
         return result
-    except McpError:
+    except ValueError:
         raise
     except Exception as e:
-        logger.error(f"Import failed: {e}")
-        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Import failed: {e}")) from e
+        logger.exception("Import failed")
+        raise RuntimeError(f"Import failed: {e}") from e
 
 
 @mcp.tool()
-async def delete(name: str, ctx: Context) -> dict:
-    """Remove a binary, cancel any running analysis, and delete on-disk project.
+async def delete(name: NonEmptyStr, ctx: Context) -> dict:
+    """Permanently remove a binary, its on-disk Ghidra project, and any running
+    analysis worker. Use this to free disk space, clean up failed analyses, or
+    remove binaries you no longer need. Accepts a binary name, unit_id, or partial
+    name match. For ambiguous matches, use the exact unit_id from binaries().
 
     Args:
         name: Binary name or unit_id.
@@ -1771,61 +2032,45 @@ async def delete(name: str, ctx: Context) -> dict:
 
         # Search loaded binaries without triggering auto-load
         handle = None
-        exact = [h for h in backend.programs.values() if name in (h.name, h.unit_id)]
+        exact = [h for h in backend.programs.values() if name in (h.name, h.unit_id, h.analysis_id)]
         partial = [h for h in backend.programs.values() if name in h.name] if not exact else []
         matches = exact or partial
         if len(matches) > 1:
             candidates = [f"{h.name} ({h.unit_id})" for h in matches]
-            raise McpError(ErrorData(
-                code=INVALID_PARAMS,
-                message=f"Ambiguous match for {name!r}: {candidates}. Use exact name or unit_id.",
-            ))
+            raise ValueError(
+                f"Ambiguous match for {name!r}: {candidates}. Use exact name or unit_id."
+            )
         handle = matches[0] if matches else None
 
         if handle is not None:
             unit_id = handle.unit_id
+            analysis_id = handle.analysis_id
             _capabilities.pop(unit_id, None)
             deleted = backend.delete_program(handle.name)
             if not deleted:
-                raise McpError(ErrorData(
-                    code=INTERNAL_ERROR,
-                    message=f"Failed to delete {handle.name!r} from Ghidra project",
-                ))
-            _kill_job(unit_id)
-            shutil.rmtree(project_base / unit_id, ignore_errors=True)
-            return {"deleted": handle.name, "unit_id": unit_id}
+                raise RuntimeError(f"Failed to delete {handle.name!r} from Ghidra project")
+            _kill_job(analysis_id)
+            project_id = analysis_id if (project_base / analysis_id).exists() else unit_id
+            shutil.rmtree(project_base / project_id, ignore_errors=True)
+            return {"deleted": handle.name, "unit_id": unit_id, "analysis_id": analysis_id}
 
         # Disk-only (errored, incomplete, never loaded)
-        unit_id = name
-        if not _UNIT_ID_RE.match(name):
-            binary_base = Path(name).name
-            candidates = [
-                uid for uid, data in _iter_disk_status()
-                if data.get("binary_name", "") == binary_base
-            ]
-            if not candidates:
-                raise McpError(ErrorData(
-                    code=INVALID_PARAMS,
-                    message=f"Not found: {name!r}. Use unit_id from binaries().",
-                ))
-            if len(candidates) > 1:
-                raise McpError(ErrorData(
-                    code=INVALID_PARAMS,
-                    message=f"Ambiguous name {name!r} matches {candidates}. Use unit_id.",
-                ))
-            unit_id = candidates[0]
+        disk_match = _find_on_disk(name)
+        if not disk_match:
+            raise ValueError(f"Not found: {name!r}. Use analysis_id or exact name from binaries().")
 
-        project_dir = project_base / unit_id
+        project_dir = project_base / disk_match["project_id"]
         if not project_dir.exists():
-            raise McpError(ErrorData(
-                code=INVALID_PARAMS,
-                message=f"Project not found: {unit_id!r}",
-            ))
+            raise ValueError(f"Project not found: {disk_match['project_id']!r}")
 
-        binary_name = _read_status_file(unit_id).get("binary_name", unit_id)
-        _kill_job(unit_id)
+        binary_name = _read_status_file(disk_match["project_id"]).get("binary_name", disk_match["analysis_id"])
+        _kill_job(disk_match["analysis_id"])
         shutil.rmtree(project_dir)
-        return {"deleted": binary_name, "unit_id": unit_id}
+        return {
+            "deleted": binary_name,
+            "unit_id": disk_match["unit_id"],
+            "analysis_id": disk_match["analysis_id"],
+        }
 
     with _backend_lock:
         return _guarded_tool_call("delete", op)
@@ -1837,7 +2082,18 @@ async def binaries(
     jobs: bool = False,
     rank_sources: bool = False,
 ) -> "list[dict]":
-    """List all binaries - loaded, analyzing, queued, or on-disk.
+    """Show everything pyghidra-lite knows about: binaries loaded in memory,
+    analyses currently running, queued jobs, and completed projects on disk from
+    previous sessions. Use this to:
+
+      - Find the exact binary name or unit_id needed by other tools.
+      - Check whether a binary is already analyzed (avoid redundant load calls).
+      - Monitor progress of large async analyses (pass jobs=True).
+      - Find the best source binary for version tracking (pass rank_sources=True
+        to sort by transferable named function count).
+
+    Binaries listed as "on_disk" auto-load into memory the first time any tool
+    references them - no need to re-import.
 
     Args:
         jobs: Include active job status and results.
@@ -1853,46 +2109,66 @@ async def binaries(
     def op():
         backend = get_backend()
         results = []
-        seen_uids = set()
+        seen_analysis_ids = set()
         with _jobs_mutex:
             active_jobs_snapshot = list(_active_jobs.items())
 
         # Currently loaded in memory
         for prog_name in backend.list_programs():
             handle = backend.get_program(prog_name)
-            seen_uids.add(handle.unit_id)
+            seen_analysis_ids.add(handle.analysis_id)
             caps = _ensure_capabilities(handle)
             results.append({
                 "name": handle.name,
                 "unit_id": handle.unit_id,
+                "analysis_id": handle.analysis_id,
                 "status": "ready",
                 "profile": handle.profile.value if handle.profile else None,
                 "capabilities": _format_capabilities(caps),
             })
 
         # In-progress analyses
-        for unit_id, job in active_jobs_snapshot:
-            if unit_id not in seen_uids:
-                seen_uids.add(unit_id)
-                results.append(_merge_live_job_entry(unit_id, job, include_jobs_meta=jobs))
+        for job_key, raw_job in active_jobs_snapshot:
+            job = dict(raw_job)
+            if job.get("kind") == "scan":
+                analysis_id = job_key
+                job.setdefault("unit_id", job_key)
+            else:
+                unit_id = job.get("unit_id") or job_key
+                profile_value = job.get("profile") or AnalysisProfile.FAST.value
+                analysis_id = job.get("analysis_id") or (
+                    make_analysis_id(unit_id, profile_value) if _UNIT_ID_RE.match(unit_id) else unit_id
+                )
+                job.setdefault("unit_id", unit_id)
+                job.setdefault("analysis_id", analysis_id)
+                if "project_id" not in job:
+                    project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+                    if (project_base / job_key / ".analysis_status").exists():
+                        job["project_id"] = job_key
+                    elif (project_base / analysis_id / ".analysis_status").exists():
+                        job["project_id"] = analysis_id
+                    else:
+                        job["project_id"] = job_key
+            if analysis_id not in seen_analysis_ids:
+                seen_analysis_ids.add(analysis_id)
+                results.append(_merge_live_job_entry(analysis_id, job, include_jobs_meta=jobs))
 
         # On-disk projects not yet loaded
         projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
         if projects_path.exists():
-            for entry in projects_path.iterdir():
-                uid = entry.name
-                if uid in seen_uids or not entry.is_dir():
+            for _project_id, status_data in _iter_disk_status():
+                analysis_id = status_data["analysis_id"]
+                if analysis_id in seen_analysis_ids:
                     continue
-                if not list(entry.glob("*.gpr")):
-                    continue
-                seen_uids.add(uid)
-                status_data = _read_status_file(uid)
+                seen_analysis_ids.add(analysis_id)
                 disk_entry = {
-                    "unit_id": uid,
-                    "name": status_data.get("binary_name", uid),
+                    "unit_id": status_data["unit_id"],
+                    "analysis_id": analysis_id,
+                    "name": status_data.get("binary_name", analysis_id),
                     "status": status_data.get("status", "on_disk"),
                     "functions": status_data.get("functions"),
                     "capabilities": status_data.get("capabilities", []),
+                    "profile": status_data.get("profile"),
                 }
                 if jobs:
                     for key in (
@@ -1907,7 +2183,6 @@ async def binaries(
                         "binary_size_bytes",
                         "binary_path",
                         "bootstrap",
-                        "profile",
                     ):
                         if key in status_data:
                             disk_entry[key] = status_data[key]
@@ -1921,11 +2196,41 @@ async def binaries(
 
 @mcp.tool()
 def info(
-    binary: str,
+    binary: NonEmptyStr,
     ctx: Context,
-    detail: str = "summary",
+    detail: InfoDetailArg = "summary",
 ) -> dict:
-    """Get binary overview with auto-detected format and language info.
+    """Get a binary overview, from a quick summary to a full first-contact triage.
+    **Call this right after load() to orient on an unfamiliar binary before diving
+    into code or search.**
+
+    The detail parameter controls how much work info does:
+
+      - "summary" (default): format, arch, bits, endianness, function/symbol counts,
+        and detected capabilities (swift/objc/elf/macho/hermes). Fast, minimal tokens.
+        Use this when you just need to confirm what you're working with.
+
+      - "full": complete triage in one call. Returns everything from summary plus:
+        top functions ranked by reference count (likely entry points and core logic),
+        suspicious imports tagged by capability (crypto, network, file, process),
+        notable strings (URLs, keys, paths, error messages), detected embedded
+        runtimes (Bun, Electron, Node, PyInstaller, UPX), and language-specific
+        metadata (Swift module name, ObjC class/selector counts). **Use this as
+        your first call on any unfamiliar binary - it replaces 5+ separate tool
+        calls and tells you where to investigate next.**
+
+      - "format": raw format-specific headers. Returns ELF details (debug info,
+        stripped status, machine type) or Mach-O details (CPU type, segment count,
+        code signature, entrypoint). Use when you need format-level metadata beyond
+        what summary provides.
+
+      - "sections": full memory/section layout with addresses, sizes, and
+        read/write/execute permissions. Use to understand the binary's memory map
+        or find which section contains a given address.
+
+      - "entropy": Shannon entropy per section. Sections >7.0 are likely encrypted
+        or compressed; <1.0 is mostly zeros. Use to identify packed or encrypted
+        regions before investing time decompiling them.
 
     Args:
         binary: Binary name or unit_id.
@@ -1936,6 +2241,8 @@ def info(
             - "sections": memory/section layout
             - "entropy": per-section entropy analysis
     """
+    detail = _validate_choice("detail", detail, _INFO_DETAILS)
+
     def op(handle):
         caps = _ensure_capabilities(handle)
         metadata = handle.metadata
@@ -2084,14 +2391,47 @@ def info(
 
 @mcp.tool()
 async def functions(
-    binary: str,
+    binary: NonEmptyStr,
     ctx: Context,
     query: str = "",
-    type: str = "all",
-    limit: int = 50,
+    type: FunctionsTypeArg = "all",
+    limit: Annotated[int, Field(ge=1)] = 50,
     demangle: str = "",
 ) -> list[dict]:
-    """List or search functions by type.
+    """List, search, or filter functions in a binary. This is the primary
+    navigation tool for understanding what code exists and finding targets to
+    decompile.
+
+    The type parameter selects which view of the binary's symbols to show:
+
+      - "all" (default): every function, sorted by name. Returns compact
+        {name, addr} pairs. Filter with query= for substring matching. Start
+        here when exploring an unfamiliar binary after running info(detail="full").
+
+      - "swift": Swift functions with demangled human-readable names, kind
+        classification (function/initializer/getter/setter/witness), and addresses.
+        Only available when Swift code is detected. Use instead of "all" when
+        working with iOS/macOS Swift binaries - "all" shows mangled names.
+
+      - "objc": Objective-C methods with full signatures (-[Class selector]),
+        class names, and addresses. Only available when ObjC code is detected.
+
+      - "imports": imported functions with automatic capability tagging (crypto,
+        network, file, process, memory, jni). Shows which system capabilities
+        the binary uses and which libraries provide them.
+
+      - "exports": exported symbols - the binary's public API surface. Use to
+        understand what a shared library exposes.
+
+      - "types": Swift type definitions (structs, classes, enums) extracted from
+        metadata sections. Use to understand the data model without decompiling.
+
+      - "got": GOT/PLT entries showing dynamic linking targets (ELF only).
+
+      - "dylibs": linked dynamic libraries (Mach-O only).
+
+    To demangle a single Swift symbol without listing functions, pass demangle=
+    with the mangled name (e.g., "_$s...").
 
     Args:
         binary: Binary name or unit_id.
@@ -2108,6 +2448,9 @@ async def functions(
         limit: Max results (default 50).
         demangle: If provided, demangle this single Swift symbol name.
     """
+    limit = _validate_minimum("limit", limit, 1)
+    type = _validate_choice("type", type, _FUNCTION_TYPES)
+
     # Single symbol demangle shortcut
     if demangle:
         from pyghidra_lite.lang import demangle_swift
@@ -2119,7 +2462,7 @@ async def functions(
 
         if type == "swift":
             if not caps.has_swift:
-                return [{"error": "Binary has no Swift code"}]
+                raise ValueError("Binary has no Swift code")
             from pyghidra_lite.lang import SwiftTools
             swift_tools = SwiftTools(handle)
             results = swift_tools.list_swift_functions(pattern=query, limit=limit)
@@ -2130,7 +2473,7 @@ async def functions(
 
         if type == "objc":
             if not caps.has_objc:
-                return [{"error": "Binary has no Objective-C code"}]
+                raise ValueError("Binary has no Objective-C code")
             from pyghidra_lite.lang import ObjCTools
             objc_tools = ObjCTools(handle)
             methods = objc_tools.list_methods(pattern=query, limit=limit)
@@ -2152,7 +2495,7 @@ async def functions(
 
         if type == "types":
             if not caps.has_swift:
-                return [{"error": "Binary has no Swift code"}]
+                raise ValueError("Binary has no Swift code")
             from pyghidra_lite.lang import SwiftTools
             swift_tools = SwiftTools(handle)
             types = swift_tools.list_swift_types(limit=limit)
@@ -2163,13 +2506,13 @@ async def functions(
 
         if type == "got":
             if not caps.is_elf:
-                return [{"error": "GOT/PLT only available for ELF binaries"}]
+                raise ValueError("GOT/PLT only available for ELF binaries")
             from pyghidra_lite.formats import ElfTools
             return ElfTools(handle).get_got_plt()
 
         if type == "dylibs":
             if not caps.is_macho:
-                return [{"error": "dylibs only available for Mach-O binaries"}]
+                raise ValueError("dylibs only available for Mach-O binaries")
             from pyghidra_lite.formats import MachOTools
             return [{"name": d.name} for d in MachOTools(handle).list_dylibs()]
 
@@ -2184,13 +2527,39 @@ async def functions(
 
 @mcp.tool()
 def code(
-    binary: str,
-    target: str | list[str],
+    binary: NonEmptyStr,
+    target: CodeTargetArg,
     ctx: Context,
-    what: str = "decompile",
+    what: CodeWhatArg = "decompile",
     cfg: bool = False,
 ) -> dict | list[dict]:
-    """Decompile or disassemble function(s).
+    """Read code from a binary. This is the core analysis tool - use it to
+    understand what a function does.
+
+    Default mode (what="decompile") returns pseudo-C source code for a function,
+    along with its callers, callees, and referenced strings - all in one call.
+    No need to make separate xrefs or search calls after decompiling.
+
+    Pass a single function name or hex address (e.g., "main" or "0x4011a0") as
+    target. Pass a list of names/addresses for batch decompilation - more
+    efficient than repeated single calls.
+
+    The what parameter selects output format:
+
+      - "decompile" (default): pseudo-C with full context (callers, callees,
+        strings). Add cfg=True to also get the control flow graph (basic blocks
+        and edges) - useful for understanding loop structure and branch complexity,
+        especially on fast-profile binaries where type inference is limited.
+
+      - "asm": raw assembly instructions with mnemonics and operands. Use when
+        decompilation fails, produces misleading output, or when you need to see
+        exact instruction encoding.
+
+      - "bytes": raw hex bytes at an address. Target format is "addr,size"
+        (e.g., "0x4011a0,64"). Use to inspect data structures or verify byte patterns.
+
+      - "string": read a null-terminated string at an address. Use when you need
+        the full untruncated value of a string found via search.
 
     Args:
         binary: Binary name or unit_id.
@@ -2202,11 +2571,15 @@ def code(
             - "string": null-terminated string at address
         cfg: Include control flow graph (blocks and edges).
     """
+    what = _validate_choice("what", what, _CODE_WHATS)
+
     def op(handle):
         tools = GhidraTools(handle)
 
         # Handle batch decompile
         if isinstance(target, list):
+            if what != "decompile":
+                raise ValueError("Batch targets only support what='decompile'")
             results = tools.batch_decompile(
                 target, include_callees=True, include_strings=True
             )
@@ -2306,14 +2679,41 @@ def code(
 
 @mcp.tool()
 def xrefs(
-    binary: str,
-    target: str | list[str],
+    binary: NonEmptyStr,
+    target: XrefsTargetArg,
     ctx: Context,
-    direction: str = "to",
-    depth: int = 1,
+    direction: XrefsDirectionArg = "to",
+    depth: Annotated[int, Field(ge=1, le=5)] = 1,
     diff: bool = False,
 ) -> dict:
-    """Get cross-references, call graph, or symbol diff.
+    """Trace references through a binary - find who calls a function, what a
+    function depends on, or build a call graph.
+
+    This tool answers navigation questions:
+      - "Who calls malloc?" -> xrefs(binary, "malloc") - default direction="to"
+      - "What does main call?" -> xrefs(binary, "main", direction="from")
+      - "Show me the call tree around this function" -> xrefs(binary, "parse_input", depth=3)
+      - "What changed between these two versions?" -> xrefs(binary_a, binary_b, diff=True)
+
+    The behavior changes based on parameters:
+
+      direction="to" (default): returns a list of references TO the target -
+      every place that calls or reads from this address. Use this to find entry
+      points into a function or to trace how data flows to a location.
+
+      direction="from": returns what the target calls or references. Faster than
+      decompiling when you only need the dependency list, not the code.
+
+      depth>1: expands into a full call graph (up to depth=5). At depth=1 you
+      get direct references; at depth=2+ you get transitive callers/callees.
+      Use this to understand how a function fits into the broader program.
+
+      Pass a list of targets (up to 20) for batch xref lookup - more efficient
+      than repeated single calls when investigating a group of related functions.
+
+      diff=True: compare symbol tables between binary and target (which should
+      be the name of a second loaded binary). Returns added, removed, and common
+      symbols. Use for patch diffing between two versions of the same binary.
 
     Args:
         binary: Binary name or unit_id.
@@ -2324,14 +2724,17 @@ def xrefs(
         depth: Call graph depth (default 1, max 5). Use depth>1 for full call graph.
         diff: If True, compare symbols between binary and target (another binary name).
     """
-    def op():
-        backend = get_backend()
+    direction = _validate_choice("direction", direction, _XREF_DIRECTIONS)
+    depth = _validate_minimum("depth", depth, 1)
 
+    def op():
         # Symbol diff mode
         if diff:
             import heapq
-            handle_a = backend.get_program(binary)
-            handle_b = backend.get_program(target if isinstance(target, str) else target[0])
+            if not isinstance(target, str):
+                raise ValueError("diff=True requires target to be a single binary name or unit_id")
+            handle_a = _get_handle(binary)
+            handle_b = _get_handle(target)
 
             def _get_symbols(handle) -> set[str]:
                 st = handle.program.getSymbolTable()
@@ -2350,13 +2753,13 @@ def xrefs(
                 "num_common": len(syms_a & syms_b),
             }
 
-        handle = backend.get_program(binary)
+        handle = _get_handle(binary)
         tools = GhidraTools(handle)
 
         # Batch xrefs
         if isinstance(target, list):
-            if len(target) > 20:
-                raise McpError(ErrorData(code=INVALID_PARAMS, message="Max 20 targets per call"))
+            if len(target) > _MAX_BATCH_XREF_TARGETS:
+                raise ValueError(f"Max {_MAX_BATCH_XREF_TARGETS} targets per call")
             result = {}
             for t in target:
                 try:
@@ -2401,15 +2804,50 @@ def xrefs(
 
 @mcp.tool()
 async def search(
-    binary: str,
-    query: str | list[str],
+    binary: NonEmptyStr,
+    query: SearchQueryArg,
     ctx: Context,
-    type: str = "strings",
-    mode: str = "indexed",
-    limit: int = 30,
+    type: SearchTypeArg = "strings",
+    mode: SearchModeArg = "indexed",
+    limit: Annotated[int, Field(ge=1)] = 30,
     bg: bool = False,
 ) -> dict:
-    """Search for strings, bytes, symbols, or all.
+    """Find strings, byte patterns, symbols, or search everything at once. This
+    is the primary discovery tool for finding interesting targets to investigate
+    with code() or xrefs().
+
+    Default (type="strings", mode="indexed") searches Ghidra's defined string
+    list - fast and returns xref information (which functions reference each
+    string). Use this first. If expected strings are missing, switch to
+    mode="deep" which scans raw memory for ASCII runs that Ghidra hasn't
+    classified as strings yet - slower but finds strings in lightly-analyzed
+    sections.
+
+    For batch efficiency, pass a list of queries (up to 20) to search multiple
+    patterns in one call - reads memory once instead of N times. Use bg=True
+    to run batch searches in the background; poll results with binaries(jobs=True).
+
+    The type parameter selects what to search:
+
+      - "strings" (default): string references with xrefs. Pair with mode="indexed"
+        (fast, defined strings) or mode="deep" (raw memory scan).
+
+      - "symbols": search the symbol table by name. Use when looking for a
+        specific named symbol rather than browsing functions.
+
+      - "bytes": search for a hex byte pattern (e.g., "cafebabe"). Use to find
+        magic numbers, crypto constants, or known byte signatures.
+
+      - "all": search functions, symbols, and strings simultaneously. Use for
+        broad exploration when you don't know whether your term is a function
+        name, symbol, or embedded string.
+
+      - "blob": extract strings from a raw memory region (query="offset,size").
+        Use after info(detail="full") identifies an embedded runtime with
+        strategy="search_payload" - pass the payload_offset as the offset.
+
+      - "extract": extract embedded BunFS filesystem from Bun binaries. Always
+        runs in background; poll with binaries(jobs=True).
 
     Args:
         binary: Binary name or unit_id.
@@ -2427,11 +2865,19 @@ async def search(
         limit: Max results per query (default 30).
         bg: Run in background (returns job_id to poll).
     """
+    type = _validate_choice("type", type, _SEARCH_TYPES)
+    mode = _validate_choice("mode", mode, _SEARCH_MODES)
+    limit = _validate_minimum("limit", limit, 1)
+
     handle = _get_handle(binary)
     tools = GhidraTools(handle)
 
     # Batch search
     if isinstance(query, list):
+        if len(query) > _MAX_BATCH_SEARCH_QUERIES:
+            raise ValueError(f"Max {_MAX_BATCH_SEARCH_QUERIES} queries per call")
+        if type != "strings":
+            raise ValueError("Batch query lists currently support type='strings' only")
         if bg:
             job_id = _new_job_id()
             job: dict = {"kind": "scan", "label": "batch_search",
@@ -2453,9 +2899,14 @@ async def search(
         return {"queries": query, "results": results}
 
     # Single query searches
+    if type != "strings" and mode != "indexed":
+        raise ValueError("mode only applies to type='strings'")
+
     if type == "extract":
         # BunFS extraction - always background
-        status = _read_status_file(handle.unit_id)
+        handle_analysis_id = _handle_analysis_id(handle)
+        status_match = _find_on_disk(handle_analysis_id) if handle_analysis_id else None
+        status = status_match or _read_status_file(getattr(handle, "unit_id", "")) or {}
         binary_path_str = status.get("binary_path", handle.name)
         stem = Path(binary_path_str).stem
         out = Path(binary_path_str).parent / f"{stem}_bunfs_extracted"
@@ -2559,10 +3010,10 @@ async def search(
 # PROJECT MANAGEMENT HELPERS (kept for delete tool)
 # =============================================================================
 
-def _kill_job(unit_id: str) -> None:
-    """Kill any active worker for unit_id and remove it from _active_jobs."""
+def _kill_job(analysis_id: str) -> None:
+    """Kill any active worker for analysis_id and remove it from _active_jobs."""
     with _jobs_mutex:
-        job = _active_jobs.pop(unit_id, None)
+        job = _active_jobs.pop(analysis_id, None)
     if job:
         pid = job.get("pid")
         if pid:
@@ -2580,7 +3031,9 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
     if not bun_rt:
         raise ValueError("No bunfs payload detected.")
 
-    status = _read_status_file(handle.unit_id)
+    handle_analysis_id = _handle_analysis_id(handle)
+    status_match = _find_on_disk(handle_analysis_id) if handle_analysis_id else None
+    status = status_match or _read_status_file(getattr(handle, "unit_id", "")) or {}
     binary_path_str = status.get("binary_path")
     if not binary_path_str:
         raise ValueError("binary_path not recorded in status file.")
@@ -2734,7 +3187,13 @@ def serve_cmd(
     for prog_name in _backend.list_programs():
         handle = _backend.get_program(prog_name)
         _ensure_capabilities(handle)
-        logger.info(f"Pre-loaded {handle.name} (unit_id={handle.unit_id}, analyzed={handle.analyzed})")
+        logger.info(
+            "Pre-loaded %s (unit_id=%s, analysis_id=%s, analyzed=%s)",
+            handle.name,
+            handle.unit_id,
+            handle.analysis_id,
+            handle.analyzed,
+        )
 
     # Import binaries from command line
     for binary_path in binaries:
@@ -2782,7 +3241,23 @@ def serve_cmd(
               help="JVM max heap (e.g. '4g'). Auto-sized if not set.")
 @click.option("--bootstrap", default=None,
               help="Name or unit_id of analyzed binary to transfer names from.")
-def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_heap, bootstrap):
+@click.option(
+    "--bootstrap-mode",
+    type=click.Choice(sorted(_BOOTSTRAP_MODES)),
+    default="named",
+    show_default=True,
+    help="Bootstrap transfer mode: semantic names only, or all functions with synthetic labels.",
+)
+def import_cmd(
+    binaries,
+    profile,
+    ghidra_dir,
+    project_dir,
+    runtime_home,
+    jvm_heap,
+    bootstrap,
+    bootstrap_mode,
+):
     """Import and analyze binaries offline. No MCP server started."""
     if not binaries:
         click.echo("No binaries specified.", err=True)
@@ -2808,12 +3283,15 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
     for binary_path in binaries:
         path = Path(binary_path).resolve()
         unit_id = compute_unit_id_streaming(path)
-        project_dir_path = Path(project_dir) / unit_id
+        analysis_id = make_analysis_id(unit_id, profile_enum)
+        project_dir_path = Path(project_dir) / analysis_id
 
         status_path = project_dir_path / ".analysis_status"
         status_path.parent.mkdir(parents=True, exist_ok=True)
         listener = AnalysisProgressListener(
             status_path, path.name, profile, path.stat().st_size,
+            unit_id=unit_id,
+            analysis_id=analysis_id,
             binary_path=str(path),
         )
 
@@ -2832,9 +3310,18 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
             bootstrap_meta = None
             if bootstrap:
                 current_phase = "bootstrap"
-                bootstrap_stats = _apply_bootstrap_transfer(backend, bootstrap, handle)
+                bootstrap_stats = _apply_bootstrap_transfer(
+                    backend,
+                    bootstrap,
+                    handle,
+                    mode=bootstrap_mode,
+                )
                 source_handle = _resolve_bootstrap_handle(backend, bootstrap)
-                bootstrap_meta = _bootstrap_meta(source_handle.unit_id, bootstrap_stats)
+                bootstrap_meta = _bootstrap_meta(
+                    source_handle.analysis_id,
+                    bootstrap_stats,
+                    mode=bootstrap_mode,
+                )
 
             caps = detect_capabilities(handle)
             cap_list = _format_capabilities(caps)
@@ -2845,11 +3332,11 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
 
             if handle.was_preexisting:
                 click.echo(f"  {path.name}: already analyzed "
-                           f"(unit_id={unit_id}, {func_count} functions)")
+                           f"(unit_id={unit_id}, analysis_id={handle.analysis_id}, {func_count} functions)")
             else:
                 message = (f"  {path.name}: {func_count} functions, "
                            f"[{', '.join(cap_list) or 'generic'}] "
-                           f"(unit_id={unit_id}, profile={profile})")
+                           f"(unit_id={unit_id}, analysis_id={handle.analysis_id}, profile={profile})")
                 if bootstrap_stats:
                     message += f", bootstrap transferred={bootstrap_stats['transferred']}"
                 click.echo(message)
@@ -2892,7 +3379,9 @@ def list_cmd(project_dir, as_json):
                 status_data = {"status": "corrupt_status"}
 
         info = {
-            "unit_id": entry.name,
+            "project_id": entry.name,
+            "unit_id": status_data.get("unit_id") or (parse_analysis_id(entry.name)[0] if parse_analysis_id(entry.name) else entry.name),
+            "analysis_id": status_data.get("analysis_id") or (entry.name if parse_analysis_id(entry.name) else make_analysis_id(entry.name, status_data.get("profile", AnalysisProfile.FAST.value))),
             "size_mb": round(size / 1024 / 1024, 1),
             "status": status_data.get("status", "ready"),
             "binary_name": status_data.get("binary_name", "unknown"),
@@ -2911,20 +3400,27 @@ def list_cmd(project_dir, as_json):
         for e in entries:
             caps = ", ".join(e["capabilities"]) if e["capabilities"] else "-"
             funcs = f"{e['functions']} funcs" if e["functions"] else ""
-            click.echo(f"  {e['unit_id']}  {e['size_mb']:>6.1f}MB  "
-                       f"[{e['status']}]  {e['binary_name']}  {funcs}  {caps}")
+            click.echo(
+                f"  {e['analysis_id']}  {e['size_mb']:>6.1f}MB  "
+                f"[{e['status']}]  {e['binary_name']}  {funcs}  {caps}"
+            )
 
 
 class AnalysisProgressListener:
     """Writes analysis progress to a JSON status file for subprocess worker consumption."""
 
     def __init__(self, status_path: Path, binary_name: str,
-                 profile: str, binary_size: int, binary_path: str | None = None):
+                 profile: str, binary_size: int,
+                 unit_id: str | None = None,
+                 analysis_id: str | None = None,
+                 binary_path: str | None = None):
         self.status_path = status_path
         self.binary_name = binary_name
         self.binary_path = binary_path
         self.profile = profile
         self.binary_size = binary_size
+        self.unit_id = unit_id
+        self.analysis_id = analysis_id
         self.started = time.time()
         self._write({"status": "analyzing", "phase": "startup", "progress": 0.0})
 
@@ -2986,6 +3482,10 @@ class AnalysisProgressListener:
                 self.started, tz=timezone.utc
             ).isoformat(),
         })
+        if self.unit_id:
+            data["unit_id"] = self.unit_id
+        if self.analysis_id:
+            data["analysis_id"] = self.analysis_id
         if self.binary_path:
             data["binary_path"] = self.binary_path
         tmp = self.status_path.with_suffix(".tmp")
@@ -3006,7 +3506,4 @@ if __name__ == "__main__":
 # OLD TOOLS REMOVED - DO NOT ADD BELOW THIS LINE
 # =============================================================================
 # All 58 original tools have been consolidated into 8 tools above:
-#   load, delete, list, info, functions, code, xrefs, search
-#
-# Old tool names are mapped via TOOL_ALIASES in consolidated.py for
-# backwards compatibility with programmatic callers.
+#   load, delete, binaries, info, functions, code, xrefs, search
