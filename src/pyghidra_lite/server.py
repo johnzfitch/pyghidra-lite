@@ -450,7 +450,7 @@ def _find_on_disk(binary: str) -> str | None:
             # Exists but not ready — give a specific error rather than "not found"
             msg = f"Unit {binary!r} found but status={status!r}"
             if status in ("analyzing", "queued"):
-                msg += ". Poll with analysis_status() for progress."
+                msg += ". Poll binaries(jobs=True) and match unit_id for progress."
             elif status == "error":
                 msg += f": {data.get('error', 'unknown error')}"
             raise McpError(ErrorData(code=INVALID_PARAMS, message=msg))
@@ -961,6 +961,16 @@ def _get_job_result(job_id: str) -> dict:
                                  message=f"Failed to read result for {job_id!r}: {e}")) from e
 
 
+def _bootstrap_meta(source_unit_id: str | None, stats: dict | None = None) -> dict | None:
+    """Return a stable bootstrap payload for MCP responses."""
+    if not source_unit_id:
+        return None
+    result = {"source_unit_id": source_unit_id}
+    if stats:
+        result["stats"] = stats
+    return result
+
+
 def _format_capabilities(caps: BinaryCapabilities) -> list[str]:
     """Convert BinaryCapabilities to a flat list of strings."""
     result = []
@@ -1004,8 +1014,9 @@ def _merge_live_job_entry(unit_id: str, job: dict, *, include_jobs_meta: bool) -
         "status": job.get("status", "unknown"),
         "profile": job.get("profile"),
     }
-    if job.get("bootstrap"):
-        entry["bootstrap"] = job.get("bootstrap")
+    bootstrap_meta = _bootstrap_meta(job.get("bootstrap_source"))
+    if bootstrap_meta:
+        entry["bootstrap"] = bootstrap_meta
 
     if not include_jobs_meta:
         return entry
@@ -1025,17 +1036,32 @@ def _merge_live_job_entry(unit_id: str, job: dict, *, include_jobs_meta: bool) -
         "started_at",
         "binary_size_bytes",
         "binary_path",
-        "bootstrap",
     ):
         if key in status_data:
             entry[key] = status_data[key]
+
+    status_bootstrap = status_data.get("bootstrap")
+    if isinstance(status_bootstrap, dict):
+        status_source = status_bootstrap.get("source_unit_id") or job.get("bootstrap_source")
+        status_stats = status_bootstrap.get("stats")
+        if status_stats is None and "source_unit_id" not in status_bootstrap:
+            status_stats = status_bootstrap
+        entry["bootstrap"] = _bootstrap_meta(status_source, status_stats)
+    elif bootstrap_meta:
+        entry["bootstrap"] = bootstrap_meta
 
     eta_sec = _compute_job_eta_sec(job, status_data)
     if eta_sec is not None:
         entry["eta_sec"] = eta_sec
 
     if job.get("kind") == "scan" and job.get("status") == "complete":
-        entry["hint"] = f"Call get_job_result('{unit_id}') for results"
+        try:
+            entry["result"] = _get_job_result(unit_id)
+        except McpError:
+            entry["result_available"] = False
+        else:
+            entry["result_available"] = True
+        entry["hint"] = "Poll binaries(jobs=True); completed scan jobs include result when available."
 
     return entry
 
@@ -1092,8 +1118,8 @@ async def _run_worker(path: Path, unit_id: str, profile: str, job: dict):
             "--project-dir", str(_server_config.project_dir or DEFAULT_PROJECT_DIR),
             "--jvm-heap", f"{heap_mb}m",
         ]
-        if job.get("bootstrap"):
-            cmd.extend(["--bootstrap", str(job["bootstrap"])])
+        if job.get("bootstrap_source"):
+            cmd.extend(["--bootstrap", str(job["bootstrap_source"])])
 
         if _server_config.ghidra_dir:
             cmd.extend(["--ghidra-dir", str(_server_config.ghidra_dir)])
@@ -1135,7 +1161,7 @@ async def _run_scan_task(job_id: str, job: dict, fn):
 
     Used by batch_search_strings(background=True) and extract_bunfs().
     On completion, job status transitions to "complete" and result is persisted to disk.
-    The model should poll analysis_status(unit_ids=[job_id]) then call get_job_result(job_id).
+    MCP clients should poll binaries(jobs=True); completed scan jobs include result data.
     """
     loop = asyncio.get_running_loop()
     job["status"] = "running"
@@ -1488,7 +1514,7 @@ async def load(
     """Import and analyze a binary file.
 
     For binaries under 10MB, blocks until analysis completes.
-    For binaries 10MB+, runs async - poll list(jobs=True) for progress.
+    For binaries 10MB+, runs async - poll binaries(jobs=True) and match unit_id.
 
     Args:
         path: Path to binary file.
@@ -1560,9 +1586,10 @@ async def load(
                     }
                     if bootstrap_source:
                         with _backend_lock:
-                            result["bootstrap"] = _apply_bootstrap_transfer(
+                            stats = _apply_bootstrap_transfer(
                                 get_backend(), bootstrap_source, h
                             )
+                        result["bootstrap"] = _bootstrap_meta(bootstrap_source, stats)
                     return result
 
         # Check disk: already analyzed by a previous import run? (outside lock)
@@ -1604,9 +1631,10 @@ async def load(
                         with _backend_lock:
                             dest_handle = _handle_by_unit_id(get_backend(), unit_id)
                             if dest_handle is not None:
-                                result["bootstrap"] = _apply_bootstrap_transfer(
+                                stats = _apply_bootstrap_transfer(
                                     get_backend(), bootstrap_source, dest_handle
                                 )
+                                result["bootstrap"] = _bootstrap_meta(bootstrap_source, stats)
                     return result
             except (json.JSONDecodeError, OSError):
                 pass
@@ -1616,7 +1644,7 @@ async def load(
             if not fresh and unit_id in _active_jobs:
                 job = _active_jobs[unit_id]
                 if job.get("status") not in ("complete", "error"):
-                    if bootstrap_source and job.get("bootstrap") != bootstrap_source:
+                    if bootstrap_source and job.get("bootstrap_source") != bootstrap_source:
                         raise McpError(ErrorData(
                             code=INVALID_PARAMS,
                             message=(
@@ -1629,7 +1657,7 @@ async def load(
                     entry["binary_name"] = p.name
                     entry["message"] = (
                         f"Analysis in progress ({file_size_mb:.0f}MB). "
-                        f"Poll with analysis_status(unit_ids=['{unit_id}'])"
+                        f"Poll binaries(jobs=True) and match unit_id='{unit_id}'"
                     )
                     return entry
                 # Terminal state stale entry: fall through and re-queue.
@@ -1643,7 +1671,7 @@ async def load(
                 "eta_sec": estimated,
                 "profile": profile,
                 "pid": None,
-                "bootstrap": bootstrap_source,
+                "bootstrap_source": bootstrap_source,
             }
             with _jobs_mutex:
                 _active_jobs[unit_id] = job
@@ -1656,11 +1684,12 @@ async def load(
                 "eta_sec": estimated,
                 "message": (
                     f"Binary is {file_size_mb:.0f}MB; analysis runs in background. "
-                    f"Poll with analysis_status(unit_ids=['{unit_id}'])"
+                    f"Poll binaries(jobs=True) and match unit_id='{unit_id}'"
                 ),
             }
-            if bootstrap_source:
-                result["bootstrap"] = bootstrap_source
+            bootstrap_meta = _bootstrap_meta(bootstrap_source)
+            if bootstrap_meta:
+                result["bootstrap"] = bootstrap_meta
             return result
 
     logger.info(f"Importing {p.name} ({kind}, {file_size_mb:.1f}MB) with profile={profile_enum.value}")
@@ -1715,8 +1744,9 @@ async def load(
             "capabilities": _format_capabilities(caps),
             "status": "ready",
         }
-        if bootstrap_stats:
-            result["bootstrap"] = bootstrap_stats
+        bootstrap_meta = _bootstrap_meta(bootstrap_source, bootstrap_stats)
+        if bootstrap_meta:
+            result["bootstrap"] = bootstrap_meta
         if handle.was_preexisting:
             result["note"] = "already_analyzed"
 
@@ -1776,7 +1806,7 @@ async def delete(name: str, ctx: Context) -> dict:
             if not candidates:
                 raise McpError(ErrorData(
                     code=INVALID_PARAMS,
-                    message=f"Not found: {name!r}. Use unit_id from list().",
+                    message=f"Not found: {name!r}. Use unit_id from binaries().",
                 ))
             if len(candidates) > 1:
                 raise McpError(ErrorData(
@@ -1886,7 +1916,7 @@ async def binaries(
         return results
 
     with _backend_lock:
-        return _guarded_tool_call("list", op)
+        return _guarded_tool_call("binaries", op)
 
 
 @mcp.tool()
@@ -2416,7 +2446,7 @@ async def search(
             return {
                 "job_id": job_id,
                 "status": "queued",
-                "hint": f"Poll: list(jobs=True). On complete: get results via list().",
+                "hint": "Poll binaries(jobs=True); completed scan jobs include result when available.",
             }
 
         results = tools.batch_search_strings(query, mode=mode, limit_per_query=limit)
@@ -2440,7 +2470,7 @@ async def search(
         return {
             "job_id": job_id,
             "status": "queued",
-            "hint": f"Poll: list(jobs=True). On complete: get results via list().",
+            "hint": "Poll binaries(jobs=True); completed scan jobs include result when available.",
         }
 
     if type == "blob":
@@ -2500,9 +2530,8 @@ async def search(
 # LEGACY TOOL ALIASES (hidden from model, route to consolidated tools)
 # =============================================================================
 
-# The old tool names are no longer registered as @mcp.tool() but can still
-# be called via the alias routing in consolidated.py. When list_tools is
-# called, only the 8 consolidated tools are returned.
+# The old tool names have been consolidated into the 8 public tools above.
+# Keep comments here in sync with the actual server implementation.
 
 
 # =============================================================================
@@ -2511,7 +2540,7 @@ async def search(
 # The following tools have been consolidated:
 # - import_binary, analyze_binary, reanalyze -> load
 # - delete_binary, cancel_analysis -> delete
-# - list_binaries, analysis_status, get_job_result -> list
+# - list_binaries, analysis_status, get_job_result -> binaries
 # - binary_info, triage_binary, elf_info, macho_info, swift_info, objc_info,
 #   hermes_info, detect_embedded_runtime, entropy_map, memory_map,
 #   elf_sections, macho_segments -> info
@@ -2800,16 +2829,19 @@ def import_cmd(binaries, profile, ghidra_dir, project_dir, runtime_home, jvm_hea
             )
 
             bootstrap_stats = None
+            bootstrap_meta = None
             if bootstrap:
                 current_phase = "bootstrap"
                 bootstrap_stats = _apply_bootstrap_transfer(backend, bootstrap, handle)
+                source_handle = _resolve_bootstrap_handle(backend, bootstrap)
+                bootstrap_meta = _bootstrap_meta(source_handle.unit_id, bootstrap_stats)
 
             caps = detect_capabilities(handle)
             cap_list = _format_capabilities(caps)
 
             func_count = handle.program.getFunctionManager().getFunctionCount()
             if not handle.was_preexisting:
-                listener.complete(func_count, cap_list, bootstrap=bootstrap_stats)
+                listener.complete(func_count, cap_list, bootstrap=bootstrap_meta)
 
             if handle.was_preexisting:
                 click.echo(f"  {path.name}: already analyzed "

@@ -609,7 +609,7 @@ class TestWorkerConfig:
         fake_path = tmp_path / "test.bin"
         fake_path.write_bytes(b"\x00" * (1024 * 1024))  # 1 MB dummy binary
 
-        job: dict = {"status": "queued", "pid": None, "bootstrap": "b" * 16}
+        job: dict = {"status": "queued", "pid": None, "bootstrap_source": "b" * 16}
         unit_id = "a" * 16
 
         async def run():
@@ -680,3 +680,36 @@ class TestBinariesLiveStatus:
         assert job_entries[0]["done"] == 25300
         assert job_entries[0]["elapsed_seconds"] == 700
         assert job_entries[0]["eta_sec"] == 425
+
+    def test_binaries_jobs_returns_completed_scan_result(self, tmp_path, monkeypatch):
+        """Completed scan jobs should expose persisted result.json via binaries(jobs=True)."""
+        backend = MagicMock()
+        backend.list_programs.return_value = []
+        backend.programs = {}
+        monkeypatch.setattr(server, "_backend", backend)
+        monkeypatch.setattr(server, "get_backend", lambda: backend)
+        monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=tmp_path))
+
+        old_jobs = server._active_jobs.copy()
+        server._active_jobs.clear()
+        try:
+            jid = "b" * 16
+            server._active_jobs[jid] = {
+                "kind": "scan",
+                "status": "complete",
+                "binary_name": "scan.bin",
+            }
+            result_dir = tmp_path / jid
+            result_dir.mkdir()
+            (result_dir / "result.json").write_text(json.dumps({"status": "complete", "results": {"foo": 3}}))
+
+            result = asyncio.run(server.binaries(ctx=MagicMock(), jobs=True))
+        finally:
+            server._active_jobs.clear()
+            server._active_jobs.update(old_jobs)
+
+        job_entries = [r for r in result if r.get("unit_id") == jid]
+        assert len(job_entries) == 1
+        assert job_entries[0]["result_available"] is True
+        assert job_entries[0]["result"]["results"]["foo"] == 3
+        assert "binaries(jobs=True)" in job_entries[0]["hint"]

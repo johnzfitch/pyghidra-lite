@@ -446,7 +446,8 @@ def test_load_forwards_bootstrap_to_import_blocking(
     result = asyncio.run(server.load(str(binary), DummyCtx(), bootstrap="source-bin"))
 
     assert captured["bootstrap"] == "a" * 16
-    assert result["bootstrap"]["transferred"] == 5
+    assert result["bootstrap"]["source_unit_id"] == "a" * 16
+    assert result["bootstrap"]["stats"]["transferred"] == 5
     assert result["binary_name"] == "sample.bin"
 
 
