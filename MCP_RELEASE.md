@@ -13,7 +13,7 @@ Complies with MCP Specification 2025-11-25.
 | Tools | 8 consolidated tools |
 | `tools/list_changed` notifications | Supported |
 | Resources | Binary metadata |
-| Transports | stdio (default), SSE |
+| Transports | stdio proxy (default), stdio direct, streamable-http, SSE |
 | Progress reporting | Supported |
 
 ## Tool Surface
@@ -52,17 +52,34 @@ Tool errors follow current MCP guidance:
 
 ## Transport Options
 
-### stdio (default)
+### stdio proxy (default)
 
-Each client gets an isolated session.
+The default mode runs a lightweight stdio proxy that forwards to a persistent shared HTTP backend. Multiple sessions share a single JVM (~10MB per proxy vs ~500MB per direct session).
+
+```bash
+pyghidra-lite          # stdio proxy, auto-starts backend
+pyghidra-lite stop     # stop the shared backend
+```
+
+The proxy auto-starts the backend on first use (`localhost:19101`) with a 30-minute idle timeout. A file lock prevents concurrent proxy starts from spawning duplicate backends.
+
+### stdio direct
+
+Each client gets its own JVM. Use for single-session workflows or debugging.
 
 ```bash
 pyghidra-lite serve
 ```
 
-### SSE
+### streamable-http
 
-Shared server for multiple agents.
+Persistent shared HTTP backend (what the proxy auto-starts). Use for systemd or manual management.
+
+```bash
+pyghidra-lite serve --transport streamable-http --port 19101
+```
+
+### SSE (legacy)
 
 ```bash
 pyghidra-lite serve --transport sse --port 8001
@@ -77,6 +94,7 @@ pyghidra-lite serve --transport sse --port 8001
 | `PYGHIDRA_LITE_DEFAULT_PROFILE` | Default `load()` profile (`fast`, `default`, `deep`) |
 | `PYGHIDRA_LITE_PROJECT_DIR` | Project storage directory |
 | `PYGHIDRA_LITE_RUNTIME_HOME` | Writable runtime home for Ghidra/JVM state |
+| `PYGHIDRA_LITE_NO_AUTOSTART` | Set to `1` to disable proxy auto-start of backend |
 
 ## Command Line Options
 

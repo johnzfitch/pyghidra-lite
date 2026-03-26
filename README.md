@@ -45,8 +45,7 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
 {
   "mcpServers": {
     "pyghidra-lite": {
-      "command": "pyghidra-lite",
-      "args": ["serve"]
+      "command": "pyghidra-lite"
     }
   }
 }
@@ -93,7 +92,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "pyghidra-lite": {
       "command": "uvx",
-      "args": ["pyghidra-lite", "serve"]
+      "args": ["pyghidra-lite"]
     }
   }
 }
@@ -106,7 +105,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "pyghidra-lite": {
       "command": "uvx",
-      "args": ["pyghidra-lite", "serve"],
+      "args": ["pyghidra-lite"],
       "env": {
         "GHIDRA_INSTALL_DIR": "/path/to/ghidra"
       }
@@ -118,6 +117,20 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 ### Claude Code
 
 Create `.mcp.json` in your project (or `~/.claude.json` for global):
+
+```json
+{
+  "mcpServers": {
+    "pyghidra-lite": {
+      "command": "pyghidra-lite"
+    }
+  }
+}
+```
+
+#### Direct mode (skip proxy)
+
+For single-session use or debugging, run the server directly:
 
 ```json
 {
@@ -245,6 +258,27 @@ pyghidra-lite is designed for minimal token usage:
 - **Opt-in detail** - use `info(detail="full")`, `code(cfg=True)`, or richer `type`/`what` modes only when needed
 - **Progress reporting** - large imports report progress every 10% or 60s
 - **Truncated strings** - long strings capped at 500 chars
+
+## Architecture
+
+By default, `pyghidra-lite` runs as a lightweight stdio proxy (~10MB) that forwards to a persistent shared HTTP backend (~500MB JVM). Multiple sessions share a single JVM instead of each spawning their own.
+
+```
+Claude Code session 1 ──stdio──> proxy ──┐
+Claude Code session 2 ──stdio──> proxy ──┼──HTTP──> shared backend (1 JVM)
+Claude Code session 3 ──stdio──> proxy ──┘        localhost:19101
+```
+
+The proxy auto-starts the backend on first use and the backend auto-exits after 30 minutes of idle. A file lock prevents concurrent proxy starts from spawning duplicate backends.
+
+| Command | What it does |
+|---------|-------------|
+| `pyghidra-lite` | Stdio proxy (default) -- auto-starts backend |
+| `pyghidra-lite serve` | Direct stdio server (1 JVM per session) |
+| `pyghidra-lite serve -t streamable-http` | Start persistent HTTP backend manually |
+| `pyghidra-lite stop` | Stop the shared backend |
+
+Set `PYGHIDRA_LITE_NO_AUTOSTART=1` to disable auto-start (useful with systemd).
 
 ## Multi-Agent Support
 
