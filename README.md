@@ -46,7 +46,7 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
   "mcpServers": {
     "pyghidra-lite": {
       "command": "pyghidra-lite",
-      "args": ["serve", "--allow-path", "/path/to/binaries"]
+      "args": ["serve"]
     }
   }
 }
@@ -57,7 +57,7 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
 ```
 You: Analyze the binary at /path/to/binaries/app
 
-Claude: [calls import_binary, list_functions, decompile...]
+Claude: [calls load, info, code...]
 ```
 
 ## Installation
@@ -93,7 +93,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "pyghidra-lite": {
       "command": "uvx",
-      "args": ["pyghidra-lite", "serve", "--allow-path", "~"]
+      "args": ["pyghidra-lite", "serve"]
     }
   }
 }
@@ -106,7 +106,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "pyghidra-lite": {
       "command": "uvx",
-      "args": ["pyghidra-lite", "serve", "--allow-path", "~"],
+      "args": ["pyghidra-lite", "serve"],
       "env": {
         "GHIDRA_INSTALL_DIR": "/path/to/ghidra"
       }
@@ -119,14 +119,12 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 Create `.mcp.json` in your project (or `~/.claude.json` for global):
 
-#### Basic (allow specific paths)
-
 ```json
 {
   "mcpServers": {
     "pyghidra-lite": {
       "command": "pyghidra-lite",
-      "args": ["serve", "--allow-path", "/home/user/binaries"]
+      "args": ["serve"]
     }
   }
 }
@@ -141,15 +139,16 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
       "command": "pyghidra-lite",
       "args": [
         "serve",
-        "--ghidra-dir", "/path/to/ghidra",
-        "--allow-path", "/home/user/binaries"
+        "--ghidra-dir", "/path/to/ghidra"
       ]
     }
   }
 }
 ```
 
-#### Multiple paths
+#### Restrict to specific paths
+
+By default, pyghidra-lite can load binaries from any path (the MCP client handles permissions). Use `--restrict-path` to lock down access:
 
 ```json
 {
@@ -158,104 +157,67 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
       "command": "pyghidra-lite",
       "args": [
         "serve",
-        "--allow-path", "/home/user/binaries",
-        "--allow-path", "/opt/targets"
+        "--restrict-path", "/home/user/binaries",
+        "--restrict-path", "/opt/targets"
       ]
     }
   }
 }
 ```
 
-#### Allow any path (development only)
+## Tools (8)
 
-```json
-{
-  "mcpServers": {
-    "pyghidra-lite": {
-      "command": "pyghidra-lite",
-      "args": ["serve", "--allow-any-path"]
-    }
-  }
-}
+pyghidra-lite provides 8 consolidated tools that auto-detect format (ELF/Mach-O/PE) and language (Swift/ObjC/Hermes):
+
+| Tool | Purpose | Key Parameters |
+|------|---------|----------------|
+| `load` | Import and analyze binary | `path`, `profile?`, `fresh?`, `bootstrap?`, `bootstrap_mode?` |
+| `delete` | Remove binary and cancel jobs | `name` |
+| `binaries` | List binaries + job status | `jobs?`, `rank_sources?` |
+| `info` | Binary overview | `binary`, `detail?` (summary/full/format/sections/entropy) |
+| `functions` | List/search functions | `binary`, `query?`, `type?` (all/swift/objc/imports/exports) |
+| `code` | Decompile or disassemble | `binary`, `target`, `what?` (decompile/asm), `cfg?` |
+| `xrefs` | References and call graphs | `binary`, `target`, `direction?`, `depth?`, `diff?` |
+| `search` | Find strings, bytes, symbols | `binary`, `query`, `type?`, `mode?`, `bg?` |
+
+### Examples
+
+```python
+# Import and analyze
+load("/path/to/binary", profile="fast")
+
+# Version-track from a prior build, including synthetic IDs for unnamed code
+load("/path/to/new.bin", profile="deep", bootstrap="old.bin", bootstrap_mode="all")
+
+# Get overview with full triage
+info("mybinary", detail="full")
+
+# List Swift functions
+functions("mybinary", type="swift")
+
+# Decompile with CFG
+code("mybinary", "main", cfg=True)
+
+# Search strings in background
+search("mybinary", ["password", "api_key"], bg=True)
+
+# Get cross-references
+xrefs("mybinary", "malloc", depth=2)
 ```
 
-## Tools
+### Auto-Detection
 
-### Core (3)
-| Tool | Description |
-|------|-------------|
-| `import_binary` | Import binary with async progress reporting |
-| `delete_binary` | Remove from project |
-| `reanalyze` | Re-run with different profile |
+All tools automatically detect:
+- **Format**: ELF, Mach-O, PE
+- **Language**: Swift, Objective-C, Hermes/React Native
+- **Runtime**: Bun, Node.js, Electron, PyInstaller
 
-### Discovery (4)
-| Tool | Description |
-|------|-------------|
-| `list_binaries` | List loaded binaries |
-| `list_functions` | Functions with metadata (compact by default) |
-| `list_imports` | Imports with capability tags |
-| `list_exports` | Exported symbols |
+Use the `type` and `detail` parameters to access format/language-specific features.
 
-### Analysis (8)
-| Tool | Description |
-|------|-------------|
-| `get_function_info` | Function metadata and callers/callees |
-| `disassemble` | Assembly for a function |
-| `decompile` | Pseudo-C with callees and strings |
-| `batch_decompile` | Decompile multiple functions |
-| `get_xrefs` | Cross-references |
-| `get_callees` | What a function calls |
-| `call_graph` | Call graph with configurable depth |
-| `memory_map` | Memory layout with permissions |
+### Bootstrap Modes
 
-### Search (2)
-| Tool | Description |
-|------|-------------|
-| `search_strings` | Strings with xrefs |
-| `search_symbols` | Symbol name search |
-
-### Data (2)
-| Tool | Description |
-|------|-------------|
-| `read_bytes` | Raw memory |
-| `read_string` | Null-terminated string |
-
-### ELF (4)
-| Tool | Description |
-|------|-------------|
-| `elf_info` | ELF structure summary |
-| `elf_sections` | ELF sections |
-| `elf_symbols` | ELF symbols |
-| `elf_got_plt` | GOT/PLT entries |
-
-### Mach-O (3)
-| Tool | Description |
-|------|-------------|
-| `macho_info` | Mach-O structure summary |
-| `macho_segments` | Segments and sections |
-| `macho_dylibs` | Linked dylibs |
-
-### Swift (4)
-| Tool | Description |
-|------|-------------|
-| `swift_functions` | Swift functions (demangled) |
-| `swift_types` | Swift types from metadata |
-| `swift_decompile` | Decompile with demangled names |
-| `demangle` | Swift symbol demangling |
-
-### Objective-C (3)
-| Tool | Description |
-|------|-------------|
-| `objc_classes` | Objective-C classes |
-| `objc_methods` | Objective-C methods |
-| `objc_decompile` | Method decompile |
-
-### Hermes (3)
-| Tool | Description |
-|------|-------------|
-| `hermes_info` | Hermes bundle summary |
-| `hermes_components` | React component names |
-| `hermes_endpoints` | API endpoints/URLs |
+- `bootstrap_mode="named"`: transfer only meaningful source names (default).
+- `bootstrap_mode="all"`: also assign stable synthetic labels to source `FUN_*` functions during transfer, which is useful for large version-to-version bootstrap workflows where uniqueness matters more than semantics.
 
 ## Analysis Profiles
 
@@ -265,22 +227,22 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
 | `default` | Balanced, full Ghidra analysis |
 | `deep` | Thorough analysis for obfuscated code |
 
-The server defaults to `fast` to stay within MCP timeout limits. Use `reanalyze` to run deeper analysis when needed:
+The server defaults to `fast` to stay within MCP timeout limits. Use `load(fresh=True)` to run deeper analysis when needed:
 
 ```python
 # Default import uses fast profile
-import_binary("/path/to/binary")
+load("/path/to/binary")
 
-# Re-analyze with deep profile when you need more detail
-reanalyze("binary-name", profile="deep")
+# Re-analyze with deep profile
+load("/path/to/binary", profile="deep", fresh=True)
 ```
 
 ## Token Efficiency
 
 pyghidra-lite is designed for minimal token usage:
 
-- **Compact output by default** - `list_functions` returns minimal fields
-- **Opt-in verbosity** - pass `compact=false` for full metadata
+- **Compact output by default** - `functions(binary, type="all")` returns minimal `{name, addr}` pairs
+- **Opt-in detail** - use `info(detail="full")`, `code(cfg=True)`, or richer `type`/`what` modes only when needed
 - **Progress reporting** - large imports report progress every 10% or 60s
 - **Truncated strings** - long strings capped at 500 chars
 

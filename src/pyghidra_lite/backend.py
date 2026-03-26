@@ -1,6 +1,7 @@
 """PyGhidra backend - manages Ghidra context and program analysis."""
 
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -32,6 +33,20 @@ _GHIDRA_SEARCH_PATHS = [
     "/usr/local/share/ghidra",
     Path.home() / "ghidra",
 ]
+
+
+def make_analysis_id(unit_id: str, profile: "AnalysisProfile | str") -> str:
+    """Return a profile-scoped analysis identifier for a binary."""
+    profile_value = profile.value if isinstance(profile, AnalysisProfile) else str(profile)
+    return f"{unit_id}-{profile_value}"
+
+
+def parse_analysis_id(value: str) -> tuple[str, str] | None:
+    """Parse a profile-scoped analysis identifier."""
+    for suffix in ("-fast", "-default", "-deep"):
+        if value.endswith(suffix):
+            return value[:-len(suffix)], suffix[1:]
+    return None
 
 
 def find_ghidra_install(hint: Path | str | None = None) -> Path | None:
@@ -121,6 +136,11 @@ class ProgramHandle:
     was_preexisting: bool = False  # True if the Ghidra project already existed on disk
     metadata: dict = field(default_factory=dict)
 
+    @property
+    def analysis_id(self) -> str:
+        """Profile-scoped identifier for this specific analysis."""
+        return make_analysis_id(self.unit_id, self.profile)
+
     def get_provenance(self) -> Provenance:
         """Get provenance info for this program."""
         from pyghidra_lite import __version__
@@ -204,37 +224,61 @@ class GhidraBackend:
         else:
             logger.info("Backend ready (lazy loading enabled).")
 
-    def _get_or_create_project_for_binary(self, unit_id: str) -> "GhidraProject":
-        """Get or create a Ghidra project for a specific binary (by unit_id)."""
+    def _project_status(self, project_key: str) -> dict:
+        """Read .analysis_status for a project directory."""
+        status_file = self.project_dir / project_key / ".analysis_status"
+        if not status_file.exists():
+            return {}
+        try:
+            return json.loads(status_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _resolve_project_key(self, unit_id: str, profile: AnalysisProfile) -> str:
+        """Return the on-disk project directory name for this binary/profile."""
+        analysis_id = make_analysis_id(unit_id, profile)
+        if (self.project_dir / analysis_id).exists():
+            return analysis_id
+
+        legacy_dir = self.project_dir / unit_id
+        if legacy_dir.exists():
+            legacy_status = self._project_status(unit_id)
+            legacy_profile = legacy_status.get("profile", AnalysisProfile.FAST.value)
+            if legacy_profile == profile.value:
+                return unit_id
+
+        return analysis_id
+
+    def _get_or_create_project_for_key(self, project_key: str) -> "GhidraProject":
+        """Get or create a Ghidra project for a specific on-disk project key."""
         from ghidra.base.project import GhidraProject
         from ghidra.framework.model import ProjectLocator
 
-        # Use unit_id as project name for isolation
-        project_path = self.project_dir / unit_id
+        project_path = self.project_dir / project_key
         project_path.mkdir(exist_ok=True, parents=True)
         project_str = str(project_path.absolute())
 
-        locator = ProjectLocator(project_str, unit_id)
+        locator = ProjectLocator(project_str, project_key)
         try:
             if locator.exists():
-                logger.debug(f"Opening existing project: {unit_id}")
-                return GhidraProject.openProject(project_str, unit_id, True)
+                logger.debug(f"Opening existing project: {project_key}")
+                return GhidraProject.openProject(project_str, project_key, True)
             else:
-                logger.info(f"Creating new project: {unit_id}")
-                return GhidraProject.createProject(project_str, unit_id, False)
+                logger.info(f"Creating new project: {project_key}")
+                return GhidraProject.createProject(project_str, project_key, False)
         except Exception as e:
             if "LockException" in str(type(e).__name__) or "Unable to lock" in str(e):
-                lock_file = project_path / f"{unit_id}.lock"
-                logger.warning(f"Stale lock detected for {unit_id}, removing: {lock_file}")
+                lock_file = project_path / f"{project_key}.lock"
+                logger.warning(f"Stale lock detected for {project_key}, removing: {lock_file}")
                 lock_file.unlink(missing_ok=True)
                 try:
                     if locator.exists():
-                        return GhidraProject.openProject(project_str, unit_id, True)
+                        return GhidraProject.openProject(project_str, project_key, True)
                     else:
-                        return GhidraProject.createProject(project_str, unit_id, False)
+                        return GhidraProject.createProject(project_str, project_key, False)
                 except Exception as retry_e:
                     raise RuntimeError(
-                        f"Binary {unit_id} still locked after removing stale lock.\n"
+                        f"Binary {project_key} still locked after removing stale lock.\n"
                         f"Original: {e}\nRetry: {retry_e}\n"
                         f"Try manually deleting: {lock_file}"
                     ) from retry_e
@@ -249,14 +293,24 @@ class GhidraBackend:
             if not project_path.is_dir():
                 continue
 
-            unit_id = project_path.name
+            project_key = project_path.name
+            status = self._project_status(project_key)
+            parsed = parse_analysis_id(project_key)
+            if parsed is not None:
+                unit_id, profile_value = parsed
+            else:
+                unit_id = project_key
+                profile_value = status.get("profile", self.default_profile.value)
+            profile = AnalysisProfile(profile_value)
+            analysis_id = make_analysis_id(unit_id, profile)
+
             # Check if it's a valid Ghidra project (has .gpr file)
-            if not (project_path / f"{unit_id}.gpr").exists():
+            if not (project_path / f"{project_key}.gpr").exists():
                 continue
 
             try:
-                project = self._get_or_create_project_for_binary(unit_id)
-                self._projects[unit_id] = project
+                project = self._get_or_create_project_for_key(project_key)
+                self._projects[analysis_id] = project
 
                 # Load programs from this project
                 root_folder = project.getRootFolder()
@@ -265,13 +319,18 @@ class GhidraBackend:
                         prog_name = domain_file.getName()
                         try:
                             program = project.openProgram("/", prog_name, False)
-                            handle = self._init_program_handle(program, prog_name, unit_id=unit_id)
+                            handle = self._init_program_handle(
+                                program,
+                                prog_name,
+                                profile=profile,
+                                unit_id=unit_id,
+                            )
                             self.programs[prog_name] = handle
                             logger.info(f"Loaded: {prog_name}")
                         except Exception as e:
                             logger.warning(f"Failed to load {prog_name}: {e}")
             except Exception as e:
-                logger.warning(f"Failed to load project {unit_id}: {e}")
+                logger.warning(f"Failed to load project {project_key}: {e}")
 
     def _init_program_handle(
         self,
@@ -300,7 +359,9 @@ class GhidraBackend:
             # Try project directory name (the canonical source for per-binary projects)
             locator = program.getDomainFile().getProjectLocator()
             if locator:
-                unit_id = Path(str(locator.getProjectDir())).name
+                project_key = Path(str(locator.getProjectDir())).name
+                parsed = parse_analysis_id(project_key)
+                unit_id = parsed[0] if parsed is not None else project_key
             else:
                 unit_id = "unknown"
 
@@ -324,12 +385,16 @@ class GhidraBackend:
         Safe to call even if the binary is not currently loaded. Used by
         import_binary(fresh=True) and can also be called directly for cleanup.
         """
+        self._purge_analysis(unit_id)
+
+    def _purge_analysis(self, analysis_id: str) -> None:
+        """Evict one specific analysis profile from memory and disk."""
         import shutil
 
-        # Close all in-memory program handles for this unit_id
-        to_remove = [name for name, h in self.programs.items() if h.unit_id == unit_id]
-        if unit_id in self._projects:
-            project = self._projects[unit_id]
+        # Close all in-memory program handles for this analysis_id
+        to_remove = [name for name, h in self.programs.items() if h.analysis_id == analysis_id]
+        if analysis_id in self._projects:
+            project = self._projects[analysis_id]
             for name in to_remove:
                 try:
                     project.close(self.programs[name].program)
@@ -339,15 +404,29 @@ class GhidraBackend:
                 project.close()
             except Exception:
                 pass
-            del self._projects[unit_id]
+            del self._projects[analysis_id]
         for name in to_remove:
             del self.programs[name]
 
-        # Wipe the on-disk project directory so the next import starts clean
-        project_path = self.project_dir / unit_id
+        # Wipe the on-disk project directory so the next import starts clean.
+        # Legacy fallback (pre-v0.5.0): projects stored under {unit_id}/
+        # instead of {unit_id}-{profile}/. Check if a legacy directory matches
+        # the requested profile. Safe to remove after v1.0.
+        project_key = analysis_id
+        parsed = parse_analysis_id(analysis_id)
+        if not (self.project_dir / project_key).exists() and parsed is not None:
+            legacy_key = parsed[0]
+            legacy_dir = self.project_dir / legacy_key
+            if legacy_dir.exists():
+                legacy_status = self._project_status(legacy_key)
+                if legacy_status.get("profile", AnalysisProfile.FAST.value) == parsed[1]:
+                    project_key = legacy_key
+        project_path = self.project_dir / project_key
         if project_path.exists():
-            shutil.rmtree(project_path, ignore_errors=True)
-            logger.info("Purged project for unit_id=%s", unit_id)
+            def _rmtree_warn(func, path, exc_info):
+                logger.warning("rmtree failed on %s: %s", path, exc_info[1])
+            shutil.rmtree(project_path, onerror=_rmtree_warn)
+            logger.info("Purged project for analysis_id=%s", analysis_id)
 
     def import_binary(
         self,
@@ -383,33 +462,44 @@ class GhidraBackend:
 
         # Generate unique ID using streaming hash (memory-efficient)
         unit_id = compute_unit_id_streaming(path)
+        analysis_id = make_analysis_id(unit_id, profile)
+        project_key = self._resolve_project_key(unit_id, profile)
 
         if fresh:
-            self._purge_binary(unit_id)
+            self._purge_analysis(analysis_id)
 
         # Check if already imported (bypassed when fresh since we just purged)
         if not fresh:
             for handle in self.programs.values():
-                if handle.unit_id == unit_id:
-                    logger.info("Program already imported (unit_id match): %s", handle.name)
+                if handle.analysis_id == analysis_id:
+                    logger.info("Program already imported (analysis_id match): %s", handle.name)
                     return handle
 
-        prog_name = f"{path.name}-{unit_id[:8]}"
+        prog_name = f"{path.name}-{unit_id[:8]}-{profile.value}"
 
         # Get or create project for this binary
-        if unit_id not in self._projects:
-            project = self._get_or_create_project_for_binary(unit_id)
-            self._projects[unit_id] = project
+        if analysis_id not in self._projects:
+            project = self._get_or_create_project_for_key(project_key)
+            self._projects[analysis_id] = project
         else:
-            project = self._projects[unit_id]
+            project = self._projects[analysis_id]
 
         # Check if program already exists in this binary's project
         root_folder = project.getRootFolder()
         program_existed = root_folder.getFile(prog_name) is not None
+        existing_name = prog_name
+        # Legacy migration (pre-v0.5.0): projects created before profile-scoped
+        # naming may have a single program whose name doesn't match the new
+        # {stem}-{profile} scheme. Reuse it if it's the only program present.
+        if not program_existed:
+            existing_files = [f.getName() for f in root_folder.getFiles() if str(f.getContentType()) == "Program"]
+            if len(existing_files) == 1:
+                existing_name = existing_files[0]
+                program_existed = True
 
         if program_existed:
-            logger.info(f"Opening existing program: {prog_name}")
-            program = project.openProgram("/", prog_name, False)
+            logger.info(f"Opening existing program: {existing_name}")
+            program = project.openProgram("/", existing_name, False)
         else:
             logger.info(f"Importing: {prog_name}")
             program = project.importProgram(path)
@@ -418,11 +508,11 @@ class GhidraBackend:
             program.name = prog_name
             project.saveAs(program, "/", prog_name, True)
 
-        handle = self._init_program_handle(program, prog_name, profile, unit_id=unit_id)
+        handle = self._init_program_handle(program, existing_name if program_existed else prog_name, profile, unit_id=unit_id)
         handle.analyzed = program_existed
         handle.was_preexisting = program_existed
         handle.file_path = path
-        self.programs[prog_name] = handle
+        self.programs[handle.name] = handle
 
         if analyze and not program_existed:
             self.analyze_program(prog_name, profile, on_progress=on_progress)
@@ -501,8 +591,8 @@ class GhidraBackend:
             handle.program.endTransaction(tx_id, tx_success)
             GhidraScriptUtil.releaseBundleHostReference()
             # Save to the binary's project
-            if tx_success and handle.unit_id in self._projects:
-                self._projects[handle.unit_id].save(handle.program)
+            if tx_success and handle.analysis_id in self._projects:
+                self._projects[handle.analysis_id].save(handle.program)
 
         handle.analyzed = True
         handle.profile = profile
@@ -527,7 +617,9 @@ class GhidraBackend:
         Only executable memory blocks are searched (avoids false matches in data
         sections). A name is transferred only when the byte pattern appears exactly
         once in the destination and the matching address is an unambiguously-named
-        (FUN_*) function entry point.
+        (FUN_*) function entry point. When ``label_fun_star`` is enabled, source
+        FUN_* names are converted into synthetic bootstrap labels instead of being
+        skipped, which allows version-to-version transfer even for unnamed code.
 
         Args:
             source_name: Name of the already-analyzed reference binary.
@@ -562,8 +654,12 @@ class GhidraBackend:
             "source": source_handle.name,
             "dest": dest_handle.name,
             "candidates": 0,
+            "semantic_candidates": 0,
+            "synthetic_candidates": 0,
             "matched_unique": 0,
             "transferred": 0,
+            "semantic_transferred": 0,
+            "synthetic_transferred": 0,
             "skipped_multi_match": 0,
             "skipped_no_match": 0,
             "skipped_already_named": 0,
@@ -576,6 +672,7 @@ class GhidraBackend:
         for func in source_fm.getFunctions(True):
             name = func.getName()
             entry = func.getEntryPoint()
+            synthetic_name = False
 
             # Build transfer label
             if name.startswith("FUN_") or name.startswith("thunk_FUN_"):
@@ -584,6 +681,7 @@ class GhidraBackend:
                 # Stable cross-version label: prefix + source address
                 prefix = fun_star_prefix or "fn"
                 transfer_name = f"{prefix}_{entry.toString().upper()}"
+                synthetic_name = True
             else:
                 transfer_name = name
 
@@ -593,6 +691,10 @@ class GhidraBackend:
                 continue
 
             stats["candidates"] += 1
+            if synthetic_name:
+                stats["synthetic_candidates"] += 1
+            else:
+                stats["semantic_candidates"] += 1
 
             # Read function bytes from source
             buf = JByte[size]
@@ -648,15 +750,19 @@ class GhidraBackend:
                 stats["skipped_already_named"] += 1
                 continue
 
-            transfers.append((dest_func, transfer_name))
+            transfers.append((dest_func, transfer_name, synthetic_name))
 
         # Apply all renames in a single transaction
         tx_id = dest_handle.program.startTransaction("transfer_analysis")
         try:
-            for dest_func, name in transfers:
+            for dest_func, name, synthetic_name in transfers:
                 try:
                     dest_func.setName(name, SourceType.ANALYSIS)
                     stats["transferred"] += 1
+                    if synthetic_name:
+                        stats["synthetic_transferred"] += 1
+                    else:
+                        stats["semantic_transferred"] += 1
                 except Exception:
                     stats["errors"] += 1
             dest_handle.program.endTransaction(tx_id, True)
@@ -665,8 +771,8 @@ class GhidraBackend:
             raise
 
         # Persist to project
-        if dest_handle.unit_id in self._projects:
-            self._projects[dest_handle.unit_id].save(dest_handle.program)
+        if dest_handle.analysis_id in self._projects:
+            self._projects[dest_handle.analysis_id].save(dest_handle.program)
 
         logger.info(
             "transfer_analysis: %d/%d names transferred (%d multi-match, %d no-match)",
@@ -762,10 +868,10 @@ class GhidraBackend:
             return False
 
         handle = self.programs[name]
-        unit_id = handle.unit_id
+        analysis_id = handle.analysis_id
 
-        if unit_id in self._projects:
-            project = self._projects[unit_id]
+        if analysis_id in self._projects:
+            project = self._projects[analysis_id]
             try:
                 df = handle.program.getDomainFile()
                 project.close(handle.program)
@@ -774,11 +880,11 @@ class GhidraBackend:
                 logger.info(f"Deleted: {name}")
 
                 # If this was the last program in the project, close it
-                remaining = [p for p in self.programs.values() if p.unit_id == unit_id]
+                remaining = [p for p in self.programs.values() if p.analysis_id == analysis_id]
                 if not remaining:
                     project.close()
-                    del self._projects[unit_id]
-                    logger.debug(f"Closed empty project: {unit_id}")
+                    del self._projects[analysis_id]
+                    logger.debug(f"Closed empty project: {analysis_id}")
 
                 return True
             except Exception as e:
@@ -795,8 +901,8 @@ class GhidraBackend:
         # Close all programs
         for name, handle in list(self.programs.items()):
             try:
-                if handle.unit_id in self._projects:
-                    self._projects[handle.unit_id].close(handle.program)
+                if handle.analysis_id in self._projects:
+                    self._projects[handle.analysis_id].close(handle.program)
             except Exception as e:
                 logger.warning(f"Error closing {name}: {e}")
 

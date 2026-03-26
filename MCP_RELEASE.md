@@ -1,36 +1,71 @@
 # MCP Technical Reference
 
-Technical details for MCP server implementation and integration.
+Technical reference for the pyghidra-lite MCP server.
 
 ## Protocol Compliance
 
-Complies with [MCP Specification 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25).
+Complies with MCP Specification 2025-11-25.
 
 | Feature | Status |
 |---------|--------|
 | JSON-RPC 2.0 | Supported |
 | Capability negotiation | Supported |
-| Tools | 40+ tools |
+| Tools | 8 consolidated tools |
+| `tools/list_changed` notifications | Supported |
 | Resources | Binary metadata |
 | Transports | stdio (default), SSE |
 | Progress reporting | Supported |
+
+## Tool Surface
+
+pyghidra-lite exposes these public MCP tools:
+
+| Tool | Purpose | Key constrained parameters |
+|------|---------|----------------------------|
+| `load` | Import/analyze a binary | `profile=fast|default|deep`, `bootstrap_mode=named|all` |
+| `delete` | Remove a binary/project/job | `name` |
+| `binaries` | List loaded, queued, and on-disk binaries | `jobs`, `rank_sources` |
+| `info` | First-contact triage and metadata | `detail=summary|full|format|sections|entropy` |
+| `functions` | List/search functions and symbol views | `type=all|swift|objc|imports|exports|types|got|dylibs` |
+| `code` | Decompile, disassemble, or read raw bytes/strings | `what=decompile|asm|bytes|string` |
+| `xrefs` | Callers, callees, call graphs, symbol diff | `direction=to|from`, `depth<=5`, batch target max 20 |
+| `search` | Strings, symbols, byte patterns, bulk discovery | `type=strings|symbols|bytes|all|blob|extract`, `mode=indexed|deep` |
+
+All enum/range constraints are published in the MCP input schema so `tools/list` is precise for agents.
+
+## Error Handling
+
+Tool errors follow current MCP guidance:
+
+- Schema/request-shape problems are handled by FastMCP validation.
+- Semantic input validation and business-rule failures are surfaced as tool execution errors with `isError: true`.
+- The server avoids using JSON-RPC `INVALID_PARAMS` for normal tool-level validation like ambiguous binary names, unsupported enum values, or invalid bootstrap combinations.
+
+## Progress Reporting
+
+`load()` reports progress for blocking imports and automatically delegates large binaries to background analysis:
+
+- Binaries smaller than 10 MB block until analysis completes
+- Binaries 10 MB and larger return quickly with `status="queued"` and a `unit_id`
+- Progress/results are available through `binaries(jobs=True)`
+- Blocking imports report progress every 10% or every 60 seconds
 
 ## Transport Options
 
 ### stdio (default)
 
-Each agent gets isolated session. No configuration needed.
+Each client gets an isolated session.
 
 ```bash
-pyghidra-lite --allow-path /path/to/binaries
+pyghidra-lite serve
 ```
 
-### SSE (Server-Sent Events)
+### SSE
 
-Shared server for multiple agents. Reduces process overhead.
+Shared server for multiple agents.
 
 ```bash
-pyghidra-lite --transport sse --port 8001 --allow-path /path/to/binaries
+pyghidra-lite serve --transport sse --port 8001
 ```
 
 ## Environment Variables
@@ -38,89 +73,45 @@ pyghidra-lite --transport sse --port 8001 --allow-path /path/to/binaries
 | Variable | Description |
 |----------|-------------|
 | `GHIDRA_INSTALL_DIR` | Path to Ghidra installation (optional, auto-detected) |
-| `PYGHIDRA_LITE_ALLOWED_PATHS` | Colon-separated allowed paths |
-| `PYGHIDRA_LITE_ALLOW_ANY_PATH` | Set to `1` to allow any path |
+| `PYGHIDRA_LITE_RESTRICT_PATHS` | Colon-separated path restrictions (unrestricted if unset) |
+| `PYGHIDRA_LITE_DEFAULT_PROFILE` | Default `load()` profile (`fast`, `default`, `deep`) |
+| `PYGHIDRA_LITE_PROJECT_DIR` | Project storage directory |
+| `PYGHIDRA_LITE_RUNTIME_HOME` | Writable runtime home for Ghidra/JVM state |
 
 ## Command Line Options
 
-```
-pyghidra-lite [OPTIONS] [BINARIES...]
+```text
+pyghidra-lite serve [OPTIONS] [BINARIES...]
 
 Options:
   --ghidra-dir DIR       Ghidra installation directory (overrides env var)
-  --allow-path PATH      Allow imports from PATH (repeatable)
-  --allow-any-path       Allow imports from any path
+  --restrict-path PATH   Restrict imports to PATH (repeatable, unrestricted if unset)
   --transport TYPE       Transport: stdio (default) or sse
   --port PORT            SSE server port (default: 8000)
   --profile PROFILE      Default analysis profile: fast/default/deep
   --project-dir DIR      Ghidra project directory
   --project-name NAME    Ghidra project name
+  --runtime-home DIR     Writable runtime home for Ghidra state
   --verbose              Enable debug logging
   --version              Show version
   --help                 Show help
 ```
 
-## Ghidra Detection
-
-The server locates Ghidra using this resolution order:
-
-1. `--ghidra-dir` CLI flag (highest priority)
-2. `GHIDRA_INSTALL_DIR` environment variable
-3. Common installation paths: `/opt/ghidra`, `/usr/share/ghidra`, `/usr/local/share/ghidra`, `~/ghidra`
-4. Versioned installs in `/opt/`, `/usr/local/share/`, `~/` (e.g. `ghidra_11.3.1`)
-
-A directory is valid if it contains `Ghidra/application.properties`.
-
-## Tool Categories
-
-Tools are capability-gated based on binary format:
-
-| Capability | Detected When | Tools Enabled |
-|------------|---------------|---------------|
-| `elf` | ELF magic bytes | `elf_*` |
-| `macho` | Mach-O magic bytes | `macho_*` |
-| `swift` | `__swift5_*` sections | `swift_*`, `demangle` |
-| `objc` | `__objc_*` sections | `objc_*` |
-| `hermes` | Hermes bytecode header | `hermes_*` |
-
-## Progress Reporting
-
-`import_binary` reports progress for large binaries:
-
-- Updates sent every 10% progress OR every 60 seconds
-- Phases: Loading -> Importing -> Analyzing -> Detecting capabilities -> Complete
-- Prevents agent timeouts without token spam
-
 ## Project Structure
 
-```
+```text
 ~/.local/share/pyghidra-lite/
 └── projects/
-    └── {unit_id}/           # SHA256 hash prefix
-        ├── {unit_id}.gpr    # Ghidra project file
-        └── {unit_id}.rep/   # Analysis repository
+    └── {unit_id}/
+        ├── {unit_id}.gpr
+        ├── {unit_id}.rep/
+        ├── .analysis_status
+        └── result.json        # scan job results when applicable
 ```
 
-- **Content-addressed**: Same binary content = same project
-- **Per-binary isolation**: No cross-binary lock contention
-- **Persistent**: Analysis survives process restarts
+Properties:
 
-## Error Codes
-
-| Code | Meaning |
-|------|---------|
-| `-32602` | Invalid parameters (bad path, unknown profile) |
-| `-32603` | Internal error (Ghidra failure, analysis timeout) |
-| `-32001` | Binary not found or not imported |
-| `-32002` | Function not found |
-
-## Token Optimization
-
-Default behavior minimizes tokens:
-
-| Tool | Default | Verbose Flag |
-|------|---------|--------------|
-| `list_functions` | name, address only | `compact=false` |
-| `list_exports` | name, address only | `compact=false` |
-| `import_binary` | no tool list | `list_tools=true` |
-| `decompile` | code only | `include_callees=true` |
+- Content-addressed by binary content
+- Per-binary project isolation
+- Persistent across restarts
+- Auto-hot-load of completed on-disk projects when referenced by tools

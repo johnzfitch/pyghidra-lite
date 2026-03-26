@@ -1,40 +1,40 @@
+import asyncio
 import os
 from pathlib import Path
 
 import pytest
-from mcp.shared.exceptions import McpError
-from mcp.types import INVALID_PARAMS
+from mcp import types
 
 from pyghidra_lite import server
 
 
-def test_resolve_import_path_requires_allowlist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = server.ServerConfig(allowed_paths=[], allow_any_path=False)
+def test_resolve_import_path_unrestricted_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = server.ServerConfig()
     monkeypatch.setattr(server, "_server_config", config)
     target = tmp_path / "sample.bin"
 
-    with pytest.raises(ValueError):
-        server._resolve_import_path(str(target))
+    resolved = server._resolve_import_path(str(target))
+    assert resolved == target.resolve()
 
 
-def test_resolve_import_path_allows_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_import_path_allows_restricted_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "root"
     root.mkdir()
     target = root / "sample.bin"
-    config = server.ServerConfig(allowed_paths=[root])
+    config = server.ServerConfig(restrict_paths=[root])
     monkeypatch.setattr(server, "_server_config", config)
 
     resolved = server._resolve_import_path(str(target))
     assert resolved == target.resolve()
 
 
-def test_resolve_import_path_blocks_outside_root(
+def test_resolve_import_path_blocks_outside_restricted_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "root"
     root.mkdir()
     target = tmp_path / "other.bin"
-    config = server.ServerConfig(allowed_paths=[root])
+    config = server.ServerConfig(restrict_paths=[root])
     monkeypatch.setattr(server, "_server_config", config)
 
     with pytest.raises(ValueError):
@@ -52,7 +52,7 @@ def test_resolve_import_path_reports_symlink_target(
     target.touch()
     link = root / "link.bin"
     link.symlink_to(target)
-    config = server.ServerConfig(allowed_paths=[root])
+    config = server.ServerConfig(restrict_paths=[root])
     monkeypatch.setattr(server, "_server_config", config)
 
     with pytest.raises(ValueError) as exc:
@@ -62,7 +62,6 @@ def test_resolve_import_path_reports_symlink_target(
     assert "requested=" in msg
     assert "resolves_to=" in msg
     assert str(link.resolve()) in msg
-    assert "--allow-path" in msg
 
 
 def test_ensure_runtime_environment_sets_user_home_and_xdg(
@@ -92,19 +91,16 @@ def test_upsert_jvm_option_preserves_existing_flags(monkeypatch: pytest.MonkeyPa
     assert "-Xmx4g" in opts
 
 
-def test_guarded_tool_call_maps_invalid_params() -> None:
+def test_guarded_tool_call_preserves_validation_errors() -> None:
     def op():
         raise ValueError("bad")
 
-    with pytest.raises(McpError) as exc:
+    with pytest.raises(ValueError, match="bad"):
         server._guarded_tool_call("test", op)
 
-    error = getattr(exc.value, "error", None) or getattr(exc.value, "data", None)
-    assert error is not None
-    assert error.code == INVALID_PARAMS
 
-
-def test_available_tools_expands_for_capabilities() -> None:
+def test_available_tools_always_returns_8_consolidated() -> None:
+    """After consolidation, _available_tools always returns the same 8 tools."""
     caps = server.BinaryCapabilities(
         name="sample",
         is_elf=True,
@@ -115,47 +111,144 @@ def test_available_tools_expands_for_capabilities() -> None:
     )
 
     tools = server._available_tools(caps)
-    for tool in ("elf_info", "macho_info", "swift_functions", "objc_classes", "hermes_info"):
-        assert tool in tools
+    # Format/language-specific features are now accessed via parameters
+    # (info(detail="format"), functions(type="swift"), etc.)
+    expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"}
+    assert set(tools) == expected
+
+
+def test_load_tool_schema_exposes_bootstrap_mode_enum() -> None:
+    """load tool should publish bootstrap_mode as an enum in its MCP schema."""
+    tool = server.mcp._tool_manager._tools["load"]
+    schema = tool.parameters
+    bootstrap_mode = schema["properties"]["bootstrap_mode"]
+
+    assert bootstrap_mode["type"] == "string"
+    assert bootstrap_mode["default"] == "named"
+    assert bootstrap_mode["enum"] == ["named", "all"]
+
+
+def test_tool_schemas_publish_enum_and_bounds() -> None:
+    """MCP tool schemas should expose constrained enums and numeric/list bounds."""
+    info_schema = server.mcp._tool_manager._tools["info"].parameters
+    functions_schema = server.mcp._tool_manager._tools["functions"].parameters
+    code_schema = server.mcp._tool_manager._tools["code"].parameters
+    xrefs_schema = server.mcp._tool_manager._tools["xrefs"].parameters
+    search_schema = server.mcp._tool_manager._tools["search"].parameters
+
+    assert info_schema["properties"]["detail"]["enum"] == [
+        "summary", "full", "format", "sections", "entropy"
+    ]
+    assert functions_schema["properties"]["type"]["enum"] == [
+        "all", "swift", "objc", "imports", "exports", "types", "got", "dylibs"
+    ]
+    assert code_schema["properties"]["what"]["enum"] == ["decompile", "asm", "bytes", "string"]
+    assert xrefs_schema["properties"]["direction"]["enum"] == ["to", "from"]
+    assert xrefs_schema["properties"]["depth"]["maximum"] == 5
+    assert xrefs_schema["properties"]["target"]["anyOf"][1]["maxItems"] == 20
+    assert search_schema["required"] == ["binary", "query"]
+    assert search_schema["properties"]["type"]["enum"] == [
+        "strings", "symbols", "bytes", "all", "blob", "extract"
+    ]
+    assert search_schema["properties"]["mode"]["enum"] == ["indexed", "deep"]
+
+
+def test_load_validation_failure_returns_mcp_tool_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Semantic tool failures should surface as CallToolResult(isError=True)."""
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELFvalidation")
+
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig())
+    handler = server.mcp._mcp_server.request_handlers[types.CallToolRequest]
+
+    req = types.CallToolRequest(
+        method="tools/call",
+        params=types.CallToolRequestParams(
+            name="load",
+            arguments={"path": str(binary), "bootstrap_mode": "all"},
+        ),
+    )
+
+    result = asyncio.run(handler(req)).root
+
+    assert result.isError is True
+    assert "bootstrap_mode requires bootstrap" in result.content[0].text
+
+
+def test_load_deep_bootstrap_keeps_existing_fast_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requesting a deep analysis should not reuse or delete an existing fast cache."""
+    from unittest.mock import MagicMock
+
+    class DummyCtx:
+        async def report_progress(self, *_args):
+            return None
+
+    binary = tmp_path / "2.1.74"
+    binary.write_bytes(b"\x7fELF" + b"\0" * (11 * 1024 * 1024))
+
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(
+        project_dir=tmp_path / "projects",
+    ))
+    monkeypatch.setattr(server, "_backend", MagicMock())
+
+    unit_id = server.compute_unit_id_streaming(binary)
+    fast_project = server._server_config.project_dir / unit_id
+    fast_project.mkdir(parents=True)
+    (fast_project / ".analysis_status").write_text(
+        '{"status":"complete","binary_name":"2.1.74","profile":"fast","functions":10}'
+    )
+    (fast_project / f"{unit_id}.gpr").touch()
+
+    created = []
+
+    def _capture_task(coro):
+        created.append(coro)
+        coro.close()
+        return MagicMock()
+
+    monkeypatch.setattr(asyncio, "create_task", _capture_task)
+    monkeypatch.setattr(server, "_normalize_bootstrap_source", lambda *_args: "1e5c1011ec899ef0-deep")
+
+    result = asyncio.run(
+        server.load(
+            str(binary),
+            DummyCtx(),
+            profile="deep",
+            bootstrap="2.1.70-1e5c1011-deep",
+        )
+    )
+
+    assert result["status"] == "queued"
+    assert result["unit_id"] == unit_id
+    assert result["analysis_id"] == f"{unit_id}-deep"
+    assert result["bootstrap"]["source_analysis_id"] == "1e5c1011ec899ef0-deep"
+    assert fast_project.exists(), "existing fast project should remain untouched"
+    assert len(created) == 1, "deep analysis should queue a new worker instead of reusing fast cache"
 
 
 # =============================================================================
 # Tests added for 0.4.0 features
 # =============================================================================
 
-def test_available_tools_includes_new_base_tools() -> None:
+def test_available_tools_returns_8_consolidated() -> None:
+    """_available_tools returns the 8 consolidated tools (always the same)."""
     caps = server.BinaryCapabilities(name="sample")
     tools = server._available_tools(caps)
-    for tool in (
-        "binary_info", "triage_binary", "find_bytes", "entropy_map",
-        "function_context", "batch_xrefs", "search_all",
-    ):
-        assert tool in tools, f"Expected '{tool}' in base available_tools"
+    expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"}
+    assert set(tools) == expected
 
 
-def test_available_tools_includes_diff_symbols_not_in_per_binary_list() -> None:
-    # diff_symbols operates on two binaries; not in per-binary available_tools list,
-    # but must be registered as an MCP tool.
-    caps = server.BinaryCapabilities(name="sample")
-    tools = server._available_tools(caps)
-    # diff_symbols is a separate server-level tool, not per-binary
-    # so it correctly should NOT appear in _available_tools
-    # (it's documented separately). Just check it's registered in the server.
-    assert hasattr(server, "diff_symbols")
-
-
-def test_available_tools_includes_swift_info_for_swift() -> None:
-    caps = server.BinaryCapabilities(name="sample", has_swift=True)
-    tools = server._available_tools(caps)
-    assert "swift_info" in tools
-    assert "swift_functions" in tools  # granular tool preserved
-
-
-def test_available_tools_includes_objc_info_for_objc() -> None:
-    caps = server.BinaryCapabilities(name="sample", has_objc=True)
-    tools = server._available_tools(caps)
-    assert "objc_info" in tools
-    assert "objc_classes" in tools  # granular tool preserved
+def test_available_tools_ignores_capabilities() -> None:
+    """All 8 tools are available regardless of capabilities (auto-detection)."""
+    caps_minimal = server.BinaryCapabilities(name="sample")
+    caps_full = server.BinaryCapabilities(
+        name="sample", is_elf=True, has_swift=True, has_objc=True
+    )
+    assert server._available_tools(caps_minimal) == server._available_tools(caps_full)
 
 
 def test_format_capabilities_stays_lowercase() -> None:
@@ -233,17 +326,12 @@ def test_find_bytes_handles_uppercase_0X_prefix() -> None:
     assert result == []
 
 
-def test_available_tools_includes_v0_5_tools() -> None:
-    """Regression: v0.5.0 layer-aware tools must be in the base available_tools list."""
-    caps = server.BinaryCapabilities(name="sample")
-    tools = server._available_tools(caps)
-    for tool in (
-        "detect_embedded_runtime",
-        "search_strings_deep",
-        "batch_search_strings",
-        "extract_strings_from_blob",
-    ):
-        assert tool in tools, f"Expected '{tool}' in base available_tools"
+def test_consolidated_tools_cover_v0_5_features() -> None:
+    """v0.5.0 layer-aware features are now in 'search' and 'info' consolidated tools."""
+    tools = server.mcp._tool_manager._tools
+    # search handles: detect_embedded_runtime (via info), search_strings_deep, batch_search_strings
+    assert "search" in tools
+    assert "info" in tools
 
 
 def test_no_deprecated_get_event_loop() -> None:
@@ -253,7 +341,7 @@ def test_no_deprecated_get_event_loop() -> None:
         server.server_lifespan,
         server._run_worker,
         server._hot_load,
-        server.import_binary,
+        server.load,  # Consolidated tool replacing import_binary
     ]
     for fn in fns:
         src = inspect.getsource(fn)
@@ -275,19 +363,26 @@ def test_file_consolidation_lang_importable() -> None:
     assert demangle_swift is not None
 
 
-def test_total_tool_count_at_least_53() -> None:
-    """Sanity check: 49 existing + 4 new (v0.5.0) = 53 total tools."""
+def test_total_tool_count_is_8() -> None:
+    """Tool consolidation: 58 tools -> 8 consolidated tools."""
     import re
     src = open("src/pyghidra_lite/server.py").read()
     count = len(re.findall(r"^@mcp\.tool\(\)", src, re.MULTILINE))
-    assert count >= 53, f"Expected >= 53 @mcp.tool() decorators, found {count}"
+    assert count == 8, f"Expected exactly 8 @mcp.tool() decorators, found {count}"
 
 
 # =============================================================================
 # Tests added for 0.5.1 bootstrap / version-tracking fixes (PR #8 follow-up)
 # =============================================================================
 
-def _make_mock_handle(name: str, unit_id: str, named: int, total: int, analyzed: bool = True):
+def _make_mock_handle(
+    name: str,
+    unit_id: str,
+    named: int,
+    total: int,
+    analyzed: bool = True,
+    synthetic: int = 0,
+):
     """Build a minimal mock ProgramHandle for bootstrap tests (no JVM)."""
     from unittest.mock import MagicMock
 
@@ -306,7 +401,11 @@ def _make_mock_handle(name: str, unit_id: str, named: int, total: int, analyzed:
             f = MagicMock()
             f.getName.return_value = f"real_func_{i}"
             funcs.append(f)
-        for i in range(total - named):
+        for i in range(synthetic):
+            f = MagicMock()
+            f.getName.return_value = f"{server._BOOTSTRAP_AUTO_PREFIX}_{i:08X}"
+            funcs.append(f)
+        for i in range(total - named - synthetic):
             f = MagicMock()
             f.getName.return_value = f"FUN_{i:08x}"
             funcs.append(f)
@@ -318,7 +417,7 @@ def _make_mock_handle(name: str, unit_id: str, named: int, total: int, analyzed:
 
 
 def test_rank_bootstrap_sources_sorted_descending(monkeypatch: pytest.MonkeyPatch) -> None:
-    """rank_bootstrap_sources (via _rank_sources_blocking) returns list sorted by named_functions desc."""
+    """rank_bootstrap_sources sorts by transferable_functions descending."""
     from unittest.mock import MagicMock
 
     handle_a = _make_mock_handle("claude-old", "a" * 16, named=800, total=1000)
@@ -334,11 +433,13 @@ def test_rank_bootstrap_sources_sorted_descending(monkeypatch: pytest.MonkeyPatc
 
     assert len(result) == 2
     assert result[0]["name"] == "claude-old"
+    assert result[0]["transferable_functions"] == 800
     assert result[0]["named_functions"] == 800
     assert result[1]["name"] == "claude-new"
+    assert result[1]["transferable_functions"] == 200
     assert result[1]["named_functions"] == 200
     # Descending order
-    assert result[0]["named_functions"] >= result[1]["named_functions"]
+    assert result[0]["transferable_functions"] >= result[1]["transferable_functions"]
 
 
 def test_rank_bootstrap_sources_excludes_dest(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -372,6 +473,202 @@ def test_rank_bootstrap_sources_named_pct(monkeypatch: pytest.MonkeyPatch) -> No
 
     result = server._rank_sources_blocking()
     assert result[0]["named_pct"] == 25.0
+    assert result[0]["transferable_pct"] == 25.0
+
+
+def test_rank_bootstrap_sources_counts_synthetic_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Synthetic bootstrap labels improve transferability without inflating named_functions."""
+    from unittest.mock import MagicMock
+
+    handle = _make_mock_handle("binary", "a" * 16, named=2, synthetic=3, total=10)
+    backend = MagicMock()
+    backend.programs = {"a" * 16: handle}
+    monkeypatch.setattr(server, "_backend", backend)
+    monkeypatch.setattr(server, "get_backend", lambda: backend)
+
+    result = server._rank_sources_blocking()
+
+    assert result[0]["named_functions"] == 2
+    assert result[0]["synthetic_bootstrap_functions"] == 3
+    assert result[0]["transferable_functions"] == 5
+    assert result[0]["named_pct"] == 20.0
+    assert result[0]["transferable_pct"] == 50.0
+
+
+def test_apply_bootstrap_transfer_calls_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_apply_bootstrap_transfer should call backend.transfer_analysis with resolved handles."""
+    from unittest.mock import MagicMock
+
+    source = MagicMock()
+    source.name = "source-prog"
+    source.unit_id = "a" * 16
+    source.analyzed = True
+
+    dest = MagicMock()
+    dest.name = "dest-prog"
+    dest.unit_id = "b" * 16
+    dest.analyzed = True
+
+    backend = MagicMock()
+    backend.transfer_analysis.return_value = {"transferred": 7}
+
+    monkeypatch.setattr(server, "_resolve_bootstrap_handle", lambda _backend, _bootstrap: source)
+
+    result = server._apply_bootstrap_transfer(backend, "source", dest)
+
+    assert result["transferred"] == 7
+    assert result["mode"] == "named"
+    backend.transfer_analysis.assert_called_once_with(
+        "source-prog",
+        "dest-prog",
+        label_fun_star=False,
+        fun_star_prefix=server._BOOTSTRAP_AUTO_PREFIX,
+    )
+
+
+def test_apply_bootstrap_transfer_all_mode_labels_fun_star(monkeypatch: pytest.MonkeyPatch) -> None:
+    """all mode should request synthetic labels for FUN_* source functions."""
+    from unittest.mock import MagicMock
+
+    source = MagicMock()
+    source.name = "source-prog"
+    source.unit_id = "a" * 16
+    source.analyzed = True
+
+    dest = MagicMock()
+    dest.name = "dest-prog"
+    dest.unit_id = "b" * 16
+    dest.analyzed = True
+
+    backend = MagicMock()
+    backend.transfer_analysis.return_value = {"transferred": 7}
+
+    monkeypatch.setattr(server, "_resolve_bootstrap_handle", lambda _backend, _bootstrap: source)
+
+    result = server._apply_bootstrap_transfer(backend, "source", dest, mode="all")
+
+    assert result["mode"] == "all"
+    assert result["synthetic_prefix"] == server._BOOTSTRAP_AUTO_PREFIX
+    backend.transfer_analysis.assert_called_once_with(
+        "source-prog",
+        "dest-prog",
+        label_fun_star=True,
+        fun_star_prefix=server._BOOTSTRAP_AUTO_PREFIX,
+    )
+
+
+def test_apply_bootstrap_transfer_rejects_same_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bootstrap source and destination must be different binaries."""
+    from unittest.mock import MagicMock
+
+    source = MagicMock()
+    source.name = "same-prog"
+    source.unit_id = "a" * 16
+    source.analyzed = True
+
+    dest = MagicMock()
+    dest.name = "same-prog"
+    dest.unit_id = "a" * 16
+    dest.analyzed = True
+
+    backend = MagicMock()
+
+    monkeypatch.setattr(server, "_resolve_bootstrap_handle", lambda _backend, _bootstrap: source)
+
+    with pytest.raises(ValueError, match="bootstrap source must differ"):
+        server._apply_bootstrap_transfer(backend, "source", dest)
+
+
+def test_load_forwards_bootstrap_to_import_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """load() should pass the canonical bootstrap source and mode into the blocking import path."""
+    from unittest.mock import MagicMock
+
+    class DummyCtx:
+        async def report_progress(self, *_args):
+            return None
+
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELFbootstrap")
+
+    handle = MagicMock()
+    handle.name = "sample.bin-12345678"
+    handle.unit_id = "b" * 16
+    handle.was_preexisting = False
+
+    caps = server.BinaryCapabilities(name=handle.name, is_elf=True)
+    captured: dict[str, str | None] = {}
+
+    def fake_do_import_blocking(
+        p,
+        profile_enum,
+        analyze,
+        tracker,
+        fresh=False,
+        bootstrap=None,
+        bootstrap_mode="named",
+    ):
+        captured["bootstrap"] = bootstrap
+        captured["bootstrap_mode"] = bootstrap_mode
+        return handle, caps, {"transferred": 5, "mode": bootstrap_mode}
+
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig())
+    monkeypatch.setattr(server, "_backend", MagicMock())
+    monkeypatch.setattr(server, "_normalize_bootstrap_source", lambda _bootstrap, _dest: "a" * 16)
+    monkeypatch.setattr(server, "_do_import_blocking", fake_do_import_blocking)
+
+    result = asyncio.run(
+        server.load(
+            str(binary),
+            DummyCtx(),
+            bootstrap="source-bin",
+            bootstrap_mode="all",
+        )
+    )
+
+    assert captured["bootstrap"] == "a" * 16
+    assert captured["bootstrap_mode"] == "all"
+    assert result["bootstrap"]["source_unit_id"] == "a" * 16
+    assert result["bootstrap"]["stats"]["transferred"] == 5
+    assert result["bootstrap"]["mode"] == "all"
+    assert result["binary_name"] == "sample.bin"
+
+
+def test_load_rejects_bootstrap_mode_without_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """load() should reject non-default bootstrap_mode when bootstrap is absent."""
+
+    class DummyCtx:
+        async def report_progress(self, *_args):
+            return None
+
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELForphaned-mode")
+
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig())
+
+    with pytest.raises(ValueError, match="bootstrap_mode requires bootstrap"):
+        asyncio.run(server.load(str(binary), DummyCtx(), bootstrap_mode="all"))
+
+
+def test_load_rejects_invalid_bootstrap_mode_even_without_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """load() should validate bootstrap_mode regardless of whether bootstrap is set."""
+
+    class DummyCtx:
+        async def report_progress(self, *_args):
+            return None
+
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELFinvalid-mode")
+
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig())
+
+    with pytest.raises(ValueError, match="Invalid bootstrap_mode"):
+        asyncio.run(server.load(str(binary), DummyCtx(), bootstrap_mode="garbage"))
 
 
 def test_kill_job_acquires_jobs_mutex() -> None:
@@ -401,10 +698,10 @@ def test_kill_job_sends_sigterm(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (99999, server.signal.SIGTERM) in signals_sent
 
 
-def test_delete_binary_ambiguous_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """delete_binary raises INVALID_PARAMS when multiple handles share the substring."""
+def test_delete_ambiguous_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """delete should reject ambiguous partial matches."""
+    import asyncio
     from unittest.mock import MagicMock
-    from mcp.types import INVALID_PARAMS
 
     handle_a = MagicMock()
     handle_a.name = "claude-aaaaaaaaaaaaaaa1"
@@ -419,14 +716,9 @@ def test_delete_binary_ambiguous_raises(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(server, "_backend", backend)
     monkeypatch.setattr(server, "get_backend", lambda: backend)
 
-    config = server.ServerConfig(allow_any_path=True)
+    config = server.ServerConfig()
     monkeypatch.setattr(server, "_server_config", config)
 
-    with pytest.raises(McpError) as exc:
+    with pytest.raises(ValueError, match="Ambiguous"):
         # "claude" is a substring of both handle names
-        server.delete_binary("claude", None)
-
-    error = getattr(exc.value, "error", None) or getattr(exc.value, "data", None)
-    assert error is not None
-    assert error.code == INVALID_PARAMS
-    assert "Ambiguous" in error.message
+        asyncio.run(server.delete("claude", None))
