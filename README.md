@@ -46,7 +46,7 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
   "mcpServers": {
     "pyghidra-lite": {
       "command": "pyghidra-lite",
-      "args": ["serve", "--allow-path", "/path/to/binaries"]
+      "args": ["serve"]
     }
   }
 }
@@ -93,7 +93,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "pyghidra-lite": {
       "command": "uvx",
-      "args": ["pyghidra-lite", "serve", "--allow-path", "~"]
+      "args": ["pyghidra-lite", "serve"]
     }
   }
 }
@@ -106,7 +106,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "pyghidra-lite": {
       "command": "uvx",
-      "args": ["pyghidra-lite", "serve", "--allow-path", "~"],
+      "args": ["pyghidra-lite", "serve"],
       "env": {
         "GHIDRA_INSTALL_DIR": "/path/to/ghidra"
       }
@@ -119,14 +119,12 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 Create `.mcp.json` in your project (or `~/.claude.json` for global):
 
-#### Basic (allow specific paths)
-
 ```json
 {
   "mcpServers": {
     "pyghidra-lite": {
       "command": "pyghidra-lite",
-      "args": ["serve", "--allow-path", "/home/user/binaries"]
+      "args": ["serve"]
     }
   }
 }
@@ -141,15 +139,16 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
       "command": "pyghidra-lite",
       "args": [
         "serve",
-        "--ghidra-dir", "/path/to/ghidra",
-        "--allow-path", "/home/user/binaries"
+        "--ghidra-dir", "/path/to/ghidra"
       ]
     }
   }
 }
 ```
 
-#### Multiple paths
+#### Restrict to specific paths
+
+By default, pyghidra-lite can load binaries from any path (the MCP client handles permissions). Use `--restrict-path` to lock down access:
 
 ```json
 {
@@ -158,22 +157,9 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
       "command": "pyghidra-lite",
       "args": [
         "serve",
-        "--allow-path", "/home/user/binaries",
-        "--allow-path", "/opt/targets"
+        "--restrict-path", "/home/user/binaries",
+        "--restrict-path", "/opt/targets"
       ]
-    }
-  }
-}
-```
-
-#### Allow any path (development only)
-
-```json
-{
-  "mcpServers": {
-    "pyghidra-lite": {
-      "command": "pyghidra-lite",
-      "args": ["serve", "--allow-any-path"]
     }
   }
 }

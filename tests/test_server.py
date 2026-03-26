@@ -8,33 +8,33 @@ from mcp import types
 from pyghidra_lite import server
 
 
-def test_resolve_import_path_requires_allowlist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = server.ServerConfig(allowed_paths=[], allow_any_path=False)
+def test_resolve_import_path_unrestricted_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = server.ServerConfig()
     monkeypatch.setattr(server, "_server_config", config)
     target = tmp_path / "sample.bin"
 
-    with pytest.raises(ValueError):
-        server._resolve_import_path(str(target))
+    resolved = server._resolve_import_path(str(target))
+    assert resolved == target.resolve()
 
 
-def test_resolve_import_path_allows_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_import_path_allows_restricted_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "root"
     root.mkdir()
     target = root / "sample.bin"
-    config = server.ServerConfig(allowed_paths=[root])
+    config = server.ServerConfig(restrict_paths=[root])
     monkeypatch.setattr(server, "_server_config", config)
 
     resolved = server._resolve_import_path(str(target))
     assert resolved == target.resolve()
 
 
-def test_resolve_import_path_blocks_outside_root(
+def test_resolve_import_path_blocks_outside_restricted_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "root"
     root.mkdir()
     target = tmp_path / "other.bin"
-    config = server.ServerConfig(allowed_paths=[root])
+    config = server.ServerConfig(restrict_paths=[root])
     monkeypatch.setattr(server, "_server_config", config)
 
     with pytest.raises(ValueError):
@@ -52,7 +52,7 @@ def test_resolve_import_path_reports_symlink_target(
     target.touch()
     link = root / "link.bin"
     link.symlink_to(target)
-    config = server.ServerConfig(allowed_paths=[root])
+    config = server.ServerConfig(restrict_paths=[root])
     monkeypatch.setattr(server, "_server_config", config)
 
     with pytest.raises(ValueError) as exc:
@@ -62,7 +62,6 @@ def test_resolve_import_path_reports_symlink_target(
     assert "requested=" in msg
     assert "resolves_to=" in msg
     assert str(link.resolve()) in msg
-    assert "--allow-path" in msg
 
 
 def test_ensure_runtime_environment_sets_user_home_and_xdg(
@@ -161,7 +160,7 @@ def test_load_validation_failure_returns_mcp_tool_error(
     binary = tmp_path / "sample.bin"
     binary.write_bytes(b"\x7fELFvalidation")
 
-    monkeypatch.setattr(server, "_server_config", server.ServerConfig(allow_any_path=True))
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig())
     handler = server.mcp._mcp_server.request_handlers[types.CallToolRequest]
 
     req = types.CallToolRequest(
@@ -192,7 +191,6 @@ def test_load_deep_bootstrap_keeps_existing_fast_project(
     binary.write_bytes(b"\x7fELF" + b"\0" * (11 * 1024 * 1024))
 
     monkeypatch.setattr(server, "_server_config", server.ServerConfig(
-        allow_any_path=True,
         project_dir=tmp_path / "projects",
     ))
     monkeypatch.setattr(server, "_backend", MagicMock())
@@ -615,7 +613,7 @@ def test_load_forwards_bootstrap_to_import_blocking(
         captured["bootstrap_mode"] = bootstrap_mode
         return handle, caps, {"transferred": 5, "mode": bootstrap_mode}
 
-    monkeypatch.setattr(server, "_server_config", server.ServerConfig(allow_any_path=True))
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig())
     monkeypatch.setattr(server, "_backend", MagicMock())
     monkeypatch.setattr(server, "_normalize_bootstrap_source", lambda _bootstrap, _dest: "a" * 16)
     monkeypatch.setattr(server, "_do_import_blocking", fake_do_import_blocking)
@@ -649,7 +647,7 @@ def test_load_rejects_bootstrap_mode_without_bootstrap(
     binary = tmp_path / "sample.bin"
     binary.write_bytes(b"\x7fELForphaned-mode")
 
-    monkeypatch.setattr(server, "_server_config", server.ServerConfig(allow_any_path=True))
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig())
 
     with pytest.raises(ValueError, match="bootstrap_mode requires bootstrap"):
         asyncio.run(server.load(str(binary), DummyCtx(), bootstrap_mode="all"))
@@ -667,7 +665,7 @@ def test_load_rejects_invalid_bootstrap_mode_even_without_bootstrap(
     binary = tmp_path / "sample.bin"
     binary.write_bytes(b"\x7fELFinvalid-mode")
 
-    monkeypatch.setattr(server, "_server_config", server.ServerConfig(allow_any_path=True))
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig())
 
     with pytest.raises(ValueError, match="Invalid bootstrap_mode"):
         asyncio.run(server.load(str(binary), DummyCtx(), bootstrap_mode="garbage"))
@@ -718,7 +716,7 @@ def test_delete_ambiguous_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "_backend", backend)
     monkeypatch.setattr(server, "get_backend", lambda: backend)
 
-    config = server.ServerConfig(allow_any_path=True)
+    config = server.ServerConfig()
     monkeypatch.setattr(server, "_server_config", config)
 
     with pytest.raises(ValueError, match="Ambiguous"):

@@ -14,7 +14,7 @@
       "version": "0.4.0",
       "transport": {
         "type": "stdio",
-        "args": ["serve"]
+        "args": []
       },
       "runtimeHint": "python",
       "environmentVariables": [

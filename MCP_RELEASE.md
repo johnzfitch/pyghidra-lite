@@ -57,7 +57,7 @@ Tool errors follow current MCP guidance:
 Each client gets an isolated session.
 
 ```bash
-pyghidra-lite serve --allow-path /path/to/binaries
+pyghidra-lite serve
 ```
 
 ### SSE
@@ -65,7 +65,7 @@ pyghidra-lite serve --allow-path /path/to/binaries
 Shared server for multiple agents.
 
 ```bash
-pyghidra-lite serve --transport sse --port 8001 --allow-path /path/to/binaries
+pyghidra-lite serve --transport sse --port 8001
 ```
 
 ## Environment Variables
@@ -73,8 +73,7 @@ pyghidra-lite serve --transport sse --port 8001 --allow-path /path/to/binaries
 | Variable | Description |
 |----------|-------------|
 | `GHIDRA_INSTALL_DIR` | Path to Ghidra installation (optional, auto-detected) |
-| `PYGHIDRA_LITE_ALLOWED_PATHS` | Colon-separated allowed paths |
-| `PYGHIDRA_LITE_ALLOW_ANY_PATH` | Set to `1` to allow any path |
+| `PYGHIDRA_LITE_RESTRICT_PATHS` | Colon-separated path restrictions (unrestricted if unset) |
 | `PYGHIDRA_LITE_DEFAULT_PROFILE` | Default `load()` profile (`fast`, `default`, `deep`) |
 | `PYGHIDRA_LITE_PROJECT_DIR` | Project storage directory |
 | `PYGHIDRA_LITE_RUNTIME_HOME` | Writable runtime home for Ghidra/JVM state |
@@ -86,8 +85,7 @@ pyghidra-lite serve [OPTIONS] [BINARIES...]
 
 Options:
   --ghidra-dir DIR       Ghidra installation directory (overrides env var)
-  --allow-path PATH      Allow imports from PATH (repeatable)
-  --allow-any-path       Allow imports from any path
+  --restrict-path PATH   Restrict imports to PATH (repeatable, unrestricted if unset)
   --transport TYPE       Transport: stdio (default) or sse
   --port PORT            SSE server port (default: 8000)
   --profile PROFILE      Default analysis profile: fast/default/deep

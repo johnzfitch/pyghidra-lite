@@ -166,16 +166,15 @@ class ServerConfig:
     default_profile: AnalysisProfile = AnalysisProfile.FAST
     ghidra_dir: Path | None = None
     runtime_home: Path | None = None
-    allow_any_path: bool = False
-    allowed_paths: list[Path] = field(default_factory=list)
+    restrict_paths: list[Path] = field(default_factory=list)
     shared: bool = False  # True for SSE (shared server), False for stdio (isolated)
     autopurge_days: int | None = None  # Delete projects not opened in N days (None = off)
 
-    def resolved_allowed_paths(self) -> list[Path]:
-        """Return de-duplicated, resolved allowlist roots."""
+    def resolved_restrict_paths(self) -> list[Path]:
+        """Return de-duplicated, resolved restrict roots (empty = unrestricted)."""
         roots = []
         seen = set()
-        for path in self.allowed_paths:
+        for path in self.restrict_paths:
             resolved = path.expanduser().resolve()
             if resolved not in seen:
                 roots.append(resolved)
@@ -248,10 +247,8 @@ def _load_config_from_env() -> ServerConfig:
             config.default_profile = AnalysisProfile(default_profile)
         except ValueError:
             logger.warning("Ignoring invalid PYGHIDRA_LITE_DEFAULT_PROFILE=%s", default_profile)
-    if allow_any := os.getenv("PYGHIDRA_LITE_ALLOW_ANY_PATH"):
-        config.allow_any_path = _parse_bool(allow_any)
-    if allowed_paths := os.getenv("PYGHIDRA_LITE_ALLOWED_PATHS"):
-        config.allowed_paths.extend(Path(p) for p in allowed_paths.split(os.pathsep) if p)
+    if restrict_paths := os.getenv("PYGHIDRA_LITE_RESTRICT_PATHS"):
+        config.restrict_paths.extend(Path(p) for p in restrict_paths.split(os.pathsep) if p)
     return config
 
 
@@ -265,8 +262,7 @@ def configure_server(
     default_profile: AnalysisProfile | None = None,
     ghidra_dir: Path | None = None,
     runtime_home: Path | None = None,
-    allow_any_path: bool | None = None,
-    allowed_paths: list[Path] | None = None,
+    restrict_paths: list[Path] | None = None,
     shared: bool | None = None,
     autopurge_days: int | None = None,
 ) -> None:
@@ -282,10 +278,8 @@ def configure_server(
         _server_config.ghidra_dir = ghidra_dir
     if runtime_home is not None:
         _server_config.runtime_home = runtime_home
-    if allow_any_path is not None:
-        _server_config.allow_any_path = allow_any_path
-    if allowed_paths:
-        _server_config.allowed_paths.extend(allowed_paths)
+    if restrict_paths:
+        _server_config.restrict_paths.extend(restrict_paths)
     if shared is not None:
         _server_config.shared = shared
     if autopurge_days is not None:
@@ -383,29 +377,25 @@ def _init_backend(eager_load: bool = False) -> GhidraBackend:
 
 
 def _resolve_import_path(path: str) -> Path:
-    """Resolve and enforce allowlist policy for imports."""
+    """Resolve and optionally enforce restrict-path policy for imports."""
     requested = Path(path).expanduser()
     resolved = requested.resolve()
-    config = _server_config
-    if config.allow_any_path:
+    restrict_roots = _server_config.resolved_restrict_paths()
+    if not restrict_roots:
         return resolved
-    allowed_roots = config.resolved_allowed_paths()
-    if not allowed_roots:
-        raise ValueError("No allowed paths configured")
-    for root in allowed_roots:
+    for root in restrict_roots:
         try:
             if resolved.is_relative_to(root):
                 return resolved
         except ValueError:
             continue
-    roots = ", ".join(str(root) for root in allowed_roots)
+    roots = ", ".join(str(root) for root in restrict_roots)
     if requested != resolved:
         raise ValueError(
             f"Path not allowed: requested={requested}, resolves_to={resolved}. "
-            f"Allowed: {roots}. If this is an intentional symlink, add an allow root "
-            f"for the resolved target with --allow-path."
+            f"Restricted to: {roots}."
         )
-    raise ValueError(f"Path not allowed: {resolved}. Allowed: {roots}")
+    raise ValueError(f"Path not allowed: {resolved}. Restricted to: {roots}")
 
 
 def _iter_disk_status():
@@ -3073,13 +3063,77 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
 # CLI
 # =============================================================================
 
+
+def _run_with_idle_timeout(mcp_server, idle_minutes: int) -> None:
+    """Run streamable-http server with auto-exit on idle.
+
+    Wraps the Starlette app with middleware that tracks last-request time,
+    then runs a background watchdog that exits after idle_minutes of silence.
+    """
+    import threading
+    import uvicorn
+
+    last_request = time.time()
+    lock = threading.Lock()
+
+    class IdleTracker:
+        """ASGI middleware that bumps the last-request timestamp."""
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            nonlocal last_request
+            if scope["type"] == "http":
+                with lock:
+                    last_request = time.time()
+            return await self.app(scope, receive, send)
+
+    def watchdog(server: uvicorn.Server):
+        timeout_sec = idle_minutes * 60
+        # Wait for server to finish starting before checking
+        while not server.started:
+            time.sleep(0.1)
+        while server.started:
+            time.sleep(30)
+            with lock:
+                idle_sec = time.time() - last_request
+            if idle_sec >= timeout_sec:
+                logger.info(
+                    "Idle for %d minutes, shutting down.",
+                    idle_minutes,
+                )
+                server.should_exit = True
+                return
+
+    starlette_app = mcp_server.streamable_http_app()
+    wrapped = IdleTracker(starlette_app)
+
+    config = uvicorn.Config(
+        wrapped,
+        host=mcp_server.settings.host,
+        port=mcp_server.settings.port,
+        log_level=mcp_server.settings.log_level.lower(),
+    )
+    server = uvicorn.Server(config)
+
+    watcher = threading.Thread(target=watchdog, args=(server,), daemon=True)
+    watcher.start()
+
+    # anyio.run is used by FastMCP internally; replicate here
+    import anyio
+    anyio.run(server.serve)
+
 class DefaultGroup(click.Group):
-    """Routes unrecognized first args to the 'serve' subcommand for backward compat."""
+    """Routes bare invocations to the 'proxy' subcommand (lightweight auto-start)."""
 
     _group_flags = frozenset({"-v", "--version", "--help", "-h"})
 
     def parse_args(self, ctx, args):
-        if args and args[0] not in self.commands and args[0] not in self._group_flags:
+        if not args:
+            args = ["proxy"]
+        elif args[0] not in self.commands and args[0] not in self._group_flags:
+            # Backward compat: unknown args (e.g. --transport, binary paths)
+            # route to serve
             args = ["serve"] + args
         return super().parse_args(ctx, args)
 
@@ -3094,9 +3148,9 @@ def cli():
 @click.option(
     "-t",
     "--transport",
-    type=click.Choice(["stdio", "sse"]),
+    type=click.Choice(["stdio", "sse", "streamable-http"]),
     default="stdio",
-    help="Transport: stdio only (sse disabled)",
+    help="Transport: stdio (per-session), sse (legacy), or streamable-http (shared HTTP)",
 )
 @click.option("-p", "--port", type=int, default=8000)
 @click.option("--host", type=str, default="127.0.0.1")
@@ -3116,16 +3170,11 @@ def cli():
     help="Directory used for Ghidra runtime state (JAVA user.home and XDG fallback).",
 )
 @click.option(
-    "--allow-path",
-    "allow_paths",
+    "--restrict-path",
+    "restrict_paths",
     type=click.Path(path_type=Path),
     multiple=True,
-    help="Allow importing binaries from this path (repeatable).",
-)
-@click.option(
-    "--allow-any-path",
-    is_flag=True,
-    help="Allow importing binaries from any path (unsafe).",
+    help="Restrict imports to these paths only (repeatable). Unrestricted by default.",
 )
 @click.option("--max-workers", type=int, default=4,
               help="Max concurrent analysis workers (default 4).")
@@ -3139,6 +3188,11 @@ def cli():
     help="Delete projects not opened in this many days at startup. "
          "Brand-new analyses (never opened) are always exempt.",
 )
+@click.option(
+    "--idle-timeout", type=int, default=None,
+    help="Auto-exit after this many minutes with no HTTP requests (shared mode only). "
+         "Set by proxy auto-start; 0 or None disables.",
+)
 @click.argument("binaries", nargs=-1, type=click.Path(exists=True, path_type=Path))
 def serve_cmd(
     transport: str,
@@ -3149,18 +3203,17 @@ def serve_cmd(
     project_dir: Path | None,
     ghidra_dir: Path | None,
     runtime_home: Path | None,
-    allow_paths: tuple[Path, ...],
-    allow_any_path: bool,
+    restrict_paths: tuple[Path, ...],
     max_workers: int,
     eager_load: bool,
     autopurge_days: int | None,
+    idle_timeout: int | None,
     binaries: tuple[Path, ...],
 ):
     """Start the MCP server (default when no subcommand given)."""
     global _backend, _worker_semaphore, _active_jobs_lock
 
-    if transport != "stdio":
-        raise click.ClickException("SSE transport is disabled. Use --transport stdio.")
+    is_shared = transport != "stdio"
 
     _worker_semaphore = asyncio.Semaphore(max_workers)
     _active_jobs_lock = asyncio.Lock()
@@ -3174,9 +3227,8 @@ def serve_cmd(
         default_profile=profile_enum,
         ghidra_dir=ghidra_dir,
         runtime_home=runtime_home,
-        allow_any_path=allow_any_path,
-        allowed_paths=list(allow_paths),
-        shared=True,
+        restrict_paths=list(restrict_paths),
+        shared=is_shared,
         autopurge_days=autopurge_days,
     )
     _check_prerequisites(ghidra_dir)
@@ -3212,9 +3264,28 @@ def serve_cmd(
 
     logger.info(f"Ready. {len(_backend.programs)} programs loaded.")
 
+    # Write PID file for shared transports so `pyghidra-lite stop` works
+    if transport in ("streamable-http", "sse"):
+        from pyghidra_lite.proxy import _write_pid, _remove_pid
+        _write_pid(port, os.getpid())
+
     try:
-        mcp.run(transport="stdio")
+        if transport == "stdio":
+            mcp.run(transport="stdio")
+        elif transport == "streamable-http":
+            mcp.settings.host = host
+            mcp.settings.port = port
+            if idle_timeout and idle_timeout > 0:
+                _run_with_idle_timeout(mcp, idle_timeout)
+            else:
+                mcp.run(transport="streamable-http")
+        else:
+            mcp.settings.host = host
+            mcp.settings.port = port
+            mcp.run(transport="sse")
     finally:
+        if transport in ("streamable-http", "sse"):
+            _remove_pid(port)
         if _backend:
             _backend.close()
 
@@ -3406,6 +3477,36 @@ def list_cmd(project_dir, as_json):
             )
 
 
+@cli.command("proxy")
+@click.option("-p", "--port", type=int, default=19101,
+              help="Backend port (default 19101)")
+@click.option("--host", type=str, default="127.0.0.1",
+              help="Backend host")
+def proxy_cmd(port: int, host: str):
+    """Lightweight stdio proxy to a shared HTTP backend.
+
+    Reads MCP JSON-RPC from stdin, forwards to the persistent backend over HTTP,
+    and writes responses to stdout. Auto-starts the backend if it's not running.
+    """
+    import anyio
+    from functools import partial
+    from pyghidra_lite.proxy import run_proxy
+    anyio.run(partial(run_proxy, host=host, port=port))
+
+
+@cli.command("stop")
+@click.option("-p", "--port", type=int, default=19101,
+              help="Backend port (default 19101)")
+def stop_cmd(port: int):
+    """Stop a running backend process."""
+    from pyghidra_lite.proxy import stop_backend
+    if stop_backend(port):
+        click.echo(f"Backend on port {port} stopped.")
+    else:
+        click.echo(f"No backend found on port {port}.", err=True)
+        raise SystemExit(1)
+
+
 class AnalysisProgressListener:
     """Writes analysis progress to a JSON status file for subprocess worker consumption."""
 
@@ -3496,6 +3597,11 @@ class AnalysisProgressListener:
 def main():
     """Entry point for pyproject.toml console_scripts."""
     cli()
+
+
+def proxy_main():
+    """Entry point for pyghidra-lite-proxy console script."""
+    cli.main(["proxy"], standalone_mode=True)
 
 
 if __name__ == "__main__":

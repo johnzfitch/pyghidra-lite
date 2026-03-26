@@ -76,7 +76,7 @@ class TestPhase1CLI:
         """Unknown first args should be prepended with 'serve'."""
         # Test the routing logic directly: unknown args get 'serve' prepended
         ctx = click.Context(server.cli)
-        original = ["--allow-any-path"]
+        original = ["--restrict-path", "/tmp"]
         # DefaultGroup.parse_args mutates args by prepending 'serve'
         # Verify the logic by calling parse_args on a fresh group
         group = server.DefaultGroup("test")
