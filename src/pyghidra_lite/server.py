@@ -132,6 +132,7 @@ _SEARCH_TYPES = ("strings", "symbols", "bytes", "all", "blob", "extract")
 _SEARCH_MODES = ("indexed", "deep")
 _MAX_BATCH_XREF_TARGETS = 20
 _MAX_BATCH_SEARCH_QUERIES = 20
+_MAX_QUEUED_JOBS = 32
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 LoadProfileArg = Literal["fast", "default", "deep"]
@@ -186,6 +187,11 @@ def _parse_bool(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _rmtree_warn(func, path, exc_info):
+    """onerror handler for shutil.rmtree that logs instead of silencing."""
+    logger.warning("rmtree failed on %s: %s", path, exc_info[1])
 
 
 def _split_jvm_options(value: str) -> list[str]:
@@ -1412,26 +1418,22 @@ class ProjectWatcher:
         self._check_and_load(path)
 
     def _check_and_load(self, status_path: Path):
-        # Validate status_path is within projects_dir before any read
-        # (prevents following symlinks outside projects root).
+        # O_NOFOLLOW atomically rejects symlinks at open time, closing the
+        # TOCTOU window between path validation and file read.
         try:
-            resolved_status = status_path.resolve()
-            resolved_root = self.projects_dir.resolve()
-            _ = resolved_status.relative_to(resolved_root)
-        except (ValueError, FileNotFoundError, OSError):
-            logger.warning(f"Status file outside projects_dir: {status_path}")
+            fd = os.open(str(status_path), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
             return
-
         try:
-            status = json.loads(resolved_status.read_text())
-        except (json.JSONDecodeError, FileNotFoundError, OSError) as e:
-            logger.debug(f"Ignoring invalid status file {status_path}: {e}")
+            with os.fdopen(fd, "r") as f:
+                status = json.load(f)
+        except (json.JSONDecodeError, OSError):
             return
 
         if status.get("status") != "complete":
             return
 
-        project_id = resolved_status.parent.name
+        project_id = status_path.parent.name
         analysis_id = status.get("analysis_id")
         profile = status.get("profile")
         if not analysis_id:
@@ -1796,7 +1798,7 @@ async def load(
             if disk_match:
                 proj_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / disk_match["project_id"]
                 if proj_path.exists():
-                    shutil.rmtree(proj_path, ignore_errors=True)
+                    shutil.rmtree(proj_path, onerror=_rmtree_warn)
             async with (_active_jobs_lock or nullcontext()):
                 _kill_job(analysis_id)
             logger.info("fresh=True: purged all cached state for analysis_id=%s", analysis_id)
@@ -1883,15 +1885,15 @@ async def load(
                 if job.get("status") not in ("complete", "error"):
                     if bootstrap_source and job.get("bootstrap_source") != bootstrap_source:
                         raise ValueError(
-                            f"Analysis already in progress for {p.name!r} without the "
-                            "requested bootstrap source. Wait for completion or retry "
-                            "with fresh=True."
+                            f"Analysis already in progress for {p.name!r} with a different "
+                            f"bootstrap source. Cancel with delete(unit_id='{unit_id}') "
+                            "or retry with fresh=True."
                         )
                     if bootstrap_source and job.get("bootstrap_mode", "named") != bootstrap_mode:
                         raise ValueError(
                             f"Analysis already in progress for {p.name!r} with "
                             f"bootstrap_mode={job.get('bootstrap_mode', 'named')!r}. "
-                            "Wait for completion or retry with fresh=True."
+                            f"Cancel with delete(unit_id='{unit_id}') or retry with fresh=True."
                         )
                     entry = _merge_live_job_entry(analysis_id, job, include_jobs_meta=True)
                     entry["binary_name"] = p.name
@@ -1901,6 +1903,17 @@ async def load(
                     )
                     return entry
                 # Terminal state stale entry: fall through and re-queue.
+
+            # Guard against unbounded job accumulation.
+            active_count = sum(
+                1 for j in _active_jobs.values()
+                if j.get("status") in ("queued", "analyzing")
+            )
+            if active_count >= _MAX_QUEUED_JOBS:
+                raise ValueError(
+                    f"Job queue full ({active_count} active). "
+                    "Wait for current jobs to complete or cancel with delete()."
+                )
 
             # Spawn async worker subprocess.
             estimated = _estimate_analysis_time(p.stat().st_size, profile)
@@ -2041,7 +2054,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
                 raise RuntimeError(f"Failed to delete {handle.name!r} from Ghidra project")
             _kill_job(analysis_id)
             project_id = analysis_id if (project_base / analysis_id).exists() else unit_id
-            shutil.rmtree(project_base / project_id, ignore_errors=True)
+            shutil.rmtree(project_base / project_id, onerror=_rmtree_warn)
             return {"deleted": handle.name, "unit_id": unit_id, "analysis_id": analysis_id}
 
         # Disk-only (errored, incomplete, never loaded)
@@ -3231,6 +3244,11 @@ def serve_cmd(
         shared=is_shared,
         autopurge_days=autopurge_days,
     )
+    if is_shared and not restrict_paths:
+        logger.warning(
+            "Shared mode with no --restrict-path: clients can import any file. "
+            "Set --restrict-path for production deployments."
+        )
     _check_prerequisites(ghidra_dir)
     with _backend_lock:
         _backend = _init_backend(eager_load=eager_load)

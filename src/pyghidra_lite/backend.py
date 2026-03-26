@@ -408,7 +408,10 @@ class GhidraBackend:
         for name in to_remove:
             del self.programs[name]
 
-        # Wipe the on-disk project directory so the next import starts clean
+        # Wipe the on-disk project directory so the next import starts clean.
+        # Legacy fallback (pre-v0.5.0): projects stored under {unit_id}/
+        # instead of {unit_id}-{profile}/. Check if a legacy directory matches
+        # the requested profile. Safe to remove after v1.0.
         project_key = analysis_id
         parsed = parse_analysis_id(analysis_id)
         if not (self.project_dir / project_key).exists() and parsed is not None:
@@ -420,7 +423,9 @@ class GhidraBackend:
                     project_key = legacy_key
         project_path = self.project_dir / project_key
         if project_path.exists():
-            shutil.rmtree(project_path, ignore_errors=True)
+            def _rmtree_warn(func, path, exc_info):
+                logger.warning("rmtree failed on %s: %s", path, exc_info[1])
+            shutil.rmtree(project_path, onerror=_rmtree_warn)
             logger.info("Purged project for analysis_id=%s", analysis_id)
 
     def import_binary(
@@ -483,6 +488,9 @@ class GhidraBackend:
         root_folder = project.getRootFolder()
         program_existed = root_folder.getFile(prog_name) is not None
         existing_name = prog_name
+        # Legacy migration (pre-v0.5.0): projects created before profile-scoped
+        # naming may have a single program whose name doesn't match the new
+        # {stem}-{profile} scheme. Reuse it if it's the only program present.
         if not program_existed:
             existing_files = [f.getName() for f in root_folder.getFiles() if str(f.getContentType()) == "Program"]
             if len(existing_files) == 1:
