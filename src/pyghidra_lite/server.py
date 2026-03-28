@@ -110,6 +110,7 @@ class BinaryCapabilities:
 _backend: GhidraBackend | None = None
 _capabilities: dict[str, BinaryCapabilities] = {}
 _backend_lock = threading.RLock()
+_last_access: dict[str, float] = {}  # analysis_id → time.monotonic()
 
 # Binaries above this threshold are auto-delegated to async analysis in load()
 _LARGE_BINARY_MB = 10
@@ -170,6 +171,8 @@ class ServerConfig:
     restrict_paths: list[Path] = field(default_factory=list)
     shared: bool = False  # True for SSE (shared server), False for stdio (isolated)
     autopurge_days: int | None = None  # Delete projects not opened in N days (None = off)
+    evict_after_minutes: int = 30  # Unload idle binaries from memory after N minutes (0 = off)
+    min_loaded: int = 2  # Always keep at least N most-recently-used binaries in memory
 
     def resolved_restrict_paths(self) -> list[Path]:
         """Return de-duplicated, resolved restrict roots (empty = unrestricted)."""
@@ -271,6 +274,8 @@ def configure_server(
     restrict_paths: list[Path] | None = None,
     shared: bool | None = None,
     autopurge_days: int | None = None,
+    evict_after_minutes: int | None = None,
+    min_loaded: int | None = None,
 ) -> None:
     """Apply runtime configuration for backend and import policy."""
     global _server_config
@@ -290,6 +295,10 @@ def configure_server(
         _server_config.shared = shared
     if autopurge_days is not None:
         _server_config.autopurge_days = autopurge_days
+    if evict_after_minutes is not None:
+        _server_config.evict_after_minutes = evict_after_minutes
+    if min_loaded is not None:
+        _server_config.min_loaded = min_loaded
 
 
 def get_backend() -> GhidraBackend:
@@ -601,10 +610,18 @@ def _handle_analysis_id(handle) -> str:
     return unit_id
 
 
+def _touch_access(handle) -> None:
+    """Update last-access timestamp for eviction tracking."""
+    aid = getattr(handle, "analysis_id", None)
+    if aid:
+        _last_access[aid] = time.monotonic()
+
+
 def _get_handle(binary: str, profile: str | None = None):
     backend = get_backend()
     handle = _handle_by_analysis_id(backend, binary)
     if handle is not None:
+        _touch_access(handle)
         return handle
 
     if _UNIT_ID_RE.match(binary):
@@ -613,6 +630,7 @@ def _get_handle(binary: str, profile: str | None = None):
             if handle.unit_id == binary and (profile is None or handle.profile.value == profile)
         ]
         if len(loaded_matches) == 1:
+            _touch_access(loaded_matches[0])
             return loaded_matches[0]
         if len(loaded_matches) > 1:
             raise ValueError(
@@ -620,7 +638,9 @@ def _get_handle(binary: str, profile: str | None = None):
             )
 
     try:
-        return backend.get_program(binary)
+        h = backend.get_program(binary)
+        _touch_access(h)
+        return h
     except ValueError:
         pass
 
@@ -632,6 +652,7 @@ def _get_handle(binary: str, profile: str | None = None):
         loaded = _hot_load_blocking(analysis_id)  # RLock allows reentry; one-time cost per session
         handle = _handle_by_analysis_id(backend, analysis_id)
         if handle is not None:
+            _touch_access(handle)
             return handle
         if loaded:
             raise RuntimeError(
@@ -1041,10 +1062,14 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
     # Start background stale job monitor
     stale_task = asyncio.create_task(_stale_job_monitor(interval=30))
 
+    # Start memory eviction monitor (unloads idle binaries from JVM, keeps on disk)
+    eviction_task = asyncio.create_task(_eviction_monitor(interval=60))
+
     try:
         yield
     finally:
         stale_task.cancel()
+        eviction_task.cancel()
         if observer:
             observer.stop()
             observer.join(timeout=2)
@@ -1624,6 +1649,66 @@ async def _autopurge_stale_projects() -> None:
 
     if purged:
         logger.info("Autopurge complete: removed %d project(s)", len(purged))
+
+
+async def _eviction_monitor(interval: int = 60):
+    """Periodically evict idle binaries from memory to reduce JVM heap pressure.
+
+    Binaries are unloaded from the JVM but kept on disk — the next tool call
+    referencing an evicted binary transparently reloads it via _get_handle().
+    """
+    evict_minutes = _server_config.evict_after_minutes
+    min_loaded = _server_config.min_loaded
+    if not evict_minutes or evict_minutes <= 0:
+        return  # Eviction disabled
+
+    evict_seconds = evict_minutes * 60
+    logger.info(
+        "Eviction monitor started: idle threshold %d min, keep at least %d loaded",
+        evict_minutes, min_loaded,
+    )
+
+    while True:
+        await asyncio.sleep(interval)
+        with _backend_lock:
+            if _backend is None:
+                continue
+            loaded_ids = [
+                h.analysis_id
+                for h in _backend.programs.values()
+                if h.analysis_id
+            ]
+        if len(loaded_ids) <= min_loaded:
+            continue
+
+        now = time.monotonic()
+        # Build (analysis_id, last_access) pairs; untracked binaries use load time 0
+        # so they're evicted first
+        scored = [(aid, _last_access.get(aid, 0.0)) for aid in loaded_ids]
+        # Sort by most recent access (keep the freshest)
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Evict idle binaries beyond min_loaded
+        candidates = scored[min_loaded:]  # protect the N most recent
+        evicted = []
+        for aid, last_ts in candidates:
+            idle_sec = now - last_ts
+            if idle_sec < evict_seconds:
+                continue
+            # Don't evict binaries with active analysis jobs
+            with _jobs_mutex:
+                if aid in _active_jobs and _active_jobs[aid].get("status") in ("queued", "analyzing", "running"):
+                    continue
+            with _backend_lock:
+                if _backend is None:
+                    break
+                name = _backend.evict(aid)
+                if name:
+                    _last_access.pop(aid, None)
+                    evicted.append(name)
+
+        if evicted:
+            logger.info("Evicted %d idle binary(ies): %s", len(evicted), ", ".join(evicted))
 
 
 async def _stale_job_monitor(interval: int = 30):
@@ -3202,6 +3287,15 @@ def cli():
          "Brand-new analyses (never opened) are always exempt.",
 )
 @click.option(
+    "--evict-after", type=int, default=None,
+    help="Unload binaries from memory after this many idle minutes (default 30, 0 = off). "
+         "Evicted binaries stay on disk and reload transparently on next access.",
+)
+@click.option(
+    "--min-loaded", type=int, default=None,
+    help="Always keep at least this many most-recently-used binaries in memory (default 2).",
+)
+@click.option(
     "--idle-timeout", type=int, default=None,
     help="Auto-exit after this many minutes with no HTTP requests (shared mode only). "
          "Set by proxy auto-start; 0 or None disables.",
@@ -3220,6 +3314,8 @@ def serve_cmd(
     max_workers: int,
     eager_load: bool,
     autopurge_days: int | None,
+    evict_after: int | None,
+    min_loaded: int | None,
     idle_timeout: int | None,
     binaries: tuple[Path, ...],
 ):
@@ -3243,6 +3339,8 @@ def serve_cmd(
         restrict_paths=list(restrict_paths),
         shared=is_shared,
         autopurge_days=autopurge_days,
+        evict_after_minutes=evict_after,
+        min_loaded=min_loaded,
     )
     if is_shared and not restrict_paths:
         logger.warning(

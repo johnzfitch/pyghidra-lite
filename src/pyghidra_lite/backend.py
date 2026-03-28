@@ -387,6 +387,37 @@ class GhidraBackend:
         """
         self._purge_analysis(unit_id)
 
+    def evict(self, analysis_id: str) -> str | None:
+        """Unload a binary from memory but keep its on-disk Ghidra project.
+
+        Returns the program name that was evicted, or None if not loaded.
+        The binary can be transparently reloaded on the next tool call
+        via _get_handle() -> _hot_load_blocking().
+        """
+        to_remove = [name for name, h in self.programs.items() if h.analysis_id == analysis_id]
+        if not to_remove:
+            return None
+
+        if analysis_id in self._projects:
+            project = self._projects[analysis_id]
+            for name in to_remove:
+                try:
+                    project.close(self.programs[name].program)
+                except Exception:
+                    pass
+            try:
+                project.close()
+            except Exception:
+                pass
+            del self._projects[analysis_id]
+
+        evicted_name = to_remove[0]
+        for name in to_remove:
+            del self.programs[name]
+
+        logger.info("Evicted %s (analysis_id=%s) from memory; on-disk project preserved", evicted_name, analysis_id)
+        return evicted_name
+
     def _purge_analysis(self, analysis_id: str) -> None:
         """Evict one specific analysis profile from memory and disk."""
         import shutil
