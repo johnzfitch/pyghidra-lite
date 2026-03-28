@@ -111,6 +111,7 @@ _backend: GhidraBackend | None = None
 _capabilities: dict[str, BinaryCapabilities] = {}
 _backend_lock = threading.RLock()
 _last_access: dict[str, float] = {}  # analysis_id → time.monotonic()
+_evicted_ids: set[str] = set()  # analysis_ids evicted from memory (still on disk)
 
 # Binaries above this threshold are auto-delegated to async analysis in load()
 _LARGE_BINARY_MB = 10
@@ -615,6 +616,7 @@ def _touch_access(handle) -> None:
     aid = getattr(handle, "analysis_id", None)
     if aid:
         _last_access[aid] = time.monotonic()
+        _evicted_ids.discard(aid)
 
 
 def _get_handle(binary: str, profile: str | None = None):
@@ -1078,6 +1080,8 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
                 _backend.close()
                 _backend = None
             _capabilities.clear()
+            _last_access.clear()
+            _evicted_ids.clear()
 
 
 mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
@@ -1705,6 +1709,7 @@ async def _eviction_monitor(interval: int = 60):
                 name = _backend.evict(aid)
                 if name:
                     _last_access.pop(aid, None)
+                    _evicted_ids.add(aid)
                     evicted.append(name)
 
         if evicted:
@@ -2180,8 +2185,10 @@ async def binaries(
       - Find the best source binary for version tracking (pass rank_sources=True
         to sort by transferable named function count).
 
-    Binaries listed as "on_disk" auto-load into memory the first time any tool
-    references them - no need to re-import.
+    Binaries listed as "on_disk" or "evicted" auto-load into memory the first
+    time any tool references them - no need to re-import. Evicted binaries were
+    previously loaded but unloaded to free memory after idle timeout; they reload
+    transparently on the next tool call (e.g., code(), functions(), search()).
 
     Args:
         jobs: Include active job status and results.
@@ -2249,15 +2256,19 @@ async def binaries(
                 if analysis_id in seen_analysis_ids:
                     continue
                 seen_analysis_ids.add(analysis_id)
+                is_evicted = analysis_id in _evicted_ids
+                disk_status = status_data.get("status", "on_disk")
                 disk_entry = {
                     "unit_id": status_data["unit_id"],
                     "analysis_id": analysis_id,
                     "name": status_data.get("binary_name", analysis_id),
-                    "status": status_data.get("status", "on_disk"),
+                    "status": "evicted" if is_evicted and disk_status == "complete" else disk_status,
                     "functions": status_data.get("functions"),
                     "capabilities": status_data.get("capabilities", []),
                     "profile": status_data.get("profile"),
                 }
+                if is_evicted and disk_status == "complete":
+                    disk_entry["hint"] = "Idle-evicted from memory. Any tool call referencing this binary reloads it automatically."
                 if jobs:
                     for key in (
                         "phase",
