@@ -1595,6 +1595,11 @@ async def _recover_in_progress_jobs():
             continue
 
         project_id = entry.name
+        # Skip directories with unrecognized names
+        try:
+            _validate_project_id(project_id)
+        except ValueError:
+            continue
         with _backend_lock:
             status = _read_status_file(project_id)
             analysis_id = status.get("analysis_id")
