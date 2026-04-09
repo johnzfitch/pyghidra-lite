@@ -136,6 +136,32 @@ _MAX_BATCH_XREF_TARGETS = 20
 _MAX_BATCH_SEARCH_QUERIES = 20
 _MAX_QUEUED_JOBS = 32
 
+def _validate_project_id(project_id: str) -> None:
+    """Raise ValueError if project_id doesn't match expected formats.
+
+    Valid formats: 16-char hex (unit_id) or 16-char hex + profile suffix (analysis_id).
+    This prevents path traversal via crafted directory or ID names.
+    """
+    if _UNIT_ID_RE.match(project_id):
+        return
+    if parse_analysis_id(project_id) is not None:
+        return
+    raise ValueError(f"Invalid project_id: {project_id!r}")
+
+
+def _safe_project_path(project_base: Path, project_id: str) -> Path:
+    """Return project_base / project_id after validating format and containment.
+
+    Ensures the resolved path stays within project_base, preventing directory
+    traversal even if project_id were somehow crafted to escape.
+    """
+    _validate_project_id(project_id)
+    result = (project_base / project_id).resolve()
+    if not result.is_relative_to(project_base.resolve()):
+        raise ValueError(f"Path escapes project directory: {project_id!r}")
+    return result
+
+
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 LoadProfileArg = Literal["fast", "default", "deep"]
 BootstrapModeArg = Literal["named", "all"]
@@ -1093,6 +1119,7 @@ mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
 
 def _read_status_file(project_id: str) -> dict:
     """Read .analysis_status for an on-disk project directory, returning {} on failure."""
+    _validate_project_id(project_id)
     status_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
     if not status_file.exists():
         return {}
@@ -1104,6 +1131,7 @@ def _read_status_file(project_id: str) -> dict:
 
 def _write_status_file(project_id: str, data: dict):
     """Atomic write of .analysis_status for a project directory."""
+    _validate_project_id(project_id)
     project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
     status_file = project_dir / ".analysis_status"
@@ -1114,6 +1142,7 @@ def _write_status_file(project_id: str, data: dict):
 
 def _write_job_result(job_id: str, data: dict):
     """Atomic write of result.json for a scan job. Mirrors _write_status_file."""
+    _validate_project_id(job_id)
     d = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / job_id
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / "result.json.tmp"
@@ -1463,6 +1492,11 @@ class ProjectWatcher:
             return
 
         project_id = status_path.parent.name
+        # Reject unrecognized directory names to prevent confusion or misuse.
+        try:
+            _validate_project_id(project_id)
+        except ValueError:
+            return
         analysis_id = status.get("analysis_id")
         profile = status.get("profile")
         if not analysis_id:
@@ -1473,7 +1507,7 @@ class ProjectWatcher:
                 profile = profile or AnalysisProfile.FAST.value
                 analysis_id = make_analysis_id(project_id, profile)
             else:
-                analysis_id = project_id
+                return  # Unreachable after _validate_project_id, but safe fallback
 
         if not analysis_id:
             return
@@ -1645,7 +1679,7 @@ async def _autopurge_stale_projects() -> None:
                     active_ids = set(get_backend()._projects.keys()) if _backend else set()
                 if analysis_id in active_ids:
                     continue  # in-use — skip purge
-                shutil.rmtree(project_base / project_id)
+                shutil.rmtree(_safe_project_path(project_base, project_id))
                 purged.append((analysis_id, data.get("binary_name", analysis_id)))
                 logger.info("Autopurged %s (%s), last opened %s", data.get("binary_name", analysis_id), analysis_id, last_open)
             except OSError as e:
@@ -1886,7 +1920,10 @@ async def load(
                     _backend._purge_analysis(analysis_id)
             disk_match = _find_on_disk(unit_id, profile=profile)
             if disk_match:
-                proj_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / disk_match["project_id"]
+                proj_path = _safe_project_path(
+                    Path(_server_config.project_dir or DEFAULT_PROJECT_DIR),
+                    disk_match["project_id"],
+                )
                 if proj_path.exists():
                     shutil.rmtree(proj_path, onerror=_rmtree_warn)
             async with (_active_jobs_lock or nullcontext()):
@@ -2144,7 +2181,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
                 raise RuntimeError(f"Failed to delete {handle.name!r} from Ghidra project")
             _kill_job(analysis_id)
             project_id = analysis_id if (project_base / analysis_id).exists() else unit_id
-            shutil.rmtree(project_base / project_id, onerror=_rmtree_warn)
+            shutil.rmtree(_safe_project_path(project_base, project_id), onerror=_rmtree_warn)
             return {"deleted": handle.name, "unit_id": unit_id, "analysis_id": analysis_id}
 
         # Disk-only (errored, incomplete, never loaded)
@@ -2152,7 +2189,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
         if not disk_match:
             raise ValueError(f"Not found: {name!r}. Use analysis_id or exact name from binaries().")
 
-        project_dir = project_base / disk_match["project_id"]
+        project_dir = _safe_project_path(project_base, disk_match["project_id"])
         if not project_dir.exists():
             raise ValueError(f"Project not found: {disk_match['project_id']!r}")
 
@@ -3561,6 +3598,9 @@ def list_cmd(project_dir, as_json):
     entries = []
     for entry in sorted(projects_path.iterdir()):
         if not entry.is_dir():
+            continue
+        # Skip directories with unrecognized names (same validation as _iter_disk_status)
+        if not _UNIT_ID_RE.match(entry.name) and parse_analysis_id(entry.name) is None:
             continue
         gpr_files = list(entry.glob("*.gpr"))
         if not gpr_files:

@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -41,11 +42,21 @@ def make_analysis_id(unit_id: str, profile: "AnalysisProfile | str") -> str:
     return f"{unit_id}-{profile_value}"
 
 
+_UNIT_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+
+
 def parse_analysis_id(value: str) -> tuple[str, str] | None:
-    """Parse a profile-scoped analysis identifier."""
+    """Parse a profile-scoped analysis identifier.
+
+    Returns (unit_id, profile) only if the unit_id portion is a valid
+    16-char hex string. This prevents path-traversal strings like
+    '../../etc-fast' from being accepted.
+    """
     for suffix in ("-fast", "-default", "-deep"):
         if value.endswith(suffix):
-            return value[:-len(suffix)], suffix[1:]
+            uid = value[: -len(suffix)]
+            if _UNIT_ID_PATTERN.match(uid):
+                return uid, suffix[1:]
     return None
 
 
