@@ -142,7 +142,7 @@ def _autostart_backend(host: str, port: int) -> None:
             "--host", host,
             "--idle-timeout", "30",
         ]
-        logger.info("Auto-starting backend: %s", " ".join(cmd))
+        logger.info("Auto-starting backend on port %d", port)
 
         proc = subprocess.Popen(
             cmd,

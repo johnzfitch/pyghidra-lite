@@ -13,8 +13,8 @@ Currently supported versions:
 pyghidra-lite includes several security features:
 
 ### Path Restrictions
-- Unrestricted by default (MCP clients like Claude Code handle permissions)
 - Use `--restrict-path` to lock down to specific directories
+- Required when binding to non-loopback addresses
 - Environment variable: `PYGHIDRA_LITE_RESTRICT_PATHS` (colon-separated)
 
 ### Project Isolation
@@ -33,10 +33,10 @@ pyghidra-lite includes several security features:
 
 When running pyghidra-lite as an MCP server:
 
-1. **Path Restrictions**: Use `--restrict-path` in shared/production environments
+1. **Path Restrictions**: Use `--restrict-path` (required for non-loopback hosts)
 2. **Untrusted Binaries**: Ghidra analyzes but doesn't execute binaries
 3. **Resource Limits**: Set appropriate timeouts for decompilation
-4. **Network Isolation**: stdio transport (default) has no network exposure
+4. **Transport**: stdio (default) is per-session; HTTP transports are shared
 
 ### Known Limitations
 
