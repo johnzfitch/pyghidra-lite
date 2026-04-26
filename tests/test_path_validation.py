@@ -15,7 +15,7 @@ from pyghidra_lite import server
 
 
 # ---------------------------------------------------------------------------
-# parse_analysis_id — allowlist: {16 lowercase hex}-{fast|default|deep}
+# parse_analysis_id -- allowlist: {16 lowercase hex}-{fast|default|deep}
 # ---------------------------------------------------------------------------
 
 class TestParseAnalysisId:
@@ -55,7 +55,7 @@ class TestParseAnalysisId:
 
 
 # ---------------------------------------------------------------------------
-# _validate_project_id — allowlist: unit_id OR analysis_id
+# _validate_project_id -- allowlist: unit_id OR analysis_id
 # ---------------------------------------------------------------------------
 
 class TestValidateProjectId:
@@ -109,7 +109,7 @@ class TestValidateProjectId:
 
 
 # ---------------------------------------------------------------------------
-# _safe_project_path — format allowlist + resolve/containment
+# _safe_project_path -- format allowlist + resolve/containment
 # ---------------------------------------------------------------------------
 
 class TestSafeProjectPath:
@@ -165,7 +165,7 @@ class TestPathHelperValidation:
         status_file = self.project_dir / "abcdef0123456789" / ".analysis_status"
         assert status_file.exists()
 
-    # _write_job_result: tighter allowlist — unit_id only (no analysis_id)
+    # _write_job_result: tighter allowlist -- unit_id only (no analysis_id)
     def test_write_job_result_rejects_analysis_id(self):
         with pytest.raises(ValueError):
             server._write_job_result("abcdef0123456789-fast", {"result": "data"})

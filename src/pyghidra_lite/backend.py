@@ -668,7 +668,7 @@ class GhidraBackend:
             dest_name: Name of the target binary to annotate.
             min_func_size: Minimum function size in bytes to consider (default 16).
             max_func_size: Maximum function size in bytes to consider (default 4096).
-                           Very large functions are skipped — they're slow to search
+                           Very large functions are skipped -- they're slow to search
                            and rarely transfer cleanly across versions.
 
         Returns:
@@ -749,7 +749,7 @@ class GhidraBackend:
                 stats["errors"] += 1
                 continue
 
-            # Build signed Java byte arrays (Java byte is signed: 0xFF → -1)
+            # Build signed Java byte arrays (Java byte is signed: 0xFF -> -1)
             java_needle = JByte[size]
             java_mask = JByte[size]
             for i in range(size):
@@ -785,7 +785,7 @@ class GhidraBackend:
 
             dest_func = dest_fm.getFunctionAt(match_addr)
             if dest_func is None:
-                # Not a function entry point in dest — skip
+                # Not a function entry point in dest -- skip
                 continue
 
             if not dest_func.getName().startswith("FUN_"):
@@ -833,7 +833,7 @@ class GhidraBackend:
         if profile == AnalysisProfile.FAST:
             # Disable all expensive analyzers for quick triage (<60s).
             # Keeps: entry point, subroutine refs, basic blocks, ASCII strings,
-            # symbol table, imports/exports — enough for function listing,
+            # symbol table, imports/exports -- enough for function listing,
             # string search, and on-demand decompilation.
             slow_analyzers = [
                 "Decompiler Parameter ID",

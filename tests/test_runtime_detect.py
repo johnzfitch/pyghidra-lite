@@ -19,7 +19,7 @@ def _make_stub() -> GhidraTools:
 
 
 def _stub_find_bytes(magic_map: dict):
-    """Return a find_bytes side_effect that maps pattern → hit list."""
+    """Return a find_bytes side_effect that maps pattern -> hit list."""
     def side_effect(pattern, limit=20):
         return magic_map.get(pattern, [])
     return side_effect
@@ -40,7 +40,7 @@ class TestDetectEmbeddedRuntimeBasic:
         assert result["runtimes"] == []
 
     def test_bunfs_detected_compact(self):
-        """BUN\\x00 magic → bunfs, high confidence, external_tools."""
+        """BUN\\x00 magic -> bunfs, high confidence, external_tools."""
         gt = _make_stub()
         gt.find_bytes = MagicMock(side_effect=_stub_find_bytes({
             "42554e00": [{"address": "0x1000000", "section": ".data"}],
@@ -125,7 +125,7 @@ class TestAsarConfidence:
         assert asar["confidence"] == "high"
 
     def test_asar_in_text_omitted(self):
-        """ASAR magic in .text → likely false positive, omitted."""
+        """ASAR magic in .text -> likely false positive, omitted."""
         gt = _make_stub()
         gt.find_bytes = MagicMock(side_effect=_stub_find_bytes({
             "41534152": [{"address": "0x500000", "section": ".text"}],
@@ -157,7 +157,7 @@ class TestNodeSeaConfidence:
         assert sea["strategy"] == "search_payload"
 
     def test_node_sea_in_strtab_omitted(self):
-        """NODE_SEA_FUSE in .strtab → likely just the symbol name, omitted."""
+        """NODE_SEA_FUSE in .strtab -> likely just the symbol name, omitted."""
         gt = _make_stub()
         gt.find_bytes = MagicMock(side_effect=_stub_find_bytes({
             self._NODE_SEA_MAGIC: [{"address": "0x100000", "section": ".strtab"}],
@@ -175,7 +175,7 @@ class TestNodeSeaConfidence:
 
 class TestV8SnapshotConfidence:
     def test_v8_via_symbol_high_confidence(self):
-        """v8_snapshot_blob_data symbol found → confidence upgraded to high."""
+        """v8_snapshot_blob_data symbol found -> confidence upgraded to high."""
         gt = _make_stub()
         gt.find_bytes = MagicMock(return_value=[])
 
@@ -203,7 +203,7 @@ class TestV8SnapshotConfidence:
         )
 
     def test_v8_magic_only_medium_confidence(self):
-        """Magic bytes only (no symbol) → stays at medium confidence."""
+        """Magic bytes only (no symbol) -> stays at medium confidence."""
         gt = _make_stub()
         gt.find_bytes = MagicMock(side_effect=_stub_find_bytes({
             "d80dcace": [{"address": "0x4000000", "section": ".data"}],

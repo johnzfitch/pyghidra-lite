@@ -2,7 +2,7 @@
 
 Tests CLI structure, helper functions, status file protocol,
 AnalysisProgressListener, ProjectWatcher, crash recovery, and
-MCP tool registration — all without requiring a running JVM.
+MCP tool registration -- all without requiring a running JVM.
 """
 
 import asyncio
@@ -90,7 +90,7 @@ class TestPhase1CLI:
     def test_default_group_preserves_known_commands(self):
         """Known subcommands should NOT be rerouted."""
         ctx = click.Context(server.cli)
-        # 'import' is a known command — should parse directly
+        # 'import' is a known command -- should parse directly
         # Just test that it's recognized
         assert "import" in server.cli.commands
 
