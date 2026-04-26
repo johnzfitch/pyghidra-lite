@@ -687,18 +687,8 @@ def _get_handle(binary: str, profile: str | None = None):
             )
         raise RuntimeError(f"Hot-load failed for {analysis_id!r}; check server logs")
 
-    # Nothing found -- list what's available
-    loaded_names = list(backend.programs.keys())
-    on_disk = [
-        f"{v.get('binary_name', v['analysis_id'])} [{v.get('profile')}]"
-        for _project_id, v in _iter_disk_status()
-        if v.get("status") == "complete"
-        and v["analysis_id"] not in {getattr(h, "analysis_id", "") for h in backend.programs.values()}
-    ]
-    msg = f"Binary not found: {binary!r}. Loaded: {loaded_names}."
-    if on_disk:
-        msg += f" Available on disk (auto-loads on tool call): {on_disk}"
-    raise ValueError(msg)
+    # Nothing found
+    raise ValueError(f"Binary not found: {binary!r}. Use binaries() to list available names and IDs.")
 
 
 def _handle_by_unit_id(backend: GhidraBackend, unit_id: str):
@@ -789,17 +779,7 @@ def _resolve_bootstrap_handle(backend: GhidraBackend, bootstrap: str):
             return handle
         raise RuntimeError(f"Bootstrap source {bootstrap!r} exists on disk but could not be loaded")
 
-    loaded_names = list(backend.programs.keys())
-    on_disk = [
-        f"{v.get('binary_name', v['analysis_id'])} [{v.get('profile')}]"
-        for _project_id, v in _iter_disk_status()
-        if v.get("status") == "complete"
-        and v["analysis_id"] not in {getattr(h, "analysis_id", "") for h in backend.programs.values()}
-    ]
-    msg = f"Bootstrap source not found: {bootstrap!r}. Loaded: {loaded_names}."
-    if on_disk:
-        msg += f" Available on disk: {on_disk}"
-    raise ValueError(msg)
+    raise ValueError(f"Bootstrap source not found: {bootstrap!r}. Use binaries() to list available names.")
 
 
 def _normalize_bootstrap_mode(mode: str) -> str:
