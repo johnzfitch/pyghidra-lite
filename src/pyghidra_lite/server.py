@@ -1119,7 +1119,10 @@ mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
 
 def _read_status_file(project_id: str) -> dict:
     """Read .analysis_status for an on-disk project directory, returning {} on failure."""
-    _validate_project_id(project_id)
+    try:
+        _validate_project_id(project_id)
+    except ValueError:
+        return {}
     status_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
     if not status_file.exists():
         return {}
@@ -1131,8 +1134,9 @@ def _read_status_file(project_id: str) -> dict:
 
 def _write_status_file(project_id: str, data: dict):
     """Atomic write of .analysis_status for a project directory."""
-    _validate_project_id(project_id)
-    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id
+    project_dir = _safe_project_path(
+        Path(_server_config.project_dir or DEFAULT_PROJECT_DIR), project_id
+    )
     project_dir.mkdir(parents=True, exist_ok=True)
     status_file = project_dir / ".analysis_status"
     tmp = status_file.with_suffix(".tmp")
@@ -1142,7 +1146,8 @@ def _write_status_file(project_id: str, data: dict):
 
 def _write_job_result(job_id: str, data: dict):
     """Atomic write of result.json for a scan job. Mirrors _write_status_file."""
-    _validate_project_id(job_id)
+    if not _UNIT_ID_RE.match(job_id):
+        raise ValueError(f"Invalid job_id: {job_id!r}")
     d = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / job_id
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / "result.json.tmp"
@@ -2200,7 +2205,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
 
         binary_name = _read_status_file(disk_match["project_id"]).get("binary_name", disk_match["analysis_id"])
         _kill_job(disk_match["analysis_id"])
-        shutil.rmtree(project_dir)
+        shutil.rmtree(project_dir, onerror=_rmtree_warn)
         return {
             "deleted": binary_name,
             "unit_id": disk_match["unit_id"],
@@ -3604,8 +3609,9 @@ def list_cmd(project_dir, as_json):
     for entry in sorted(projects_path.iterdir()):
         if not entry.is_dir():
             continue
-        # Skip directories with unrecognized names (same validation as _iter_disk_status)
-        if not _UNIT_ID_RE.match(entry.name) and parse_analysis_id(entry.name) is None:
+        try:
+            _validate_project_id(entry.name)
+        except ValueError:
             continue
         gpr_files = list(entry.glob("*.gpr"))
         if not gpr_files:
