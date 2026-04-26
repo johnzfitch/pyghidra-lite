@@ -3373,6 +3373,14 @@ def serve_cmd(
             "Shared mode with no --restrict-path: clients can import any file. "
             "Set --restrict-path for production deployments."
         )
+    if is_shared and host != "127.0.0.1":
+        logger.warning(
+            "Binding to %s exposes the server to the network. "
+            "There is no authentication -- any host that can reach this port "
+            "gets full access to all tools. Use 127.0.0.1 (default) unless "
+            "you have network-level access control.",
+            host,
+        )
     _check_prerequisites(ghidra_dir)
     with _backend_lock:
         _backend = _init_backend(eager_load=eager_load)
