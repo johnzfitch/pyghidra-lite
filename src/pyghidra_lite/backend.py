@@ -48,9 +48,8 @@ _UNIT_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 def parse_analysis_id(value: str) -> tuple[str, str] | None:
     """Parse a profile-scoped analysis identifier.
 
-    Returns (unit_id, profile) only if the unit_id portion is a valid
-    16-char hex string. This prevents path-traversal strings like
-    '../../etc-fast' from being accepted.
+    Returns (unit_id, profile) only when the unit_id portion is a valid
+    16-char hex string and the suffix is a known profile.
     """
     for suffix in ("-fast", "-default", "-deep"):
         if value.endswith(suffix):

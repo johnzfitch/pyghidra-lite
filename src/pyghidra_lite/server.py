@@ -140,7 +140,6 @@ def _validate_project_id(project_id: str) -> None:
     """Raise ValueError if project_id doesn't match expected formats.
 
     Valid formats: 16-char hex (unit_id) or 16-char hex + profile suffix (analysis_id).
-    This prevents path traversal via crafted directory or ID names.
     """
     if _UNIT_ID_RE.match(project_id):
         return
@@ -150,11 +149,7 @@ def _validate_project_id(project_id: str) -> None:
 
 
 def _safe_project_path(project_base: Path, project_id: str) -> Path:
-    """Return project_base / project_id after validating format and containment.
-
-    Ensures the resolved path stays within project_base, preventing directory
-    traversal even if project_id were somehow crafted to escape.
-    """
+    """Return project_base / project_id after validating format and containment."""
     _validate_project_id(project_id)
     result = (project_base / project_id).resolve()
     if not result.is_relative_to(project_base.resolve()):
@@ -1458,8 +1453,6 @@ class ProjectWatcher:
         self._check_and_load(path)
 
     def _check_and_load(self, status_path: Path):
-        # O_NOFOLLOW atomically rejects symlinks at open time, closing the
-        # TOCTOU window between path validation and file read.
         try:
             fd = os.open(str(status_path), os.O_RDONLY | os.O_NOFOLLOW)
         except OSError:
@@ -1474,7 +1467,6 @@ class ProjectWatcher:
             return
 
         project_id = status_path.parent.name
-        # Reject unrecognized directory names to prevent confusion or misuse.
         try:
             _validate_project_id(project_id)
         except ValueError:
@@ -1489,7 +1481,7 @@ class ProjectWatcher:
                 profile = profile or AnalysisProfile.FAST.value
                 analysis_id = make_analysis_id(project_id, profile)
             else:
-                return  # Unreachable after _validate_project_id, but safe fallback
+                return
 
         if not analysis_id:
             return
