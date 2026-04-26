@@ -431,13 +431,11 @@ def _resolve_import_path(path: str) -> Path:
                 return resolved
         except ValueError:
             continue
-    roots = ", ".join(str(root) for root in restrict_roots)
     if requested != resolved:
         raise ValueError(
-            f"Path not allowed: requested={requested}, resolves_to={resolved}. "
-            f"Restricted to: {roots}."
+            f"Path not allowed: {requested} (resolves outside restricted directories)."
         )
-    raise ValueError(f"Path not allowed: {resolved}. Restricted to: {roots}")
+    raise ValueError(f"Path not allowed: {resolved}")
 
 
 def _iter_disk_status():
@@ -1270,7 +1268,6 @@ def _merge_live_job_entry(analysis_id: str, job: dict, *, include_jobs_meta: boo
         "error",
         "started_at",
         "binary_size_bytes",
-        "binary_path",
     ):
         if key in status_data:
             entry[key] = status_data[key]
@@ -2327,7 +2324,6 @@ async def binaries(
                         "error",
                         "started_at",
                         "binary_size_bytes",
-                        "binary_path",
                         "bootstrap",
                     ):
                         if key in status_data:
@@ -3185,7 +3181,7 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
         raise ValueError("binary_path not recorded in status file.")
     binary_path = Path(binary_path_str)
     if not binary_path.exists():
-        raise FileNotFoundError(f"Original binary not found at: {binary_path}")
+        raise FileNotFoundError("Original binary no longer exists on disk.")
 
     out.mkdir(parents=True, exist_ok=True)
     strategy_used = None
