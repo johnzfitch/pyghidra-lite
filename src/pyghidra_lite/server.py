@@ -442,10 +442,13 @@ def _iter_disk_status():
         if not entry.is_dir():
             continue
         status_file = entry / ".analysis_status"
-        if not status_file.exists():
+        try:
+            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
             continue
         try:
-            status = json.loads(status_file.read_text())
+            with os.fdopen(fd, "r") as f:
+                status = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
         project_id = entry.name
@@ -1097,11 +1100,14 @@ def _read_status_file(project_id: str) -> dict:
     except ValueError:
         return {}
     status_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
-    if not status_file.exists():
+    try:
+        fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
         return {}
     try:
-        return json.loads(status_file.read_text())
-    except (json.JSONDecodeError, FileNotFoundError):
+        with os.fdopen(fd, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
         return {}
 
 
@@ -1145,7 +1151,13 @@ def _get_job_result(job_id: str) -> dict:
                     "Poll binaries(jobs=True) until complete.",
         ))
     try:
-        return json.loads(result_file.read_text())
+        fd = os.open(str(result_file), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR,
+                                 message=f"Failed to read result for {job_id!r}: {e}")) from e
+    try:
+        with os.fdopen(fd, "r") as f:
+            return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         raise McpError(ErrorData(code=INTERNAL_ERROR,
                                  message=f"Failed to read result for {job_id!r}: {e}")) from e
@@ -1591,8 +1603,13 @@ async def _recover_in_progress_jobs():
                 continue  # Already loaded by eager_load
 
         try:
-            status = json.loads(status_file.read_text())
-        except json.JSONDecodeError:
+            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            with os.fdopen(fd, "r") as f:
+                status = json.load(f)
+        except (json.JSONDecodeError, OSError):
             continue
         analysis_id = status.get("analysis_id") or analysis_id or project_id
         unit_id = status.get("unit_id") or (parse_analysis_id(analysis_id)[0] if parse_analysis_id(analysis_id) else project_id)
@@ -3237,6 +3254,10 @@ def _run_with_idle_timeout(mcp_server, idle_minutes: int) -> None:
         host=mcp_server.settings.host,
         port=mcp_server.settings.port,
         log_level=mcp_server.settings.log_level.lower(),
+        limit_concurrency=20,
+        limit_max_requests=10000,
+        timeout_keep_alive=30,
+        h11_max_incomplete_event_size=1024 * 1024,
     )
     server = uvicorn.Server(config)
 
@@ -3594,11 +3615,16 @@ def list_cmd(project_dir, as_json):
         status_file = entry / ".analysis_status"
 
         status_data = {}
-        if status_file.exists():
+        try:
+            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            pass
+        else:
             try:
-                status_data = json.loads(status_file.read_text())
-            except json.JSONDecodeError:
-                status_data = {"status": "corrupt_status"}
+                with os.fdopen(fd, "r") as f:
+                    status_data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                status_data = {}
 
         info = {
             "project_id": entry.name,
