@@ -2,7 +2,7 @@
 
 Tests CLI structure, helper functions, status file protocol,
 AnalysisProgressListener, ProjectWatcher, crash recovery, and
-MCP tool registration — all without requiring a running JVM.
+MCP tool registration -- all without requiring a running JVM.
 """
 
 import asyncio
@@ -90,7 +90,7 @@ class TestPhase1CLI:
     def test_default_group_preserves_known_commands(self):
         """Known subcommands should NOT be rerouted."""
         ctx = click.Context(server.cli)
-        # 'import' is a known command — should parse directly
+        # 'import' is a known command -- should parse directly
         # Just test that it's recognized
         assert "import" in server.cli.commands
 
@@ -254,16 +254,16 @@ class TestHelperFunctions:
     def test_read_status_file_missing(self, tmp_path, monkeypatch):
         config = server.ServerConfig(project_dir=tmp_path)
         monkeypatch.setattr(server, "_server_config", config)
-        result = server._read_status_file("nonexistent")
+        result = server._read_status_file("aabbccddeeff0011")
         assert result == {}
 
     def test_write_and_read_status_file(self, tmp_path, monkeypatch):
         config = server.ServerConfig(project_dir=tmp_path)
         monkeypatch.setattr(server, "_server_config", config)
         data = {"status": "complete", "functions": 42}
-        server._write_status_file("testunit", data)
+        server._write_status_file("aabbccddeeff0011", data)
 
-        result = server._read_status_file("testunit")
+        result = server._read_status_file("aabbccddeeff0011")
         assert result["status"] == "complete"
         assert result["functions"] == 42
 
@@ -271,9 +271,9 @@ class TestHelperFunctions:
         """Verify atomic write (no .tmp file left behind)."""
         config = server.ServerConfig(project_dir=tmp_path)
         monkeypatch.setattr(server, "_server_config", config)
-        server._write_status_file("atomictest", {"status": "testing"})
+        server._write_status_file("aabbccddeeff0022", {"status": "testing"})
 
-        project = tmp_path / "atomictest"
+        project = tmp_path / "aabbccddeeff0022"
         assert (project / ".analysis_status").exists()
         assert not (project / ".analysis_status.tmp").exists()
 
@@ -378,7 +378,7 @@ class TestProjectWatcher:
         watcher = server.ProjectWatcher(backend, tmp_path, loop)
 
         # Create a complete status file
-        unit_dir = tmp_path / "abc123"
+        unit_dir = tmp_path / "abc1230000000000"
         unit_dir.mkdir()
         status_path = unit_dir / ".analysis_status"
         status_path.write_text(json.dumps({"status": "complete"}))
@@ -397,7 +397,7 @@ class TestProjectWatcher:
 
         watcher = server.ProjectWatcher(backend, tmp_path, loop)
 
-        unit_dir = tmp_path / "abc123"
+        unit_dir = tmp_path / "abc1230000000000"
         unit_dir.mkdir()
         status_path = unit_dir / ".analysis_status"
         status_path.write_text(json.dumps({"status": "analyzing"}))
@@ -412,13 +412,13 @@ class TestProjectWatcher:
     def test_watcher_skips_already_loaded(self, tmp_path):
         backend = MagicMock()
         handle = MagicMock()
-        handle.unit_id = "abc123"
+        handle.unit_id = "abc1230000000000"
         backend.programs = {"prog": handle}
         loop = MagicMock()
 
         watcher = server.ProjectWatcher(backend, tmp_path, loop)
 
-        unit_dir = tmp_path / "abc123"
+        unit_dir = tmp_path / "abc1230000000000"
         unit_dir.mkdir()
         status_path = unit_dir / ".analysis_status"
         status_path.write_text(json.dumps({"status": "complete"}))
@@ -459,7 +459,7 @@ class TestCrashRecovery:
         monkeypatch.setattr(server, "_backend", MagicMock(programs={}))
 
         # Create an "analyzing" status with a dead PID
-        uid = "deadworker1234"
+        uid = "dead00001234abcd"
         unit_dir = tmp_path / uid
         unit_dir.mkdir()
         (unit_dir / ".analysis_status").write_text(json.dumps({
@@ -481,7 +481,7 @@ class TestCrashRecovery:
         monkeypatch.setattr(server, "_backend", MagicMock(programs={}))
         old_jobs = server._active_jobs.copy()
 
-        uid = "aliveworker123"
+        uid = "a11ce00000123456"
         unit_dir = tmp_path / uid
         unit_dir.mkdir()
         (unit_dir / ".analysis_status").write_text(json.dumps({
@@ -492,8 +492,9 @@ class TestCrashRecovery:
 
         try:
             asyncio.run(server._recover_in_progress_jobs())
-            assert uid in server._active_jobs
-            assert server._active_jobs[uid]["recovered"]
+            analysis_id = f"{uid}-fast"
+            assert analysis_id in server._active_jobs
+            assert server._active_jobs[analysis_id]["recovered"]
         finally:
             server._active_jobs.clear()
             server._active_jobs.update(old_jobs)
@@ -504,7 +505,7 @@ class TestCrashRecovery:
         monkeypatch.setattr(server, "_server_config", config)
         monkeypatch.setattr(server, "_backend", MagicMock(programs={}))
 
-        uid = "completedunit"
+        uid = "c00100ed00000001"
         unit_dir = tmp_path / uid
         unit_dir.mkdir()
         (unit_dir / ".analysis_status").write_text(json.dumps({

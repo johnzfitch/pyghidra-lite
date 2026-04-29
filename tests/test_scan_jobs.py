@@ -2,7 +2,7 @@
 
 Covers _new_job_id, _write_job_result, _run_scan_task, get_job_result,
 batch_search_strings(background=True), extract_bunfs, and the analysis_status
-scan-job branch — all without a running JVM.
+scan-job branch -- all without a running JVM.
 """
 
 import asyncio

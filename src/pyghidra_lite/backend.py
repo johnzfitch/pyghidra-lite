@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -41,11 +42,20 @@ def make_analysis_id(unit_id: str, profile: "AnalysisProfile | str") -> str:
     return f"{unit_id}-{profile_value}"
 
 
+_UNIT_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+
+
 def parse_analysis_id(value: str) -> tuple[str, str] | None:
-    """Parse a profile-scoped analysis identifier."""
+    """Parse a profile-scoped analysis identifier.
+
+    Returns (unit_id, profile) only when the unit_id portion is a valid
+    16-char hex string and the suffix is a known profile.
+    """
     for suffix in ("-fast", "-default", "-deep"):
         if value.endswith(suffix):
-            return value[:-len(suffix)], suffix[1:]
+            uid = value[: -len(suffix)]
+            if _UNIT_ID_PATTERN.match(uid):
+                return uid, suffix[1:]
     return None
 
 
@@ -657,7 +667,7 @@ class GhidraBackend:
             dest_name: Name of the target binary to annotate.
             min_func_size: Minimum function size in bytes to consider (default 16).
             max_func_size: Maximum function size in bytes to consider (default 4096).
-                           Very large functions are skipped — they're slow to search
+                           Very large functions are skipped -- they're slow to search
                            and rarely transfer cleanly across versions.
 
         Returns:
@@ -738,7 +748,7 @@ class GhidraBackend:
                 stats["errors"] += 1
                 continue
 
-            # Build signed Java byte arrays (Java byte is signed: 0xFF → -1)
+            # Build signed Java byte arrays (Java byte is signed: 0xFF -> -1)
             java_needle = JByte[size]
             java_mask = JByte[size]
             for i in range(size):
@@ -774,7 +784,7 @@ class GhidraBackend:
 
             dest_func = dest_fm.getFunctionAt(match_addr)
             if dest_func is None:
-                # Not a function entry point in dest — skip
+                # Not a function entry point in dest -- skip
                 continue
 
             if not dest_func.getName().startswith("FUN_"):
@@ -822,7 +832,7 @@ class GhidraBackend:
         if profile == AnalysisProfile.FAST:
             # Disable all expensive analyzers for quick triage (<60s).
             # Keeps: entry point, subroutine refs, basic blocks, ASCII strings,
-            # symbol table, imports/exports — enough for function listing,
+            # symbol table, imports/exports -- enough for function listing,
             # string search, and on-demand decompilation.
             slow_analyzers = [
                 "Decompiler Parameter ID",

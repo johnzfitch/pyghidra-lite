@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decompression. Accepts `payload_offset` from `detect_embedded_runtime` for uncompressed
   payloads (ASAR, Node SEA).
 - **`StringXref.section`**: Section provenance (`.rodata`, `.strtab`, etc.) added to all
-  `search_strings` results. Non-breaking — field defaults to None.
+  `search_strings` results. Non-breaking -- field defaults to None.
 - **`EmbeddedRuntime` model**: New model for runtime detection results with `type`,
   `confidence`, `strategy`, and optional `payload_offset`.
 

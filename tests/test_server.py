@@ -285,7 +285,7 @@ def _make_ghidra_tools_stub():
     gt.handle = handle
     gt.program = handle.program
     gt.decompiler = handle.decompiler
-    # Empty memory — validation runs before iteration
+    # Empty memory -- validation runs before iteration
     gt.program.getMemory().getBlocks.return_value = []
     return gt
 
@@ -321,7 +321,7 @@ def test_find_bytes_validation_invalid_hex() -> None:
 def test_find_bytes_handles_uppercase_0X_prefix() -> None:
     """Regression: 0XDEADBEEF should be handled the same as 0xdeadbeef."""
     gt = _make_ghidra_tools_stub()
-    # Should NOT raise — validation passes, returns empty list (no memory blocks)
+    # Should NOT raise -- validation passes, returns empty list (no memory blocks)
     result = gt.find_bytes("0XDEADBEEF")
     assert result == []
 

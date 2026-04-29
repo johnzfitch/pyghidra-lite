@@ -874,7 +874,7 @@ class GhidraTools:
 
         from jpype import JByte
 
-        # Build Java signed-byte arrays (Java byte is signed: 0xFF → -1)
+        # Build Java signed-byte arrays (Java byte is signed: 0xFF -> -1)
         java_needle = JByte[len(needle)]
         java_mask = JByte[len(needle)]
         for i, b in enumerate(needle):
@@ -1008,7 +1008,7 @@ class GhidraTools:
                 for sym in st.getAllSymbols(True):
                     if sym.getName() == sig["symbol"]:
                         magic_address = str(sym.getAddress())
-                        confidence = "high"  # symbol match → upgrade to high
+                        confidence = "high"  # symbol match -> upgrade to high
                         block = mem.getBlock(sym.getAddress())
                         hit_section = block.getName() if block else None
                         sym_found = True
@@ -1029,7 +1029,7 @@ class GhidraTools:
             if magic_address is None:
                 continue
 
-            # Confidence adjustments — low-confidence hits are omitted entirely
+            # Confidence adjustments -- low-confidence hits are omitted entirely
             if sig.get("section_adjust") and hit_section == ".text":
                 continue  # electron_asar in .text: likely false positive
             if sig.get("strtab_fp") and hit_section == ".strtab":
@@ -1067,10 +1067,10 @@ class GhidraTools:
         """Raw memory scan for ASCII strings, bypassing Ghidra's defined-string list.
 
         Unlike search_strings() which only finds strings Ghidra has already defined,
-        this scans raw memory blocks for printable ASCII runs — useful for lightly-
+        this scans raw memory blocks for printable ASCII runs -- useful for lightly-
         analyzed binaries or sections with no defined data.
 
-        For compressed payloads (Bun/BunFS), this tool won't find readable strings —
+        For compressed payloads (Bun/BunFS), this tool won't find readable strings --
         use detect_embedded_runtime() first. For uncompressed/lightly-compressed
         payloads (ASAR, Node SEA), pass the sections parameter or use
         extract_strings_from_blob().
@@ -1195,7 +1195,7 @@ class GhidraTools:
         """Search for multiple string patterns in one call.
 
         For mode="deep": reads all memory blocks once and scans all queries
-        simultaneously — more efficient than N separate search_strings_deep() calls.
+        simultaneously -- more efficient than N separate search_strings_deep() calls.
         For mode="indexed": iterates Ghidra's defined strings once across all queries.
         Entropy map is computed at most once for the batch, regardless of query count.
 
@@ -1205,7 +1205,7 @@ class GhidraTools:
             min_length: Minimum string length (default 4).
             skip_high_entropy: Skip sections with entropy > 7.5 (default False).
             compact: Return {query: count} (default True). If False, returns
-                     {query: [{value, address, section}]} — compact-format hits.
+                     {query: [{value, address, section}]} -- compact-format hits.
             limit_per_query: Max hits per query (default 5).
 
         Raises:
@@ -1326,7 +1326,7 @@ class GhidraTools:
         Useful for scanning uncompressed embedded payloads like ASAR or Node SEA.
         Pass the payload_offset returned by detect_embedded_runtime() as the offset.
 
-        For compressed payloads (Bun/BunFS), this won't find readable strings —
+        For compressed payloads (Bun/BunFS), this won't find readable strings --
         use external tools (extract_bunfs.py) instead.
 
         Args:

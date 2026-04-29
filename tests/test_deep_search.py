@@ -202,7 +202,7 @@ class TestExtractStringsFromBlob:
         def fake_get_bytes(addr, buf):
             n = len(buf)
             for i, b in enumerate(data[:n]):
-                buf[i] = b  # bytearray accepts 0–255
+                buf[i] = b  # bytearray accepts 0-255
             return min(n, len(data))
 
         gt.program.getMemory().getBytes.side_effect = fake_get_bytes

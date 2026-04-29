@@ -110,14 +110,14 @@ class BinaryCapabilities:
 _backend: GhidraBackend | None = None
 _capabilities: dict[str, BinaryCapabilities] = {}
 _backend_lock = threading.RLock()
-_last_access: dict[str, float] = {}  # analysis_id → time.monotonic()
+_last_access: dict[str, float] = {}  # analysis_id -> time.monotonic()
 _evicted_ids: set[str] = set()  # analysis_ids evicted from memory (still on disk)
 
 # Binaries above this threshold are auto-delegated to async analysis in load()
 _LARGE_BINARY_MB = 10
 
 # Async job tracking for analyze_binary
-_active_jobs: dict[str, dict] = {}  # unit_id → job dict
+_active_jobs: dict[str, dict] = {}  # unit_id -> job dict
 _active_jobs_lock: asyncio.Lock | None = None  # initialized in serve
 _jobs_mutex = threading.Lock()  # guards _active_jobs dict mutations from sync callers
 _worker_semaphore: asyncio.Semaphore | None = None  # initialized in serve, default 4
@@ -135,6 +135,27 @@ _SEARCH_MODES = ("indexed", "deep")
 _MAX_BATCH_XREF_TARGETS = 20
 _MAX_BATCH_SEARCH_QUERIES = 20
 _MAX_QUEUED_JOBS = 32
+
+def _validate_project_id(project_id: str) -> None:
+    """Raise ValueError if project_id doesn't match expected formats.
+
+    Valid formats: 16-char hex (unit_id) or 16-char hex + profile suffix (analysis_id).
+    """
+    if _UNIT_ID_RE.match(project_id):
+        return
+    if parse_analysis_id(project_id) is not None:
+        return
+    raise ValueError(f"Invalid project_id: {project_id!r}")
+
+
+def _safe_project_path(project_base: Path, project_id: str) -> Path:
+    """Return project_base / project_id after validating format and containment."""
+    _validate_project_id(project_id)
+    result = (project_base / project_id).resolve()
+    if not result.is_relative_to(project_base.resolve()):
+        raise ValueError(f"Path escapes project directory: {project_id!r}")
+    return result
+
 
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 LoadProfileArg = Literal["fast", "default", "deep"]
@@ -405,13 +426,11 @@ def _resolve_import_path(path: str) -> Path:
                 return resolved
         except ValueError:
             continue
-    roots = ", ".join(str(root) for root in restrict_roots)
     if requested != resolved:
         raise ValueError(
-            f"Path not allowed: requested={requested}, resolves_to={resolved}. "
-            f"Restricted to: {roots}."
+            f"Path not allowed: {requested} (resolves outside restricted directories)."
         )
-    raise ValueError(f"Path not allowed: {resolved}. Restricted to: {roots}")
+    raise ValueError(f"Path not allowed: {resolved}")
 
 
 def _iter_disk_status():
@@ -423,10 +442,13 @@ def _iter_disk_status():
         if not entry.is_dir():
             continue
         status_file = entry / ".analysis_status"
-        if not status_file.exists():
+        try:
+            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
             continue
         try:
-            status = json.loads(status_file.read_text())
+            with os.fdopen(fd, "r") as f:
+                status = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
         project_id = entry.name
@@ -647,7 +669,7 @@ def _get_handle(binary: str, profile: str | None = None):
         pass
 
     # Auto-lazy-load: find a completed project on disk by analysis_id, unit_id, or filename
-    # (raises ValueError for in-progress/ambiguous — let that propagate)
+    # (raises ValueError for in-progress/ambiguous -- let that propagate)
     disk_match = _find_on_disk(binary, profile=profile)
     if disk_match:
         analysis_id = disk_match["analysis_id"]
@@ -659,22 +681,12 @@ def _get_handle(binary: str, profile: str | None = None):
         if loaded:
             raise RuntimeError(
                 f"Hot-loaded {analysis_id!r} but program not found in backend; "
-                "internal name mismatch — try the full program name from binaries()"
+                "internal name mismatch -- try the full program name from binaries()"
             )
         raise RuntimeError(f"Hot-load failed for {analysis_id!r}; check server logs")
 
-    # Nothing found — list what's available
-    loaded_names = list(backend.programs.keys())
-    on_disk = [
-        f"{v.get('binary_name', v['analysis_id'])} [{v.get('profile')}]"
-        for _project_id, v in _iter_disk_status()
-        if v.get("status") == "complete"
-        and v["analysis_id"] not in {getattr(h, "analysis_id", "") for h in backend.programs.values()}
-    ]
-    msg = f"Binary not found: {binary!r}. Loaded: {loaded_names}."
-    if on_disk:
-        msg += f" Available on disk (auto-loads on tool call): {on_disk}"
-    raise ValueError(msg)
+    # Nothing found
+    raise ValueError(f"Binary not found: {binary!r}. Use binaries() to list available names and IDs.")
 
 
 def _handle_by_unit_id(backend: GhidraBackend, unit_id: str):
@@ -765,17 +777,7 @@ def _resolve_bootstrap_handle(backend: GhidraBackend, bootstrap: str):
             return handle
         raise RuntimeError(f"Bootstrap source {bootstrap!r} exists on disk but could not be loaded")
 
-    loaded_names = list(backend.programs.keys())
-    on_disk = [
-        f"{v.get('binary_name', v['analysis_id'])} [{v.get('profile')}]"
-        for _project_id, v in _iter_disk_status()
-        if v.get("status") == "complete"
-        and v["analysis_id"] not in {getattr(h, "analysis_id", "") for h in backend.programs.values()}
-    ]
-    msg = f"Bootstrap source not found: {bootstrap!r}. Loaded: {loaded_names}."
-    if on_disk:
-        msg += f" Available on disk: {on_disk}"
-    raise ValueError(msg)
+    raise ValueError(f"Bootstrap source not found: {bootstrap!r}. Use binaries() to list available names.")
 
 
 def _normalize_bootstrap_mode(mode: str) -> str:
@@ -865,7 +867,7 @@ def _rank_sources_blocking(exclude_name: str | None = None) -> list[dict]:
     Tracks both meaningful names and synthetic bootstrap labels. Sorting uses the
     transferable count, which includes either category and therefore better
     reflects how useful a source binary is for future bootstrap runs.
-    Results are sorted descending — index 0 is the richest source.
+    Results are sorted descending -- index 0 is the richest source.
 
     Lock is held only to snapshot the handles list; JVM enumeration runs unlocked.
     """
@@ -930,7 +932,7 @@ def get_capabilities(binary: str) -> BinaryCapabilities:
         if binary in _capabilities:
             return _capabilities[binary]
 
-        # Resolve name → handle → unit_id
+        # Resolve name -> handle -> unit_id
         handle = _get_handle(binary)
         return _ensure_capabilities(handle)
 
@@ -1093,18 +1095,27 @@ mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
 
 def _read_status_file(project_id: str) -> dict:
     """Read .analysis_status for an on-disk project directory, returning {} on failure."""
+    try:
+        _validate_project_id(project_id)
+    except ValueError:
+        return {}
     status_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
-    if not status_file.exists():
+    try:
+        fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
         return {}
     try:
-        return json.loads(status_file.read_text())
-    except (json.JSONDecodeError, FileNotFoundError):
+        with os.fdopen(fd, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
         return {}
 
 
 def _write_status_file(project_id: str, data: dict):
     """Atomic write of .analysis_status for a project directory."""
-    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id
+    project_dir = _safe_project_path(
+        Path(_server_config.project_dir or DEFAULT_PROJECT_DIR), project_id
+    )
     project_dir.mkdir(parents=True, exist_ok=True)
     status_file = project_dir / ".analysis_status"
     tmp = status_file.with_suffix(".tmp")
@@ -1114,6 +1125,8 @@ def _write_status_file(project_id: str, data: dict):
 
 def _write_job_result(job_id: str, data: dict):
     """Atomic write of result.json for a scan job. Mirrors _write_status_file."""
+    if not _UNIT_ID_RE.match(job_id):
+        raise ValueError(f"Invalid job_id: {job_id!r}")
     d = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / job_id
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / "result.json.tmp"
@@ -1138,7 +1151,13 @@ def _get_job_result(job_id: str) -> dict:
                     "Poll binaries(jobs=True) until complete.",
         ))
     try:
-        return json.loads(result_file.read_text())
+        fd = os.open(str(result_file), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR,
+                                 message=f"Failed to read result for {job_id!r}: {e}")) from e
+    try:
+        with os.fdopen(fd, "r") as f:
+            return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         raise McpError(ErrorData(code=INTERNAL_ERROR,
                                  message=f"Failed to read result for {job_id!r}: {e}")) from e
@@ -1236,7 +1255,6 @@ def _merge_live_job_entry(analysis_id: str, job: dict, *, include_jobs_meta: boo
         "error",
         "started_at",
         "binary_size_bytes",
-        "binary_path",
     ):
         if key in status_data:
             entry[key] = status_data[key]
@@ -1447,8 +1465,6 @@ class ProjectWatcher:
         self._check_and_load(path)
 
     def _check_and_load(self, status_path: Path):
-        # O_NOFOLLOW atomically rejects symlinks at open time, closing the
-        # TOCTOU window between path validation and file read.
         try:
             fd = os.open(str(status_path), os.O_RDONLY | os.O_NOFOLLOW)
         except OSError:
@@ -1463,6 +1479,10 @@ class ProjectWatcher:
             return
 
         project_id = status_path.parent.name
+        try:
+            _validate_project_id(project_id)
+        except ValueError:
+            return
         analysis_id = status.get("analysis_id")
         profile = status.get("profile")
         if not analysis_id:
@@ -1473,7 +1493,7 @@ class ProjectWatcher:
                 profile = profile or AnalysisProfile.FAST.value
                 analysis_id = make_analysis_id(project_id, profile)
             else:
-                analysis_id = project_id
+                return
 
         if not analysis_id:
             return
@@ -1561,6 +1581,11 @@ async def _recover_in_progress_jobs():
             continue
 
         project_id = entry.name
+        # Skip directories with unrecognized names
+        try:
+            _validate_project_id(project_id)
+        except ValueError:
+            continue
         with _backend_lock:
             status = _read_status_file(project_id)
             analysis_id = status.get("analysis_id")
@@ -1578,8 +1603,13 @@ async def _recover_in_progress_jobs():
                 continue  # Already loaded by eager_load
 
         try:
-            status = json.loads(status_file.read_text())
-        except json.JSONDecodeError:
+            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            with os.fdopen(fd, "r") as f:
+                status = json.load(f)
+        except (json.JSONDecodeError, OSError):
             continue
         analysis_id = status.get("analysis_id") or analysis_id or project_id
         unit_id = status.get("unit_id") or (parse_analysis_id(analysis_id)[0] if parse_analysis_id(analysis_id) else project_id)
@@ -1617,7 +1647,7 @@ async def _recover_in_progress_jobs():
 async def _autopurge_stale_projects() -> None:
     """Delete on-disk projects whose last open was more than autopurge_days days ago.
 
-    Brand-new analyses (never opened, no history entry) are always skipped — they
+    Brand-new analyses (never opened, no history entry) are always skipped -- they
     may be freshly analyzed and waiting for an agent to start working on them.
     """
     days = _server_config.autopurge_days
@@ -1638,14 +1668,14 @@ async def _autopurge_stale_projects() -> None:
         analysis_id = data["analysis_id"]
         last_open = last_opened.get(analysis_id)
         if last_open is None:
-            continue  # Never opened — brand new, skip
+            continue  # Never opened -- brand new, skip
         if last_open < cutoff_str:  # ISO UTC strings compare lexicographically
             try:
                 with _backend_lock:
                     active_ids = set(get_backend()._projects.keys()) if _backend else set()
                 if analysis_id in active_ids:
-                    continue  # in-use — skip purge
-                shutil.rmtree(project_base / project_id)
+                    continue  # in-use -- skip purge
+                shutil.rmtree(_safe_project_path(project_base, project_id))
                 purged.append((analysis_id, data.get("binary_name", analysis_id)))
                 logger.info("Autopurged %s (%s), last opened %s", data.get("binary_name", analysis_id), analysis_id, last_open)
             except OSError as e:
@@ -1658,7 +1688,7 @@ async def _autopurge_stale_projects() -> None:
 async def _eviction_monitor(interval: int = 60):
     """Periodically evict idle binaries from memory to reduce JVM heap pressure.
 
-    Binaries are unloaded from the JVM but kept on disk — the next tool call
+    Binaries are unloaded from the JVM but kept on disk -- the next tool call
     referencing an evicted binary transparently reloads it via _get_handle().
     """
     evict_minutes = _server_config.evict_after_minutes
@@ -1771,7 +1801,7 @@ def _do_import_blocking(
 
     tracker.update(40, "Import complete")
 
-    # Analysis runs outside the lock — analyzeAll() operates on a
+    # Analysis runs outside the lock -- analyzeAll() operates on a
     # per-program transaction and doesn't need the global lock.
     # Skip if program was already analyzed (preexisting on disk or in memory).
     if analyze and not handle.analyzed:
@@ -1886,7 +1916,10 @@ async def load(
                     _backend._purge_analysis(analysis_id)
             disk_match = _find_on_disk(unit_id, profile=profile)
             if disk_match:
-                proj_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / disk_match["project_id"]
+                proj_path = _safe_project_path(
+                    Path(_server_config.project_dir or DEFAULT_PROJECT_DIR),
+                    disk_match["project_id"],
+                )
                 if proj_path.exists():
                     shutil.rmtree(proj_path, onerror=_rmtree_warn)
             async with (_active_jobs_lock or nullcontext()):
@@ -1969,7 +2002,7 @@ async def load(
                 pass
 
         async with (_active_jobs_lock or nullcontext()):
-            # Already in progress? (skip check when fresh — we just cleared the job)
+            # Already in progress? (skip check when fresh -- we just cleared the job)
             if not fresh and analysis_id in _active_jobs:
                 job = _active_jobs[analysis_id]
                 if job.get("status") not in ("complete", "error"):
@@ -2144,7 +2177,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
                 raise RuntimeError(f"Failed to delete {handle.name!r} from Ghidra project")
             _kill_job(analysis_id)
             project_id = analysis_id if (project_base / analysis_id).exists() else unit_id
-            shutil.rmtree(project_base / project_id, onerror=_rmtree_warn)
+            shutil.rmtree(_safe_project_path(project_base, project_id), onerror=_rmtree_warn)
             return {"deleted": handle.name, "unit_id": unit_id, "analysis_id": analysis_id}
 
         # Disk-only (errored, incomplete, never loaded)
@@ -2152,13 +2185,13 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
         if not disk_match:
             raise ValueError(f"Not found: {name!r}. Use analysis_id or exact name from binaries().")
 
-        project_dir = project_base / disk_match["project_id"]
+        project_dir = _safe_project_path(project_base, disk_match["project_id"])
         if not project_dir.exists():
             raise ValueError(f"Project not found: {disk_match['project_id']!r}")
 
         binary_name = _read_status_file(disk_match["project_id"]).get("binary_name", disk_match["analysis_id"])
         _kill_job(disk_match["analysis_id"])
-        shutil.rmtree(project_dir)
+        shutil.rmtree(project_dir, onerror=_rmtree_warn)
         return {
             "deleted": binary_name,
             "unit_id": disk_match["unit_id"],
@@ -2280,7 +2313,6 @@ async def binaries(
                         "error",
                         "started_at",
                         "binary_size_bytes",
-                        "binary_path",
                         "bootstrap",
                     ):
                         if key in status_data:
@@ -3138,7 +3170,7 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
         raise ValueError("binary_path not recorded in status file.")
     binary_path = Path(binary_path_str)
     if not binary_path.exists():
-        raise FileNotFoundError(f"Original binary not found at: {binary_path}")
+        raise FileNotFoundError("Original binary no longer exists on disk.")
 
     out.mkdir(parents=True, exist_ok=True)
     strategy_used = None
@@ -3222,6 +3254,10 @@ def _run_with_idle_timeout(mcp_server, idle_minutes: int) -> None:
         host=mcp_server.settings.host,
         port=mcp_server.settings.port,
         log_level=mcp_server.settings.log_level.lower(),
+        limit_concurrency=20,
+        limit_max_requests=10000,
+        timeout_keep_alive=30,
+        h11_max_incomplete_event_size=1024 * 1024,
     )
     server = uvicorn.Server(config)
 
@@ -3353,9 +3389,14 @@ def serve_cmd(
         evict_after_minutes=evict_after,
         min_loaded=min_loaded,
     )
+    if is_shared and host != "127.0.0.1" and not restrict_paths:
+        logger.error(
+            "--restrict-path is required when binding to non-loopback address."
+        )
+        raise SystemExit(1)
     if is_shared and not restrict_paths:
         logger.warning(
-            "Shared mode with no --restrict-path: clients can import any file. "
+            "Shared mode with no --restrict-path. "
             "Set --restrict-path for production deployments."
         )
     _check_prerequisites(ghidra_dir)
@@ -3562,6 +3603,10 @@ def list_cmd(project_dir, as_json):
     for entry in sorted(projects_path.iterdir()):
         if not entry.is_dir():
             continue
+        try:
+            _validate_project_id(entry.name)
+        except ValueError:
+            continue
         gpr_files = list(entry.glob("*.gpr"))
         if not gpr_files:
             continue
@@ -3570,11 +3615,16 @@ def list_cmd(project_dir, as_json):
         status_file = entry / ".analysis_status"
 
         status_data = {}
-        if status_file.exists():
+        try:
+            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            pass
+        else:
             try:
-                status_data = json.loads(status_file.read_text())
-            except json.JSONDecodeError:
-                status_data = {"status": "corrupt_status"}
+                with os.fdopen(fd, "r") as f:
+                    status_data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                status_data = {}
 
         info = {
             "project_id": entry.name,

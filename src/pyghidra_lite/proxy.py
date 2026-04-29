@@ -121,12 +121,12 @@ def _autostart_backend(host: str, port: int) -> None:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            # Another proxy is already starting the backend — wait for it
+            # Another proxy is already starting the backend -- wait for it
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             # By the time we get the lock, backend should be up
             if _is_backend_alive(host, port):
                 return
-            # Other starter failed — fall through and try ourselves
+            # Other starter failed -- fall through and try ourselves
 
         # Re-check after acquiring lock (another process may have started it)
         if _is_backend_alive(host, port):
@@ -142,7 +142,7 @@ def _autostart_backend(host: str, port: int) -> None:
             "--host", host,
             "--idle-timeout", "30",
         ]
-        logger.info("Auto-starting backend: %s", " ".join(cmd))
+        logger.info("Auto-starting backend on port %d", port)
 
         proc = subprocess.Popen(
             cmd,
@@ -160,7 +160,7 @@ def _autostart_backend(host: str, port: int) -> None:
                 logger.info("Backend is ready on port %d (pid %d)", port, proc.pid)
                 return
 
-        # Timed out — kill the orphaned process
+        # Timed out -- kill the orphaned process
         try:
             proc.kill()
             proc.wait(timeout=2)
