@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # Cache TTL in seconds (functions don't change during analysis session)
 CACHE_TTL = 300
 
+# Upper bounds for call-graph traversal so a high-fan-out function at depth=5
+# can't emit thousands of nodes/edges in a single response.
+MAX_GRAPH_NODES = 250
+MAX_GRAPH_EDGES = 1000
+
 # Capability tags for common APIs
 CAPABILITY_TAGS = {
     # Crypto
@@ -720,6 +725,13 @@ class GhidraTools:
         nodes = {}
         edges = []
         visited = set()
+        state = {"truncated": False}
+
+        def budget_exhausted() -> bool:
+            if len(nodes) >= MAX_GRAPH_NODES or len(edges) >= MAX_GRAPH_EDGES:
+                state["truncated"] = True
+                return True
+            return False
 
         def add_node(f):
             name = f.getName()
@@ -741,6 +753,8 @@ class GhidraTools:
             visited.add(name)
 
             for callee in f.getCalledFunctions(None):
+                if budget_exhausted():
+                    return
                 callee_name = add_node(callee)
                 edges.append({"from": name, "to": callee_name, "type": "calls"})
                 if current_depth < depth:
@@ -757,6 +771,8 @@ class GhidraTools:
             fm = self.program.getFunctionManager()
             rm = self.program.getReferenceManager()
             for ref in rm.getReferencesTo(f.getEntryPoint()):
+                if budget_exhausted():
+                    return
                 caller = fm.getFunctionContaining(ref.getFromAddress())
                 if caller:
                     caller_name = add_node(caller)
@@ -773,11 +789,15 @@ class GhidraTools:
             visited.clear()
             traverse_callers(func, 0)
 
-        return {
+        result = {
             "root": func.getName(),
             "nodes": list(nodes.values()),
             "edges": edges,
         }
+        if state["truncated"]:
+            result["truncated"] = True
+            result["limits"] = {"max_nodes": MAX_GRAPH_NODES, "max_edges": MAX_GRAPH_EDGES}
+        return result
 
     def get_memory_map(self) -> list[dict]:
         """Get memory layout with sections and permissions.

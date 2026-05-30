@@ -156,6 +156,33 @@ def test_bearer_auth_accepts_correct_token() -> None:
     assert sent[0]["status"] == 200
 
 
+def test_unit_id_for_caches_until_file_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """unit_id is cached by (path, mtime, size) and recomputed when content changes."""
+    monkeypatch.setattr(server, "_unit_id_cache", {})
+    calls = {"n": 0}
+
+    def fake_hash(p):
+        calls["n"] += 1
+        return f"{calls['n']:016x}"
+
+    monkeypatch.setattr(server, "compute_unit_id_streaming", fake_hash)
+
+    f = tmp_path / "bin"
+    f.write_bytes(b"abc")
+    first = server._unit_id_for(f)
+    second = server._unit_id_for(f)
+    assert first == second
+    assert calls["n"] == 1  # second call served from cache
+
+    # Changing size (and mtime) busts the cache.
+    f.write_bytes(b"abcd")
+    third = server._unit_id_for(f)
+    assert calls["n"] == 2
+    assert third != first
+
+
 def test_guarded_tool_call_preserves_validation_errors() -> None:
     def op():
         raise ValueError("bad")

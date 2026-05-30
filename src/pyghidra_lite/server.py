@@ -115,6 +115,13 @@ _backend_lock = threading.RLock()
 _last_access: dict[str, float] = {}  # analysis_id -> time.monotonic()
 _evicted_ids: set[str] = set()  # analysis_ids evicted from memory (still on disk)
 
+# Cache of computed unit_ids keyed by (resolved path, mtime_ns, size) so that
+# re-loading an already-analyzed binary doesn't re-stream the whole file just
+# to recompute its content hash. Bounded to avoid unbounded growth.
+_unit_id_cache: dict[tuple[str, int, int], str] = {}
+_unit_id_cache_lock = threading.Lock()
+_UNIT_ID_CACHE_MAX = 256
+
 # Binaries above this threshold are auto-delegated to async analysis in load()
 _LARGE_BINARY_MB = 10
 
@@ -463,6 +470,28 @@ def _resolve_import_path(path: str) -> Path:
         f"Path not allowed: requested={requested}, resolves_to={resolved} "
         "(outside restricted directories)."
     )
+
+
+def _unit_id_for(p: Path) -> str:
+    """Compute (or reuse a cached) content-hash unit_id for a file.
+
+    compute_unit_id_streaming reads the entire file -- expensive for large
+    binaries and previously paid on every load(), even cache hits. Key the cache
+    on (resolved path, mtime_ns, size): if any of those change the file is
+    re-hashed, so a modified binary never reuses a stale id.
+    """
+    st = p.stat()
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    with _unit_id_cache_lock:
+        cached = _unit_id_cache.get(key)
+    if cached is not None:
+        return cached
+    unit_id = compute_unit_id_streaming(p)
+    with _unit_id_cache_lock:
+        if len(_unit_id_cache) >= _UNIT_ID_CACHE_MAX:
+            _unit_id_cache.clear()  # simple bounded reset; recomputation is rare
+        _unit_id_cache[key] = unit_id
+    return unit_id
 
 
 def _assert_within_restrict_roots(p: Path) -> None:
@@ -2042,7 +2071,7 @@ async def load(
 
     kind = detect_binary_kind(p, header)
     file_size_mb = p.stat().st_size / (1024 * 1024)
-    unit_id = compute_unit_id_streaming(p)
+    unit_id = _unit_id_for(p)
     analysis_id = make_analysis_id(unit_id, profile)
     bootstrap_source = None
     bootstrap_mode = _normalize_bootstrap_mode(bootstrap_mode)
