@@ -178,6 +178,22 @@ By default, pyghidra-lite can load binaries from any path (the MCP client handle
 }
 ```
 
+#### Shared HTTP transport (network access)
+
+The HTTP/SSE transports are shared and apply DNS-rebinding protection (Host/Origin
+validation). Binding to a non-loopback address additionally **requires** both
+`--restrict-path` and a bearer token:
+
+```bash
+pyghidra-lite serve -t streamable-http --host 0.0.0.0 \
+  --restrict-path /opt/targets \
+  --auth-token "$PYGHIDRA_LITE_AUTH_TOKEN" \
+  --allowed-host re.example.com:8000   # if fronted under another hostname
+```
+
+Clients then send `Authorization: Bearer <token>` on every request. Terminate TLS
+at a reverse proxy for remote access.
+
 ## Tools (8)
 
 pyghidra-lite provides 8 consolidated tools that auto-detect format (ELF/Mach-O/PE) and language (Swift/ObjC/Hermes):

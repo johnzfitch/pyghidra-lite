@@ -16,6 +16,27 @@ pyghidra-lite includes several security features:
 - Use `--restrict-path` to lock down to specific directories
 - Required when binding to non-loopback addresses
 - Environment variable: `PYGHIDRA_LITE_RESTRICT_PATHS` (colon-separated)
+- Import paths are resolved to their canonical target and re-validated
+  immediately before import, so a symlink swapped after the check cannot
+  redirect the load outside an allowed root (TOCTOU defense-in-depth)
+
+### Network Transport Hardening (HTTP/SSE)
+- **Loopback by default**: loopback binds are detected via `ipaddress`
+  (127.0.0.0/8, ::1, `localhost`), not a literal string compare
+- **DNS-rebinding protection**: Host/Origin headers are validated against an
+  allow-list of localhost variants plus the configured bind host. Front the
+  server under another hostname with `--allowed-host host:port`
+- **Bearer auth**: `--auth-token` (or `PYGHIDRA_LITE_AUTH_TOKEN`) enforces a
+  constant-time token check on every HTTP request. It is **required** for
+  non-loopback binds — the server has no other access control, so reaching the
+  port must not be enough to call tools such as `delete`
+- **Tool annotations**: every tool advertises MCP behavioral hints
+  (`readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`) so
+  clients can apply safe auto-approve / confirmation policies
+
+### Error Disclosure
+- Outward-facing error messages are sanitized to redact server-side absolute
+  paths (project dir, runtime home, home directory); full detail stays in logs
 
 ### Project Isolation
 - Each binary gets isolated Ghidra project
@@ -34,9 +55,12 @@ pyghidra-lite includes several security features:
 When running pyghidra-lite as an MCP server:
 
 1. **Path Restrictions**: Use `--restrict-path` (required for non-loopback hosts)
-2. **Untrusted Binaries**: Ghidra analyzes but doesn't execute binaries
-3. **Resource Limits**: Set appropriate timeouts for decompilation
-4. **Transport**: stdio (default) is per-session; HTTP transports are shared
+2. **Authentication**: Set `--auth-token` for HTTP/SSE (required for non-loopback
+   binds); terminate TLS at a reverse proxy for remote access
+3. **Untrusted Binaries**: Ghidra analyzes but doesn't execute binaries
+4. **Resource Limits**: Set appropriate timeouts for decompilation
+5. **Transport**: stdio (default) is per-session; HTTP transports are shared and
+   apply DNS-rebinding protection plus optional bearer auth
 
 ### Known Limitations
 

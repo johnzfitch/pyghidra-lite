@@ -5,6 +5,43 @@ All notable changes to pyghidra-lite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **MCP tool annotations**: every tool now publishes `ToolAnnotations`
+  (`title` + `readOnlyHint` / `destructiveHint` / `idempotentHint` /
+  `openWorldHint`) so clients can apply safe auto-approve / confirmation UX.
+  `delete` is marked destructive; the six analysis tools are read-only and
+  idempotent; `load` mutates but is non-destructive.
+- **HTTP transport hardening**: DNS-rebinding protection (Host/Origin
+  validation) for all HTTP/SSE binds, a static bearer-token guard via
+  `--auth-token` / `PYGHIDRA_LITE_AUTH_TOKEN`, and `--allowed-host` for serving
+  behind another hostname. A bearer token is now required for non-loopback binds.
+
+### Changed
+- `info`, `code`, and `xrefs` are now async and run their blocking Ghidra work
+  off the event loop (via `asyncio.to_thread`), so a single decompile no longer
+  freezes the whole shared HTTP server; `functions` and `search` offload their
+  blocking work the same way.
+- `GhidraTools` is cached per binary handle, so its function-name index and list
+  caches survive between calls instead of being rebuilt every time.
+- Loopback bind detection uses `ipaddress` (127.0.0.0/8, ::1, `localhost`)
+  instead of a literal `127.0.0.1` string compare.
+- Outward-facing error messages redact server-side absolute paths.
+
+### Fixed
+- Import paths are re-validated against the restrict roots immediately before
+  import (TOCTOU defense-in-depth); the "path not allowed" error now reports
+  both the requested path and where it resolved to.
+- Background search/extract jobs are bounded by the same queue cap as analysis
+  jobs, preventing unbounded `_active_jobs` growth.
+- `xrefs(depth>1)` call graphs are capped (max nodes/edges) and flagged as
+  `truncated` instead of returning unbounded payloads.
+- `load()` caches the binary content hash by `(path, mtime, size)` so an
+  already-analyzed binary isn't re-hashed from scratch on every call.
+- Removed a dead `depth = min(depth, 5)` line in `xrefs` that shadowed the
+  closure variable (would raise `UnboundLocalError` on `depth>1`).
+
 ## [0.5.1] - 2026-03-12
 
 ### Changed
