@@ -99,6 +99,45 @@ def test_guarded_tool_call_preserves_validation_errors() -> None:
         server._guarded_tool_call("test", op)
 
 
+def test_guarded_tool_call_redacts_paths_in_generic_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unexpected exceptions must not leak absolute server paths to clients."""
+    project_dir = tmp_path / "projects"
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=project_dir))
+
+    leaky = str(project_dir / "abcdef0123456789" / "secret.gpr")
+
+    def op():
+        raise KeyError(f"boom at {leaky}")
+
+    with pytest.raises(RuntimeError) as exc:
+        server._guarded_tool_call("decompile", op)
+
+    msg = str(exc.value)
+    assert str(project_dir) not in msg
+    assert "<project-dir>" in msg
+
+
+def test_assert_within_restrict_roots_rejects_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.touch()
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(restrict_paths=[root]))
+
+    # Inside an allowed root: passes.
+    inside = root / "ok.bin"
+    inside.touch()
+    server._assert_within_restrict_roots(inside)
+
+    # Outside every root: rejected.
+    with pytest.raises(ValueError):
+        server._assert_within_restrict_roots(outside)
+
+
 def test_available_tools_always_returns_8_consolidated() -> None:
     """After consolidation, _available_tools always returns the same 8 tools."""
     caps = server.BinaryCapabilities(

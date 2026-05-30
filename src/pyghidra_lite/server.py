@@ -437,7 +437,15 @@ def _init_backend(eager_load: bool = False) -> GhidraBackend:
 
 
 def _resolve_import_path(path: str) -> Path:
-    """Resolve and optionally enforce restrict-path policy for imports."""
+    """Resolve and enforce restrict-path policy for imports.
+
+    Returns the fully resolved, canonical path (all symlinks collapsed). Callers
+    must use this resolved path for the actual import: because it is canonical,
+    re-opening it cannot be redirected by swapping a symlink component after the
+    check (the restricted-root decision is made on the real target). When the
+    resolved target lies outside every restricted root, the error reports both
+    the requested path and where it resolved to, so a blocked symlink is obvious.
+    """
     requested = Path(path).expanduser()
     resolved = requested.resolve()
     restrict_roots = _server_config.resolved_restrict_paths()
@@ -449,11 +457,32 @@ def _resolve_import_path(path: str) -> Path:
                 return resolved
         except ValueError:
             continue
-    if requested != resolved:
-        raise ValueError(
-            f"Path not allowed: {requested} (resolves outside restricted directories)."
-        )
-    raise ValueError(f"Path not allowed: {resolved}")
+    raise ValueError(
+        f"Path not allowed: requested={requested}, resolves_to={resolved} "
+        "(outside restricted directories)."
+    )
+
+
+def _assert_within_restrict_roots(p: Path) -> None:
+    """Re-check that an already-resolved path is inside the restrict roots.
+
+    Defense-in-depth against a time-of-check/time-of-use swap between resolving
+    the import path and actually importing it: re-resolve right before use and
+    confirm containment still holds. No-op when no roots are configured.
+    """
+    restrict_roots = _server_config.resolved_restrict_paths()
+    if not restrict_roots:
+        return
+    resolved = p.resolve()
+    for root in restrict_roots:
+        try:
+            if resolved.is_relative_to(root):
+                return
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Path not allowed: {resolved} (outside restricted directories)."
+    )
 
 
 def _iter_disk_status():
@@ -869,6 +898,33 @@ def _available_tools(caps: BinaryCapabilities) -> list[str]:
     return ["load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"]
 
 
+def _sanitize_error_text(text: str) -> str:
+    """Redact server-side absolute paths from outward-facing error text.
+
+    Internal exceptions (Ghidra/JVM, filesystem) frequently embed absolute paths
+    that disclose the project-dir layout and the server's home directory to MCP
+    clients -- a real concern for shared/network deployments. Replace the known
+    server roots with placeholders; full, unredacted detail still goes to the
+    logs via logger.exception.
+    """
+    cfg = _server_config
+    redactions: list[tuple[str, str]] = []
+    pd = cfg.project_dir or DEFAULT_PROJECT_DIR
+    if pd:
+        redactions.append((str(Path(pd)), "<project-dir>"))
+    if cfg.runtime_home:
+        redactions.append((str(Path(cfg.runtime_home)), "<runtime-home>"))
+    try:
+        redactions.append((str(Path.home()), "~"))
+    except (RuntimeError, OSError):
+        pass
+    # Longest needle first so nested roots (project-dir under home) redact fully.
+    for needle, repl in sorted(redactions, key=lambda r: len(r[0]), reverse=True):
+        if needle and needle not in ("/", "") and needle in text:
+            text = text.replace(needle, repl)
+    return text
+
+
 def _guarded_tool_call(action: str, op):
     try:
         return op()
@@ -876,7 +932,7 @@ def _guarded_tool_call(action: str, op):
         raise
     except Exception as exc:
         logger.exception("%s failed", action)
-        raise RuntimeError(f"{action} failed: {exc}") from exc
+        raise RuntimeError(f"{action} failed: {_sanitize_error_text(str(exc))}") from exc
 
 
 def _with_handle(action: str, binary: str, op):
@@ -1874,6 +1930,9 @@ def _do_import_blocking(
     tool calls aren't blocked for the entire analysis duration.
     """
     tracker.update(10, "Loading file")
+
+    # Re-validate containment right before import (TOCTOU defense-in-depth).
+    _assert_within_restrict_roots(p)
 
     # Hold lock only for the import (mutates shared state)
     with _backend_lock:
