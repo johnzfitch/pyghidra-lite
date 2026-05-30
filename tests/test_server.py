@@ -211,6 +211,49 @@ def test_guarded_tool_call_redacts_paths_in_generic_errors(
     assert "<project-dir>" in msg
 
 
+def test_sanitize_redacts_relative_project_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative --project-dir must still redact the absolute paths in errors."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=Path("./projects")))
+
+    abs_leak = str((tmp_path / "projects" / "abcdef0123456789").resolve())
+    out = server._sanitize_error_text(f"boom at {abs_leak}/p.gpr")
+
+    assert abs_leak not in out
+    assert "<project-dir>" in out
+
+
+def test_locked_tools_holds_backend_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_locked_tools must hold _backend_lock while the JVM work runs."""
+    import threading
+
+    monkeypatch.setattr(server, "_tools_for", lambda h: "TOOLS")
+    captured: dict = {}
+
+    def work(tools):
+        captured["tools"] = tools
+        # A different thread must NOT be able to grab the lock while we hold it.
+        result: dict = {}
+
+        def other():
+            result["got"] = server._backend_lock.acquire(blocking=False)
+            if result["got"]:
+                server._backend_lock.release()
+
+        t = threading.Thread(target=other)
+        t.start()
+        t.join()
+        captured["other_got_lock"] = result["got"]
+        return "RESULT"
+
+    out = server._locked_tools(object(), work)
+    assert out == "RESULT"
+    assert captured["tools"] == "TOOLS"
+    assert captured["other_got_lock"] is False
+
+
 def test_assert_within_restrict_roots_rejects_escape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

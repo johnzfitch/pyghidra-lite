@@ -14,7 +14,7 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
@@ -940,15 +940,24 @@ def _sanitize_error_text(text: str) -> str:
     """
     cfg = _server_config
     redactions: list[tuple[str, str]] = []
-    pd = cfg.project_dir or DEFAULT_PROJECT_DIR
-    if pd:
-        redactions.append((str(Path(pd)), "<project-dir>"))
-    if cfg.runtime_home:
-        redactions.append((str(Path(cfg.runtime_home)), "<runtime-home>"))
-    try:
-        redactions.append((str(Path.home()), "~"))
-    except (RuntimeError, OSError):
-        pass
+
+    def add_root(value, repl: str) -> None:
+        # Exceptions report absolute paths, so redact the resolved form. Keep the
+        # raw configured form too in case it appears verbatim (e.g. a relative
+        # --project-dir like ./projects echoed back before resolution).
+        if not value:
+            return
+        raw = Path(value)
+        forms = {str(raw)}
+        with suppress(RuntimeError, OSError):
+            forms.add(str(raw.expanduser().resolve()))
+        for form in forms:
+            redactions.append((form, repl))
+
+    add_root(cfg.project_dir or DEFAULT_PROJECT_DIR, "<project-dir>")
+    add_root(cfg.runtime_home, "<runtime-home>")
+    with suppress(RuntimeError, OSError):
+        add_root(Path.home(), "~")
     # Longest needle first so nested roots (project-dir under home) redact fully.
     for needle, repl in sorted(redactions, key=lambda r: len(r[0]), reverse=True):
         if needle and needle not in ("/", "") and needle in text:
@@ -1004,6 +1013,18 @@ def _tools_for(handle) -> GhidraTools:
     if d is not None:
         d["_tools_cache"] = cached
     return cached
+
+
+def _locked_tools(handle, work):
+    """Run a blocking GhidraTools operation under _backend_lock.
+
+    The other read tools hold _backend_lock for their whole op (via
+    _with_handle), so JVM access is serialized across worker threads. search
+    resolves its handle off-lock for metadata, but its actual Ghidra calls must
+    take the same lock so concurrent worker threads never touch the JVM at once.
+    """
+    with _backend_lock:
+        return work(_tools_for(handle))
 
 
 def _rank_sources_blocking(exclude_name: str | None = None) -> list[dict]:
@@ -3191,8 +3212,9 @@ async def search(
     limit = _validate_minimum("limit", limit, 1)
 
     # Handle resolution may hot-load an evicted binary from disk -- offload it.
+    # JVM work below runs through _locked_tools so it is serialized with the
+    # other read tools under _backend_lock (not held during handle resolution).
     handle = await asyncio.to_thread(_get_handle, binary)
-    tools = _tools_for(handle)
 
     # Batch search
     if isinstance(query, list):
@@ -3208,9 +3230,9 @@ async def search(
             with _jobs_mutex:
                 _active_jobs[job_id] = job
 
-            fn = lambda: {"results": tools.batch_search_strings(
+            fn = lambda: _locked_tools(handle, lambda t: {"results": t.batch_search_strings(
                 query, mode=mode, limit_per_query=limit,
-            )}
+            )})
             asyncio.create_task(_run_scan_task(job_id, job, fn))
             return {
                 "job_id": job_id,
@@ -3219,8 +3241,10 @@ async def search(
             }
 
         return await asyncio.to_thread(
-            lambda: {"queries": query,
-                     "results": tools.batch_search_strings(query, mode=mode, limit_per_query=limit)}
+            lambda: _locked_tools(handle, lambda t: {
+                "queries": query,
+                "results": t.batch_search_strings(query, mode=mode, limit_per_query=limit),
+            })
         )
 
     # Single query searches
@@ -3250,8 +3274,9 @@ async def search(
             "hint": "Poll binaries(jobs=True); completed scan jobs include result when available.",
         }
 
-    # Remaining single-query searches are blocking JVM work -- run off the loop.
-    def _single() -> dict:
+    # Remaining single-query searches are blocking JVM work -- run off the loop,
+    # serialized under _backend_lock via _locked_tools.
+    def _single(tools) -> dict:
         if type == "blob":
             parts = query.split(",")
             offset = parts[0].strip()
@@ -3304,7 +3329,7 @@ async def search(
             ],
         }
 
-    return await asyncio.to_thread(_single)
+    return await asyncio.to_thread(lambda: _locked_tools(handle, _single))
 
 
 # =============================================================================
@@ -3356,7 +3381,9 @@ def _kill_job(analysis_id: str) -> None:
 # Keep _extract_bunfs_blocking for search(type="extract")
 def _extract_bunfs_blocking(handle, out: Path) -> dict:
     """Extract the bunfs filesystem from a Bun binary into readable JS files."""
-    rt_info = _tools_for(handle).detect_embedded_runtime(compact=False)
+    # Only the runtime detection touches the JVM -- serialize that under the
+    # backend lock; the bun subprocess below runs unlocked (it can take minutes).
+    rt_info = _locked_tools(handle, lambda t: t.detect_embedded_runtime(compact=False))
     bun_rt = next((r for r in rt_info.get("runtimes", []) if r["type"] == "bunfs"), None)
     if not bun_rt:
         raise ValueError("No bunfs payload detected.")
