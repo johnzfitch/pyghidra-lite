@@ -26,7 +26,7 @@ from mcp.server import Server
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 from mcp.shared.exceptions import McpError
-from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
+from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData, ToolAnnotations
 
 from pyghidra_lite import __version__
 import json
@@ -180,6 +180,29 @@ SearchQueryArg = str | Annotated[list[str], Field(
 def _new_job_id() -> str:
     """Generate a random 16-hex scan job ID (passes _UNIT_ID_RE)."""
     return secrets.token_hex(8)
+
+
+# Non-terminal job statuses that count against the queue cap.
+_ACTIVE_JOB_STATES = ("queued", "analyzing", "running")
+
+
+def _reject_if_jobs_full() -> None:
+    """Raise if too many jobs are already in flight.
+
+    Background search/extract jobs previously had no cap (only analysis jobs in
+    load() did), so a client could spawn unbounded scans. Mirror the load()
+    guard so all background work shares one ceiling.
+    """
+    with _jobs_mutex:
+        active = sum(
+            1 for j in _active_jobs.values()
+            if j.get("status") in _ACTIVE_JOB_STATES
+        )
+    if active >= _MAX_QUEUED_JOBS:
+        raise ValueError(
+            f"Job queue full ({active} active). "
+            "Wait for current jobs to complete or cancel with delete()."
+        )
 
 
 @dataclass
@@ -861,6 +884,41 @@ def _with_handle(action: str, binary: str, op):
         return _guarded_tool_call(action, lambda: op(_get_handle(binary)))
 
 
+async def _with_handle_async(action: str, binary: str, op):
+    """Run a blocking handle operation off the event loop.
+
+    Ghidra/JVM work (decompilation, reference walking, section iteration) is
+    synchronous and can take seconds. Executing it directly in an async tool
+    body would block the whole server -- under the shared HTTP transport a
+    single decompile would freeze progress notifications and every other
+    client's request. Offloading to a worker thread keeps the loop responsive;
+    `_backend_lock` still serializes JVM access across threads.
+    """
+    return await asyncio.to_thread(_with_handle, action, binary, op)
+
+
+def _tools_for(handle) -> GhidraTools:
+    """Return a per-handle GhidraTools, reusing its caches across calls.
+
+    GhidraTools builds a function-name index and caches function/symbol lists
+    (with a TTL). The code used to do ``GhidraTools(handle)`` fresh on every
+    info/code/functions/xrefs/search call, which threw those caches away each
+    time and forced a full getFunctions() walk on every name lookup. Caching it
+    on the handle lets the index survive between calls; it is discarded
+    automatically when the handle is evicted and reloaded (a new handle object).
+    """
+    # Read/write through __dict__ so the cache key never collides with attribute
+    # auto-vivification (e.g. MagicMock handles in tests) and so a handle without
+    # a writable __dict__ simply falls back to a fresh instance.
+    d = getattr(handle, "__dict__", None)
+    if d is not None and "_tools_cache" in d:
+        return d["_tools_cache"]
+    cached = GhidraTools(handle)
+    if d is not None:
+        d["_tools_cache"] = cached
+    return cached
+
+
 def _rank_sources_blocking(exclude_name: str | None = None) -> list[dict]:
     """Rank loaded+analyzed binaries by transferable named function count.
 
@@ -1087,6 +1145,30 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
 
 
 mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
+
+
+# =============================================================================
+# TOOL ANNOTATIONS (MCP spec behavioral hints for clients/users)
+# =============================================================================
+# Per the MCP tool-annotations guidance, every tool advertises whether it is
+# read-only, destructive, idempotent, and whether it touches the outside world.
+# These are advisory hints (untrusted by spec) but let clients render safe
+# auto-approve / confirmation UX. All pyghidra-lite tools operate on locally
+# loaded binaries (no internet), so openWorldHint is False throughout.
+
+def _read_only(title: str) -> ToolAnnotations:
+    """Annotations for a read-only, idempotent analysis tool.
+
+    Never mutates the binary, on-disk project, or server state; repeated calls
+    with the same arguments return the same result.
+    """
+    return ToolAnnotations(
+        title=title,
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
 
 
 # =============================================================================
@@ -1831,7 +1913,15 @@ def _do_import_blocking(
 # CONSOLIDATED TOOLS (8 tools replacing 58)
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Load Binary",
+        readOnlyHint=False,  # imports the binary and creates an on-disk project
+        destructiveHint=False,  # never deletes existing data (fresh re-imports in place)
+        idempotentHint=False,  # may kick off analysis / transfer bootstrap names
+        openWorldHint=False,  # operates on the local filesystem only
+    )
+)
 async def load(
     path: NonEmptyStr,
     ctx: Context,
@@ -2142,7 +2232,15 @@ async def load(
         raise RuntimeError(f"Import failed: {e}") from e
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Delete Binary",
+        readOnlyHint=False,
+        destructiveHint=True,  # permanently removes the project and any worker
+        idempotentHint=True,  # deleting an already-removed binary is a no-op
+        openWorldHint=False,
+    )
+)
 async def delete(name: NonEmptyStr, ctx: Context) -> dict:
     """Permanently remove a binary, its on-disk Ghidra project, and any running
     analysis worker. Use this to free disk space, clean up failed analyses, or
@@ -2202,7 +2300,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
         return _guarded_tool_call("delete", op)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("List Binaries"))
 async def binaries(
     ctx: Context,
     jobs: bool = False,
@@ -2325,8 +2423,8 @@ async def binaries(
         return _guarded_tool_call("binaries", op)
 
 
-@mcp.tool()
-def info(
+@mcp.tool(annotations=_read_only("Binary Info"))
+async def info(
     binary: NonEmptyStr,
     ctx: Context,
     detail: InfoDetailArg = "summary",
@@ -2399,7 +2497,7 @@ def info(
         if detail == "summary":
             return base
 
-        tools = GhidraTools(handle)
+        tools = _tools_for(handle)
 
         if detail == "entropy":
             try:
@@ -2517,10 +2615,10 @@ def info(
 
         return base
 
-    return _with_handle("info", binary, op)
+    return await _with_handle_async("info", binary, op)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("List Functions"))
 async def functions(
     binary: NonEmptyStr,
     ctx: Context,
@@ -2588,7 +2686,7 @@ async def functions(
         return [{"mangled": demangle, "demangled": demangle_swift(demangle)}]
 
     def op(handle):
-        tools = GhidraTools(handle)
+        tools = _tools_for(handle)
         caps = _ensure_capabilities(handle)
 
         if type == "swift":
@@ -2651,13 +2749,13 @@ async def functions(
         funcs = tools.list_functions(pattern=query, limit=limit)
         return [{"name": f.name, "addr": f.address} for f in funcs]
 
-    results = _with_handle("functions", binary, op)
+    results = await _with_handle_async("functions", binary, op)
     await _warn_if_limit_reached(ctx, "functions", limit, len(results))
     return results
 
 
-@mcp.tool()
-def code(
+@mcp.tool(annotations=_read_only("Read Code"))
+async def code(
     binary: NonEmptyStr,
     target: CodeTargetArg,
     ctx: Context,
@@ -2705,7 +2803,7 @@ def code(
     what = _validate_choice("what", what, _CODE_WHATS)
 
     def op(handle):
-        tools = GhidraTools(handle)
+        tools = _tools_for(handle)
 
         # Handle batch decompile
         if isinstance(target, list):
@@ -2805,11 +2903,11 @@ def code(
 
         return result
 
-    return _with_handle("code", binary, op)
+    return await _with_handle_async("code", binary, op)
 
 
-@mcp.tool()
-def xrefs(
+@mcp.tool(annotations=_read_only("Cross-References"))
+async def xrefs(
     binary: NonEmptyStr,
     target: XrefsTargetArg,
     ctx: Context,
@@ -2885,7 +2983,7 @@ def xrefs(
             }
 
         handle = _get_handle(binary)
-        tools = GhidraTools(handle)
+        tools = _tools_for(handle)
 
         # Batch xrefs
         if isinstance(target, list):
@@ -2903,9 +3001,8 @@ def xrefs(
                     result[t] = []
             return {"xrefs": result}
 
-        # Call graph (depth > 1)
+        # Call graph (depth > 1; Field already caps depth at 5)
         if depth > 1:
-            depth = min(depth, 5)
             graph_direction = "both" if direction == "to" else direction
             if direction == "from":
                 graph_direction = "callees"
@@ -2929,11 +3026,14 @@ def xrefs(
             ],
         }
 
-    with _backend_lock:
-        return _guarded_tool_call("xrefs", op)
+    def _run():
+        with _backend_lock:
+            return _guarded_tool_call("xrefs", op)
+
+    return await asyncio.to_thread(_run)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Search Binary"))
 async def search(
     binary: NonEmptyStr,
     query: SearchQueryArg,
@@ -3000,8 +3100,9 @@ async def search(
     mode = _validate_choice("mode", mode, _SEARCH_MODES)
     limit = _validate_minimum("limit", limit, 1)
 
-    handle = _get_handle(binary)
-    tools = GhidraTools(handle)
+    # Handle resolution may hot-load an evicted binary from disk -- offload it.
+    handle = await asyncio.to_thread(_get_handle, binary)
+    tools = _tools_for(handle)
 
     # Batch search
     if isinstance(query, list):
@@ -3010,6 +3111,7 @@ async def search(
         if type != "strings":
             raise ValueError("Batch query lists currently support type='strings' only")
         if bg:
+            _reject_if_jobs_full()
             job_id = _new_job_id()
             job: dict = {"kind": "scan", "label": "batch_search",
                          "binary": binary, "status": "queued", "job_id": job_id}
@@ -3026,8 +3128,10 @@ async def search(
                 "hint": "Poll binaries(jobs=True); completed scan jobs include result when available.",
             }
 
-        results = tools.batch_search_strings(query, mode=mode, limit_per_query=limit)
-        return {"queries": query, "results": results}
+        return await asyncio.to_thread(
+            lambda: {"queries": query,
+                     "results": tools.batch_search_strings(query, mode=mode, limit_per_query=limit)}
+        )
 
     # Single query searches
     if type != "strings" and mode != "indexed":
@@ -3035,6 +3139,7 @@ async def search(
 
     if type == "extract":
         # BunFS extraction - always background
+        _reject_if_jobs_full()
         handle_analysis_id = _handle_analysis_id(handle)
         status_match = _find_on_disk(handle_analysis_id) if handle_analysis_id else None
         status = status_match or _read_status_file(getattr(handle, "unit_id", "")) or {}
@@ -3055,57 +3160,61 @@ async def search(
             "hint": "Poll binaries(jobs=True); completed scan jobs include result when available.",
         }
 
-    if type == "blob":
-        parts = query.split(",")
-        offset = parts[0].strip()
-        size = int(parts[1].strip()) if len(parts) > 1 else 1024
-        results = tools.extract_strings_from_blob(offset, size, limit=limit)
-        return {"offset": offset, "size": size, "strings": results}
+    # Remaining single-query searches are blocking JVM work -- run off the loop.
+    def _single() -> dict:
+        if type == "blob":
+            parts = query.split(",")
+            offset = parts[0].strip()
+            size = int(parts[1].strip()) if len(parts) > 1 else 1024
+            results = tools.extract_strings_from_blob(offset, size, limit=limit)
+            return {"offset": offset, "size": size, "strings": results}
 
-    if type == "bytes":
-        results = tools.find_bytes(query, limit=limit)
-        return {"pattern": query, "matches": results}
+        if type == "bytes":
+            results = tools.find_bytes(query, limit=limit)
+            return {"pattern": query, "matches": results}
 
-    if type == "symbols":
-        results = tools.search_symbols(query, limit=limit)
+        if type == "symbols":
+            results = tools.search_symbols(query, limit=limit)
+            return {
+                "query": query,
+                "symbols": [
+                    {"name": s.name, "address": s.address, "type": s.type}
+                    for s in results
+                ],
+            }
+
+        if type == "all":
+            return {
+                "query": query,
+                "functions": [
+                    {"name": f.name, "address": f.address}
+                    for f in tools.list_functions(pattern=query, limit=limit)
+                ],
+                "symbols": [
+                    {"name": s.name, "address": s.address, "type": s.type}
+                    for s in tools.search_symbols(query, limit=limit)
+                ],
+                "strings": [
+                    {"value": s.value, "address": s.address}
+                    for s in tools.search_strings(query, limit=limit)
+                ],
+            }
+
+        # Default: strings
+        if mode == "deep":
+            results = tools.search_strings_deep(query, limit=limit)
+            return {"query": query, "mode": "deep", "strings": results}
+
+        results = tools.search_strings(query, limit=limit)
         return {
             "query": query,
-            "symbols": [
-                {"name": s.name, "address": s.address, "type": s.type}
+            "strings": [
+                {"value": s.value, "address": s.address, "refs": s.refs}
                 for s in results
             ],
         }
 
-    if type == "all":
-        return {
-            "query": query,
-            "functions": [
-                {"name": f.name, "address": f.address}
-                for f in tools.list_functions(pattern=query, limit=limit)
-            ],
-            "symbols": [
-                {"name": s.name, "address": s.address, "type": s.type}
-                for s in tools.search_symbols(query, limit=limit)
-            ],
-            "strings": [
-                {"value": s.value, "address": s.address}
-                for s in tools.search_strings(query, limit=limit)
-            ],
-        }
-
-    # Default: strings
-    if mode == "deep":
-        results = tools.search_strings_deep(query, limit=limit)
-        return {"query": query, "mode": "deep", "strings": results}
-
-    results = tools.search_strings(query, limit=limit)
-    return {
-        "query": query,
-        "strings": [
-            {"value": s.value, "address": s.address, "refs": s.refs}
-            for s in results
-        ],
-    }
+    return await asyncio.to_thread(_single)
 
 
 # =============================================================================
@@ -3157,7 +3266,7 @@ def _kill_job(analysis_id: str) -> None:
 # Keep _extract_bunfs_blocking for search(type="extract")
 def _extract_bunfs_blocking(handle, out: Path) -> dict:
     """Extract the bunfs filesystem from a Bun binary into readable JS files."""
-    rt_info = GhidraTools(handle).detect_embedded_runtime(compact=False)
+    rt_info = _tools_for(handle).detect_embedded_runtime(compact=False)
     bun_rt = next((r for r in rt_info.get("runtimes", []) if r["type"] == "bunfs"), None)
     if not bun_rt:
         raise ValueError("No bunfs payload detected.")

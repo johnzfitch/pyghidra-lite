@@ -153,6 +153,39 @@ def test_tool_schemas_publish_enum_and_bounds() -> None:
     assert search_schema["properties"]["mode"]["enum"] == ["indexed", "deep"]
 
 
+def test_all_tools_declare_annotations() -> None:
+    """Every consolidated tool must publish MCP behavioral annotations."""
+    tools = server.mcp._tool_manager._tools
+    expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"}
+    assert set(tools) == expected
+    for name, tool in tools.items():
+        assert tool.annotations is not None, f"{name} is missing annotations"
+        assert tool.annotations.title, f"{name} is missing a title"
+
+
+def test_read_only_tools_marked_read_only_and_idempotent() -> None:
+    """Analysis tools must advertise readOnlyHint + idempotentHint, not destructive."""
+    tools = server.mcp._tool_manager._tools
+    for name in ("binaries", "info", "functions", "code", "xrefs", "search"):
+        ann = tools[name].annotations
+        assert ann.readOnlyHint is True, f"{name} should be read-only"
+        assert ann.idempotentHint is True, f"{name} should be idempotent"
+        assert ann.destructiveHint is False, f"{name} should not be destructive"
+        assert ann.openWorldHint is False, f"{name} operates on local binaries only"
+
+
+def test_mutating_tools_have_correct_hints() -> None:
+    """delete is destructive; load mutates but is non-destructive."""
+    tools = server.mcp._tool_manager._tools
+    delete_ann = tools["delete"].annotations
+    assert delete_ann.readOnlyHint is False
+    assert delete_ann.destructiveHint is True
+
+    load_ann = tools["load"].annotations
+    assert load_ann.readOnlyHint is False
+    assert load_ann.destructiveHint is False
+
+
 def test_load_validation_failure_returns_mcp_tool_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -367,7 +400,9 @@ def test_total_tool_count_is_8() -> None:
     """Tool consolidation: 58 tools -> 8 consolidated tools."""
     import re
     src = open("src/pyghidra_lite/server.py").read()
-    count = len(re.findall(r"^@mcp\.tool\(\)", src, re.MULTILINE))
+    # Decorators now carry MCP tool annotations, e.g. @mcp.tool(annotations=...),
+    # so match the opening @mcp.tool( rather than the bare ().
+    count = len(re.findall(r"^@mcp\.tool\(", src, re.MULTILINE))
     assert count == 8, f"Expected exactly 8 @mcp.tool() decorators, found {count}"
 
 
