@@ -91,6 +91,71 @@ def test_upsert_jvm_option_preserves_existing_flags(monkeypatch: pytest.MonkeyPa
     assert "-Xmx4g" in opts
 
 
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        ("127.0.0.1", True),
+        ("localhost", True),
+        ("LOCALHOST", True),
+        ("::1", True),
+        ("[::1]", True),
+        ("127.0.0.2", True),  # all of 127.0.0.0/8 is loopback
+        ("0.0.0.0", False),
+        ("::", False),
+        ("10.0.0.5", False),
+        ("example.com", False),
+    ],
+)
+def test_is_loopback_host(host: str, expected: bool) -> None:
+    assert server._is_loopback_host(host) is expected
+
+
+def test_build_transport_security_allows_localhost_and_bind_host() -> None:
+    ts = server._build_transport_security("0.0.0.0", 9000, ("proxy.internal:9000",))
+    assert ts.enable_dns_rebinding_protection is True
+    assert "localhost:9000" in ts.allowed_hosts
+    assert "127.0.0.1:9000" in ts.allowed_hosts
+    assert "proxy.internal:9000" in ts.allowed_hosts
+    assert "http://localhost:9000" in ts.allowed_origins
+    # Wildcard bind itself is never an allowed Host header value.
+    assert "0.0.0.0:9000" not in ts.allowed_hosts
+
+
+def _drive_asgi(app, headers: list[tuple[bytes, bytes]]):
+    """Invoke an ASGI app once with an http scope, capturing the response start."""
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    async def downstream(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    middleware = server._BearerAuthMiddleware(downstream, "s3cret")
+    scope = {"type": "http", "headers": headers}
+    asyncio.run(middleware(scope, receive, send))
+    return sent
+
+
+def test_bearer_auth_rejects_missing_token() -> None:
+    sent = _drive_asgi(None, headers=[])
+    assert sent[0]["status"] == 401
+
+
+def test_bearer_auth_rejects_wrong_token() -> None:
+    sent = _drive_asgi(None, headers=[(b"authorization", b"Bearer nope")])
+    assert sent[0]["status"] == 401
+
+
+def test_bearer_auth_accepts_correct_token() -> None:
+    sent = _drive_asgi(None, headers=[(b"authorization", b"Bearer s3cret")])
+    assert sent[0]["status"] == 200
+
+
 def test_guarded_tool_call_preserves_validation_errors() -> None:
     def op():
         raise ValueError("bad")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import shlex
@@ -27,6 +28,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData, ToolAnnotations
+from mcp.server.transport_security import TransportSecuritySettings
 
 from pyghidra_lite import __version__
 import json
@@ -3373,52 +3375,144 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
 # =============================================================================
 
 
-def _run_with_idle_timeout(mcp_server, idle_minutes: int) -> None:
-    """Run streamable-http server with auto-exit on idle.
+def _is_loopback_host(host: str) -> bool:
+    """True when host is a loopback bind that is not externally reachable.
 
-    Wraps the Starlette app with middleware that tracks last-request time,
-    then runs a background watchdog that exits after idle_minutes of silence.
+    Accepts the literal "localhost" and any loopback IP (127.0.0.0/8, ::1),
+    including the bracketed IPv6 form "[::1]". Non-loopback hosts and the
+    wildcard binds (0.0.0.0, ::) return False, so the caller can require auth.
+    The old guard compared against the literal "127.0.0.1" only, which let
+    127.0.0.2, ::1, hostnames, and ::-wildcard slip through.
     """
-    import threading
+    h = host.strip().lower()
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _build_transport_security(
+    host: str, port: int, extra_hosts: tuple[str, ...] = ()
+) -> TransportSecuritySettings:
+    """Build DNS-rebinding protection settings for an HTTP/SSE bind.
+
+    The MCP transport-security guidance calls for validating the Host and Origin
+    headers so a malicious web page can't rebind DNS to the local server. We
+    always allow localhost variants plus the configured bind host; operators
+    fronting the server under another hostname add it via --allowed-host.
+    """
+    hostnames = {"localhost", "127.0.0.1", "::1", "[::1]"}
+    if host and host not in ("0.0.0.0", "::"):
+        hostnames.add(host)
+
+    allowed_hosts: set[str] = set()
+    allowed_origins: set[str] = set()
+    for hn in hostnames:
+        allowed_hosts.add(f"{hn}:{port}")
+        allowed_hosts.add(f"{hn}:*")
+        allowed_origins.add(f"http://{hn}:{port}")
+        allowed_origins.add(f"https://{hn}:{port}")
+
+    for entry in extra_hosts:
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            entry = f"{entry}:*"
+        allowed_hosts.add(entry)
+        if not entry.endswith(":*"):
+            allowed_origins.add(f"http://{entry}")
+            allowed_origins.add(f"https://{entry}")
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=sorted(allowed_hosts),
+        allowed_origins=sorted(allowed_origins),
+    )
+
+
+class _BearerAuthMiddleware:
+    """ASGI middleware enforcing a static bearer token on every HTTP request.
+
+    The MCP server itself has no auth; for non-loopback binds a shared token is
+    the minimum bar so that merely reaching the port is not enough to call every
+    tool (including delete). Compared in constant time to avoid timing oracles.
+    Non-HTTP scopes (lifespan) pass through untouched.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self._expected = f"Bearer {token}"
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        headers = dict(scope.get("headers") or [])
+        provided = headers.get(b"authorization", b"").decode("latin-1")
+        if not secrets.compare_digest(provided, self._expected):
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"www-authenticate", b"Bearer"),
+                ],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b'{"error":"unauthorized"}',
+            })
+            return
+        return await self.app(scope, receive, send)
+
+
+class _IdleTracker:
+    """ASGI middleware that records the time of the last HTTP request."""
+
+    def __init__(self, app):
+        self.app = app
+        self.last_request = time.time()
+        self._lock = threading.Lock()
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            with self._lock:
+                self.last_request = time.time()
+        return await self.app(scope, receive, send)
+
+    def idle_seconds(self) -> float:
+        with self._lock:
+            return time.time() - self.last_request
+
+
+def _serve_http(
+    mcp_server,
+    *,
+    transport: str,
+    auth_token: str | None = None,
+    idle_minutes: int | None = None,
+) -> None:
+    """Serve an HTTP/SSE MCP app via uvicorn with optional auth + idle exit.
+
+    Replaces the bare mcp.run() for the HTTP family so a single path applies the
+    bearer-auth and idle-timeout middleware (DNS-rebinding protection is wired
+    in earlier via mcp.settings.transport_security).
+    """
     import uvicorn
 
-    last_request = time.time()
-    lock = threading.Lock()
+    app = mcp_server.sse_app() if transport == "sse" else mcp_server.streamable_http_app()
+    if auth_token:
+        app = _BearerAuthMiddleware(app, auth_token)
 
-    class IdleTracker:
-        """ASGI middleware that bumps the last-request timestamp."""
-        def __init__(self, app):
-            self.app = app
-
-        async def __call__(self, scope, receive, send):
-            nonlocal last_request
-            if scope["type"] == "http":
-                with lock:
-                    last_request = time.time()
-            return await self.app(scope, receive, send)
-
-    def watchdog(server: uvicorn.Server):
-        timeout_sec = idle_minutes * 60
-        # Wait for server to finish starting before checking
-        while not server.started:
-            time.sleep(0.1)
-        while server.started:
-            time.sleep(30)
-            with lock:
-                idle_sec = time.time() - last_request
-            if idle_sec >= timeout_sec:
-                logger.info(
-                    "Idle for %d minutes, shutting down.",
-                    idle_minutes,
-                )
-                server.should_exit = True
-                return
-
-    starlette_app = mcp_server.streamable_http_app()
-    wrapped = IdleTracker(starlette_app)
+    idle = None
+    if idle_minutes and idle_minutes > 0:
+        idle = _IdleTracker(app)
+        app = idle
 
     config = uvicorn.Config(
-        wrapped,
+        app,
         host=mcp_server.settings.host,
         port=mcp_server.settings.port,
         log_level=mcp_server.settings.log_level.lower(),
@@ -3429,8 +3523,19 @@ def _run_with_idle_timeout(mcp_server, idle_minutes: int) -> None:
     )
     server = uvicorn.Server(config)
 
-    watcher = threading.Thread(target=watchdog, args=(server,), daemon=True)
-    watcher.start()
+    if idle is not None:
+        def watchdog(srv: uvicorn.Server, tracker: _IdleTracker):
+            timeout_sec = idle_minutes * 60
+            while not srv.started:
+                time.sleep(0.1)
+            while srv.started:
+                time.sleep(30)
+                if tracker.idle_seconds() >= timeout_sec:
+                    logger.info("Idle for %d minutes, shutting down.", idle_minutes)
+                    srv.should_exit = True
+                    return
+
+        threading.Thread(target=watchdog, args=(server, idle), daemon=True).start()
 
     # anyio.run is used by FastMCP internally; replicate here
     import anyio
@@ -3515,6 +3620,17 @@ def cli():
     help="Auto-exit after this many minutes with no HTTP requests (shared mode only). "
          "Set by proxy auto-start; 0 or None disables.",
 )
+@click.option(
+    "--auth-token", type=str, default=None, envvar="PYGHIDRA_LITE_AUTH_TOKEN",
+    help="Require this bearer token on every HTTP/SSE request (shared mode). "
+         "Required for non-loopback binds. Reads PYGHIDRA_LITE_AUTH_TOKEN.",
+)
+@click.option(
+    "--allowed-host", "allowed_hosts", type=str, multiple=True,
+    help="Extra Host header value to accept for DNS-rebinding protection "
+         "(host:port or host:*). Repeatable. Add this when fronting the server "
+         "under a hostname other than the bind address.",
+)
 @click.argument("binaries", nargs=-1, type=click.Path(exists=True, path_type=Path))
 def serve_cmd(
     transport: str,
@@ -3532,6 +3648,8 @@ def serve_cmd(
     evict_after: int | None,
     min_loaded: int | None,
     idle_timeout: int | None,
+    auth_token: str | None,
+    allowed_hosts: tuple[str, ...],
     binaries: tuple[Path, ...],
 ):
     """Start the MCP server (default when no subcommand given)."""
@@ -3557,11 +3675,22 @@ def serve_cmd(
         evict_after_minutes=evict_after,
         min_loaded=min_loaded,
     )
-    if is_shared and host != "127.0.0.1" and not restrict_paths:
-        logger.error(
-            "--restrict-path is required when binding to non-loopback address."
-        )
-        raise SystemExit(1)
+    is_loopback = _is_loopback_host(host)
+    if is_shared and not is_loopback:
+        if not restrict_paths:
+            logger.error(
+                "--restrict-path is required when binding to a non-loopback address (%s).",
+                host,
+            )
+            raise SystemExit(1)
+        if not auth_token:
+            logger.error(
+                "--auth-token (or PYGHIDRA_LITE_AUTH_TOKEN) is required when binding to a "
+                "non-loopback address (%s): the server has no other access control, so any "
+                "host that can reach the port could call every tool, including delete.",
+                host,
+            )
+            raise SystemExit(1)
     if is_shared and not restrict_paths:
         logger.warning(
             "Shared mode with no --restrict-path. "
@@ -3608,17 +3737,22 @@ def serve_cmd(
     try:
         if transport == "stdio":
             mcp.run(transport="stdio")
-        elif transport == "streamable-http":
-            mcp.settings.host = host
-            mcp.settings.port = port
-            if idle_timeout and idle_timeout > 0:
-                _run_with_idle_timeout(mcp, idle_timeout)
-            else:
-                mcp.run(transport="streamable-http")
         else:
             mcp.settings.host = host
             mcp.settings.port = port
-            mcp.run(transport="sse")
+            # Enable Host/Origin validation (DNS-rebinding protection) for all
+            # HTTP family transports, and enforce bearer auth when configured.
+            mcp.settings.transport_security = _build_transport_security(
+                host, port, allowed_hosts
+            )
+            if auth_token:
+                logger.info("Bearer token auth enabled for %s transport.", transport)
+            _serve_http(
+                mcp,
+                transport=transport,
+                auth_token=auth_token,
+                idle_minutes=idle_timeout,
+            )
     finally:
         if transport in ("streamable-http", "sse"):
             _remove_pid(port)
