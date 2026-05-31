@@ -132,7 +132,10 @@ _jobs_mutex = threading.Lock()  # guards _active_jobs dict mutations from sync c
 _worker_semaphore: asyncio.Semaphore | None = None  # initialized in serve, default 4
 
 # Valid unit_id format: 16 lowercase hex chars (64-bit xxHash)
-_UNIT_ID_RE = re.compile(r'^[0-9a-f]{16}$')
+# \Z (not $): Python's `$` also matches before a trailing newline, so a `$`
+# anchor would accept "abcdef0123456789\n" as a valid id (log-injection / odd
+# filenames). \Z requires the match to reach the very end of the string.
+_UNIT_ID_RE = re.compile(r'^[0-9a-f]{16}\Z')
 _BOOTSTRAP_MODES = {"named", "all"}
 _BOOTSTRAP_AUTO_PREFIX = "BTFN"
 _INFO_DETAILS = ("summary", "full", "format", "sections", "entropy")
