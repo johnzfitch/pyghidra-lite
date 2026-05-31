@@ -3401,11 +3401,17 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     strategy_used = None
 
-    bun_exe = shutil.which("bun")
-    if bun_exe:
+    # Invoke a locally pre-installed, pinned extractor DIRECTLY. The previous
+    # implementation ran `bun x bun-extract-bundled`, which resolves and executes
+    # an npm package from the network on every call -- i.e. a tool call could
+    # fetch and run arbitrary remote code. We removed that: the only thing we run
+    # here is an extractor the operator has already installed on PATH, with a
+    # fixed argument vector (no shell, no package-manager launcher).
+    extractor = shutil.which("bun-extract-bundled")
+    if extractor:
         try:
             result = subprocess.run(
-                [bun_exe, "x", "bun-extract-bundled", str(binary_path), str(out)],
+                [extractor, str(binary_path), str(out)],
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode == 0:
@@ -3414,7 +3420,11 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
             pass
 
     if strategy_used is None:
-        raise RuntimeError("bunfs extraction failed. Install bun and retry.")
+        raise RuntimeError(
+            "bunfs extraction unavailable. Install the 'bun-extract-bundled' "
+            "executable on PATH (e.g. `bun add -g bun-extract-bundled`); "
+            "pyghidra-lite no longer fetches it from the network at run time."
+        )
 
     files = list(out.rglob("*"))
     js_files = [f for f in files if f.suffix in (".js", ".ts", ".json")]
