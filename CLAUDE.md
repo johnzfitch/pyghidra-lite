@@ -23,7 +23,10 @@ uv run pyghidra-lite serve # Start MCP server
 
 ### 1. Bump version
 
-Update version in `pyproject.toml` and `server.json` (both places).
+Update version in **three** places, keeping them in sync:
+- `pyproject.toml` (`version`)
+- `server.json` (top-level `version` **and** the `packages[].version`)
+- `src/pyghidra_lite/__init__.py` (`__version__`, exposed by `pyghidra-lite --version`)
 
 ### 2. PyPI
 
