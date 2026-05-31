@@ -312,3 +312,124 @@ class TestErrorRedaction:
             server._guarded_tool_call("decompile", op)
         assert leak not in str(exc.value)
         assert "<project-dir>" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 9. DNS rebinding -- END TO END through the real running ASGI pipeline
+# ---------------------------------------------------------------------------
+# Unlike TestDnsRebinding (which calls the validator helper), this drives the
+# actual streamable-HTTP app with the session task group running, the same way
+# `pyghidra-lite serve -t streamable-http` does. It would FAIL if the protection
+# were configured but never wired into the request pipeline.
+class TestDnsRebindingEndToEnd:
+    def _drive(self, host: str) -> list:
+        import anyio
+
+        server.mcp.settings.host = "127.0.0.1"
+        server.mcp.settings.port = 8000
+        server.mcp.settings.transport_security = server._build_transport_security("127.0.0.1", 8000)
+        app = server.mcp.streamable_http_app()
+        path = server.mcp.settings.streamable_http_path
+        body = (b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":'
+                b'"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}')
+        statuses: list = []
+
+        async def run():
+            scope = {
+                "type": "http", "http_version": "1.1", "method": "POST", "path": path,
+                "raw_path": path.encode(), "query_string": b"", "scheme": "http",
+                "server": ("127.0.0.1", 8000), "client": ("203.0.113.9", 51000),
+                "headers": [(b"host", host.encode()), (b"content-type", b"application/json"),
+                            (b"accept", b"application/json, text/event-stream"),
+                            (b"content-length", str(len(body)).encode())],
+            }
+
+            async def receive():
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            async def send(m):
+                if m["type"] == "http.response.start":
+                    statuses.append(m["status"])
+
+            async with server.mcp.session_manager.run():
+                with anyio.move_on_after(20):
+                    await app(scope, receive, send)
+
+        anyio.run(run)
+        return statuses
+
+    def test_forged_host_rejected_end_to_end(self):
+        statuses = self._drive("attacker.com:8000")
+        assert statuses and statuses[0] == 421, f"expected 421, got {statuses}"
+
+
+# ---------------------------------------------------------------------------
+# 10. Live trojan-on-PATH trap: prove no package launcher is ever executed
+# ---------------------------------------------------------------------------
+# This plants REAL executables named bun/npm/npx/node/sh on PATH that write a
+# marker if run, then triggers the extraction path. The pinned extractor is the
+# only thing permitted to run; if any launcher fired (i.e. a `bun x`-style fetch
+# survived), the marker would appear. This executes real processes, not mocks.
+class TestNoLauncherExecLive:
+    def test_extraction_never_runs_a_package_launcher(self, tmp_path, monkeypatch):
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        marker = tmp_path / "LAUNCHER_RAN"
+        for name in ("bun", "npm", "npx", "node", "sh", "bash", "curl", "wget"):
+            p = bindir / name
+            p.write_text(f'#!/bin/sh\necho "$0 $@" >> "{marker}"\n')
+            p.chmod(0o755)
+        # The one thing we DO permit: a locally pre-installed pinned extractor.
+        ext = bindir / "bun-extract-bundled"
+        ext.write_text('#!/bin/sh\nexit 0\n')
+        ext.chmod(0o755)
+        monkeypatch.setenv("PATH", str(bindir))  # nothing but our planted bins
+
+        binpath = tmp_path / "app.bin"
+        binpath.write_bytes(b"\x00")
+        monkeypatch.setattr(server, "_locked_tools", lambda h, w: {"runtimes": [{"type": "bunfs"}]})
+        monkeypatch.setattr(server, "_handle_analysis_id", lambda h: None)
+        monkeypatch.setattr(server, "_find_on_disk", lambda a: None)
+        monkeypatch.setattr(server, "_read_status_file", lambda u: {"binary_path": str(binpath)})
+
+        server._extract_bunfs_blocking(MagicMock(), tmp_path / "out")
+
+        assert not marker.exists(), (
+            f"a package launcher was executed: {marker.read_text() if marker.exists() else ''}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 11. Import worker spawns only our own interpreter (fixed self-spawn)
+# ---------------------------------------------------------------------------
+class TestWorkerSelfSpawn:
+    def test_worker_argv_is_fixed_self_import(self, tmp_path, monkeypatch):
+        import sys
+
+        monkeypatch.setattr(server, "_server_config",
+                            server.ServerConfig(project_dir=tmp_path))
+        monkeypatch.setattr(server, "_worker_semaphore", asyncio.Semaphore(1))
+        captured: dict = {}
+
+        class _Proc:
+            pid = 4242
+
+            async def communicate(self):
+                return (b"", b"")
+            returncode = 0
+
+        async def fake_exec(*argv, **kw):
+            captured["argv"] = list(argv)
+            return _Proc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        binpath = tmp_path / "app.bin"
+        binpath.write_bytes(b"\x00")
+
+        job = {"status": "queued"}
+        asyncio.run(server._run_worker(binpath, "abcdef0123456789-fast", "fast", job))
+
+        argv = captured["argv"]
+        # The agent controls only the binary path (data); the program is always us.
+        assert argv[0] == sys.executable
+        assert argv[1:5] == ["-m", "pyghidra_lite.server", "import", str(binpath)]
