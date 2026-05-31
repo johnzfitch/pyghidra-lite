@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-31
+
 ### Added
 - **MCP tool annotations**: every tool now publishes `ToolAnnotations`
   (`title` + `readOnlyHint` / `destructiveHint` / `idempotentHint` /
@@ -17,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation) for all HTTP/SSE binds, a static bearer-token guard via
   `--auth-token` / `PYGHIDRA_LITE_AUTH_TOKEN`, and `--allowed-host` for serving
   behind another hostname. A bearer token is now required for non-loopback binds.
+
+### Security
+- **Configuration is immutable while serving**: `ServerConfig` is now frozen,
+  built once at startup through a single writer (`configure_server`), and locked
+  at the serve boundary (`go_live()`). Any attempt to change a security setting
+  (restrict paths, bind host, auth, runtime home) mid-session raises
+  `ConfigLockedError` -- to change one you stop the process and re-run the CLI.
+  This closes the runtime config-tamper/MITM surface.
+- **Removed run-time remote code execution**: `search(type="extract")` no longer
+  runs `bun x bun-extract-bundled`, which resolved and executed an npm package
+  from the network on every call. It now invokes a locally pre-installed, pinned
+  extractor directly (fixed argv, no shell, no package-manager launcher), or
+  returns an actionable error.
 
 ### Changed
 - `info`, `code`, and `xrefs` are now async and run their blocking Ghidra work
@@ -41,6 +56,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already-analyzed binary isn't re-hashed from scratch on every call.
 - Removed a dead `depth = min(depth, 5)` line in `xrefs` that shadowed the
   closure variable (would raise `UnboundLocalError` on `depth>1`).
+- Both id validators now anchor with `\Z` instead of `$`. `^[0-9a-f]{16}$`
+  accepted a trailing newline (Python's `$` also matches just before a final
+  `\n`), so `"<unit_id>\n"` passed as a valid id.
+- `_init_backend` no longer mutates `runtime_home` on the config object in place
+  -- a write that previously ran inside the lifespan, after the server was
+  already live. The resolved runtime home is persisted before config is locked.
+
+### Tests
+- Added an adversarial red-team suite (`tests/test_red_team.py`) that performs
+  each attack and asserts it fails closed: restrict-path escape + TOCTOU, id
+  injection, a live trojan-on-PATH trap proving extraction never runs a package
+  launcher, DNS-rebinding rejected `421` end-to-end through the real ASGI app,
+  the auth-bypass matrix, loopback fail-closed, job-queue cap, error redaction,
+  and holder-impenetrability checks (config cannot be mutated while live, plus a
+  tripwire that fails if any `@mcp.tool` gains a settings-mutation surface).
+- Added a real-server end-to-end suite (`tests/test_security_e2e.py`, gated by
+  `PYGHIDRA_E2E`) and a `security-e2e` CI workflow (JDK 21 + pinned Ghidra) that
+  boots an actual `pyghidra-lite serve` and attacks it over real TCP sockets.
 
 ## [0.5.1] - 2026-03-12
 
