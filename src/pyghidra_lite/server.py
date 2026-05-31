@@ -15,7 +15,7 @@ import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -217,19 +217,32 @@ def _reject_if_jobs_full() -> None:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class ServerConfig:
-    """Configuration for backend initialization and import policy."""
+    """Immutable configuration for backend initialization and import policy.
+
+    Frozen by design: a security setting (restrict_paths, shared, runtime_home,
+    ...) must not be mutable while the server is running. The only legitimate way
+    to produce one is to build it once at startup (see configure_server); there
+    is no field setter, so the MITM/tamper surface -- widening restrict_paths,
+    flipping shared, nulling runtime_home mid-session -- simply does not exist.
+    """
     project_name: str = "pyghidra_lite"
     project_dir: Path | None = None
     default_profile: AnalysisProfile = AnalysisProfile.FAST
     ghidra_dir: Path | None = None
     runtime_home: Path | None = None
-    restrict_paths: list[Path] = field(default_factory=list)
+    restrict_paths: tuple[Path, ...] = ()
     shared: bool = False  # True for SSE (shared server), False for stdio (isolated)
     autopurge_days: int | None = None  # Delete projects not opened in N days (None = off)
     evict_after_minutes: int = 30  # Unload idle binaries from memory after N minutes (0 = off)
     min_loaded: int = 2  # Always keep at least N most-recently-used binaries in memory
+
+    def __post_init__(self) -> None:
+        # Accept any iterable (e.g. a list from a CLI/test call) but store an
+        # immutable tuple, so callers cannot append to restrict_paths after the
+        # fact. object.__setattr__ is the frozen-dataclass normalization idiom.
+        object.__setattr__(self, "restrict_paths", tuple(self.restrict_paths))
 
     def resolved_restrict_paths(self) -> list[Path]:
         """Return de-duplicated, resolved restrict roots (empty = unrestricted)."""
@@ -299,26 +312,53 @@ def _ensure_runtime_environment(project_dir: Path | None, runtime_home: Path | N
 
 
 def _load_config_from_env() -> ServerConfig:
-    config = ServerConfig()
+    """Build the boot-time config from the allowlisted set of env vars."""
+    kwargs: dict = {}
     if project_name := os.getenv("PYGHIDRA_LITE_PROJECT_NAME"):
-        config.project_name = project_name
+        kwargs["project_name"] = project_name
     if project_dir := os.getenv("PYGHIDRA_LITE_PROJECT_DIR"):
-        config.project_dir = Path(project_dir)
+        kwargs["project_dir"] = Path(project_dir)
     if ghidra_dir := os.getenv("GHIDRA_INSTALL_DIR"):
-        config.ghidra_dir = Path(ghidra_dir)
+        kwargs["ghidra_dir"] = Path(ghidra_dir)
     if runtime_home := os.getenv("PYGHIDRA_LITE_RUNTIME_HOME"):
-        config.runtime_home = Path(runtime_home)
+        kwargs["runtime_home"] = Path(runtime_home)
     if default_profile := os.getenv("PYGHIDRA_LITE_DEFAULT_PROFILE"):
         try:
-            config.default_profile = AnalysisProfile(default_profile)
+            kwargs["default_profile"] = AnalysisProfile(default_profile)
         except ValueError:
             logger.warning("Ignoring invalid PYGHIDRA_LITE_DEFAULT_PROFILE=%s", default_profile)
     if restrict_paths := os.getenv("PYGHIDRA_LITE_RESTRICT_PATHS"):
-        config.restrict_paths.extend(Path(p) for p in restrict_paths.split(os.pathsep) if p)
-    return config
+        kwargs["restrict_paths"] = tuple(Path(p) for p in restrict_paths.split(os.pathsep) if p)
+    return ServerConfig(**kwargs)
 
 
 _server_config = _load_config_from_env()
+_config_live = False  # flips True once, at the serve boundary (go_live)
+
+
+class ConfigLockedError(RuntimeError):
+    """Raised when something tries to change config after the server is serving."""
+
+
+def get_config() -> ServerConfig:
+    """The single read path for the active (immutable) configuration."""
+    return _server_config
+
+
+def go_live() -> None:
+    """Lock configuration for the lifetime of the serving process.
+
+    Idempotent. Called once at the serve boundary, after all startup config is
+    applied. After this, configure_server raises: the only way to change a
+    setting is to stop the process and re-run the CLI. This is the allowlist
+    rule -- changes are permitted only while not live, none after.
+    """
+    global _config_live
+    _config_live = True
+
+
+def is_config_live() -> bool:
+    return _config_live
 
 
 def configure_server(
@@ -334,28 +374,34 @@ def configure_server(
     evict_after_minutes: int | None = None,
     min_loaded: int | None = None,
 ) -> None:
-    """Apply runtime configuration for backend and import policy."""
+    """Build and install a fresh immutable config (the only writer).
+
+    Permitted only before go_live(); raises ConfigLockedError afterwards. Each
+    call constructs a brand-new frozen ServerConfig (dataclasses.replace) rather
+    than mutating the live one, so there is no in-place write surface. restrict_paths
+    is additive, preserving the prior accumulate-on-each-call behavior.
+    """
     global _server_config
-    if project_name is not None:
-        _server_config.project_name = project_name
-    if project_dir is not None:
-        _server_config.project_dir = project_dir
-    if default_profile is not None:
-        _server_config.default_profile = default_profile
-    if ghidra_dir is not None:
-        _server_config.ghidra_dir = ghidra_dir
-    if runtime_home is not None:
-        _server_config.runtime_home = runtime_home
-    if restrict_paths:
-        _server_config.restrict_paths.extend(restrict_paths)
-    if shared is not None:
-        _server_config.shared = shared
-    if autopurge_days is not None:
-        _server_config.autopurge_days = autopurge_days
-    if evict_after_minutes is not None:
-        _server_config.evict_after_minutes = evict_after_minutes
-    if min_loaded is not None:
-        _server_config.min_loaded = min_loaded
+    if _config_live:
+        raise ConfigLockedError(
+            "Server configuration is locked while serving; stop the process and "
+            "re-run the CLI to change settings."
+        )
+    cur = _server_config
+    merged_restrict = cur.restrict_paths + tuple(restrict_paths) if restrict_paths else cur.restrict_paths
+    _server_config = replace(
+        cur,
+        project_name=cur.project_name if project_name is None else project_name,
+        project_dir=cur.project_dir if project_dir is None else project_dir,
+        default_profile=cur.default_profile if default_profile is None else default_profile,
+        ghidra_dir=cur.ghidra_dir if ghidra_dir is None else ghidra_dir,
+        runtime_home=cur.runtime_home if runtime_home is None else runtime_home,
+        restrict_paths=merged_restrict,
+        shared=cur.shared if shared is None else shared,
+        autopurge_days=cur.autopurge_days if autopurge_days is None else autopurge_days,
+        evict_after_minutes=cur.evict_after_minutes if evict_after_minutes is None else evict_after_minutes,
+        min_loaded=cur.min_loaded if min_loaded is None else min_loaded,
+    )
 
 
 def get_backend() -> GhidraBackend:
@@ -433,9 +479,11 @@ def _init_backend(eager_load: bool = False) -> GhidraBackend:
     """Initialize the backend if needed."""
     global _backend
     if _backend is None:
-        config = _server_config
+        config = get_config()
+        # Idempotent: sets XDG/JVM env and returns the resolved home. We do NOT
+        # write it back into the (frozen) config -- serve_cmd persists the
+        # resolved runtime_home before go-live so downstream reads still see it.
         resolved_runtime_home = _ensure_runtime_environment(config.project_dir, config.runtime_home)
-        config.runtime_home = resolved_runtime_home
         logger.info("Using runtime home: %s", resolved_runtime_home)
         _backend = GhidraBackend(
             project_name=config.project_name,
@@ -460,7 +508,7 @@ def _resolve_import_path(path: str) -> Path:
     """
     requested = Path(path).expanduser()
     resolved = requested.resolve()
-    restrict_roots = _server_config.resolved_restrict_paths()
+    restrict_roots = get_config().resolved_restrict_paths()
     if not restrict_roots:
         return resolved
     for root in restrict_roots:
@@ -504,7 +552,7 @@ def _assert_within_restrict_roots(p: Path) -> None:
     the import path and actually importing it: re-resolve right before use and
     confirm containment still holds. No-op when no roots are configured.
     """
-    restrict_roots = _server_config.resolved_restrict_paths()
+    restrict_roots = get_config().resolved_restrict_paths()
     if not restrict_roots:
         return
     resolved = p.resolve()
@@ -521,7 +569,7 @@ def _assert_within_restrict_roots(p: Path) -> None:
 
 def _iter_disk_status():
     """Yield (project_id, enriched_status_dict) for every valid .analysis_status file on disk."""
-    projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    projects_path = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
     if not projects_path.exists():
         return
     for entry in projects_path.iterdir():
@@ -560,7 +608,7 @@ def _iter_disk_status():
 
 
 def _history_path() -> Path:
-    return Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / "history.jsonl"
+    return Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / "history.jsonl"
 
 
 def _append_history(analysis_id: str, binary_name: str) -> None:
@@ -616,7 +664,7 @@ def _find_on_disk(binary: str, profile: str | None = None) -> dict | None:
     then most-recently-opened.
     Used by _get_handle to auto-lazy-load programs that exist on disk but aren't loaded.
     """
-    projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    projects_path = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
     if not projects_path.exists():
         return None
 
@@ -800,7 +848,7 @@ def _load_project_into_backend(
     project_id = status["project_id"]
     unit_id = status["unit_id"]
     profile = AnalysisProfile(status["profile"])
-    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id
+    project_dir = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / project_id
     if not project_dir.exists():
         return None
 
@@ -941,7 +989,7 @@ def _sanitize_error_text(text: str) -> str:
     server roots with placeholders; full, unredacted detail still goes to the
     logs via logger.exception.
     """
-    cfg = _server_config
+    cfg = get_config()
     redactions: list[tuple[str, str]] = []
 
     def add_root(value, repl: str) -> None:
@@ -1211,7 +1259,7 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
 
     # Start filesystem watcher for hot-loading completed analyses
     observer = None
-    projects_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    projects_dir = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
     projects_dir.mkdir(parents=True, exist_ok=True)
     try:
         loop = asyncio.get_running_loop()
@@ -1292,7 +1340,7 @@ def _read_status_file(project_id: str) -> dict:
         _validate_project_id(project_id)
     except ValueError:
         return {}
-    status_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
+    status_file = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
     try:
         fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
@@ -1307,7 +1355,7 @@ def _read_status_file(project_id: str) -> dict:
 def _write_status_file(project_id: str, data: dict):
     """Atomic write of .analysis_status for a project directory."""
     project_dir = _safe_project_path(
-        Path(_server_config.project_dir or DEFAULT_PROJECT_DIR), project_id
+        Path(get_config().project_dir or DEFAULT_PROJECT_DIR), project_id
     )
     project_dir.mkdir(parents=True, exist_ok=True)
     status_file = project_dir / ".analysis_status"
@@ -1320,7 +1368,7 @@ def _write_job_result(job_id: str, data: dict):
     """Atomic write of result.json for a scan job. Mirrors _write_status_file."""
     if not _UNIT_ID_RE.match(job_id):
         raise ValueError(f"Invalid job_id: {job_id!r}")
-    d = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / job_id
+    d = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / job_id
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / "result.json.tmp"
     tmp.write_text(json.dumps(data))
@@ -1335,7 +1383,7 @@ def _get_job_result(job_id: str) -> dict:
     """
     if not _UNIT_ID_RE.match(job_id):
         raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Invalid job_id: {job_id!r}"))
-    result_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / job_id / "result.json"
+    result_file = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / job_id / "result.json"
     if not result_file.exists():
         status = _active_jobs.get(job_id, {}).get("status", "not_found")
         raise McpError(ErrorData(
@@ -1532,17 +1580,17 @@ async def _run_worker(path: Path, analysis_id: str, profile: str, job: dict):
             sys.executable, "-m", "pyghidra_lite.server",
             "import", str(path),
             "--profile", profile,
-            "--project-dir", str(_server_config.project_dir or DEFAULT_PROJECT_DIR),
+            "--project-dir", str(get_config().project_dir or DEFAULT_PROJECT_DIR),
             "--jvm-heap", f"{heap_mb}m",
         ]
         if job.get("bootstrap_source"):
             cmd.extend(["--bootstrap", str(job["bootstrap_source"])])
             cmd.extend(["--bootstrap-mode", str(job.get("bootstrap_mode", "named"))])
 
-        if _server_config.ghidra_dir:
-            cmd.extend(["--ghidra-dir", str(_server_config.ghidra_dir)])
-        if _server_config.runtime_home:
-            cmd.extend(["--runtime-home", str(_server_config.runtime_home)])
+        if get_config().ghidra_dir:
+            cmd.extend(["--ghidra-dir", str(get_config().ghidra_dir)])
+        if get_config().runtime_home:
+            cmd.extend(["--runtime-home", str(get_config().runtime_home)])
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1762,7 +1810,7 @@ def start_project_watcher(
 
 async def _recover_in_progress_jobs():
     """Recover from server restart: detect running/stale workers from previous run."""
-    projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    projects_path = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
     if not projects_path.exists():
         return
 
@@ -1843,7 +1891,7 @@ async def _autopurge_stale_projects() -> None:
     Brand-new analyses (never opened, no history entry) are always skipped -- they
     may be freshly analyzed and waiting for an agent to start working on them.
     """
-    days = _server_config.autopurge_days
+    days = get_config().autopurge_days
     if not days or days <= 0:
         return
 
@@ -1852,7 +1900,7 @@ async def _autopurge_stale_projects() -> None:
     cutoff_str = cutoff.isoformat()
 
     last_opened = _last_opened_by_analysis_id()
-    project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    project_base = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
 
     purged = []
     for project_id, data in _iter_disk_status():
@@ -1884,8 +1932,8 @@ async def _eviction_monitor(interval: int = 60):
     Binaries are unloaded from the JVM but kept on disk -- the next tool call
     referencing an evicted binary transparently reloads it via _get_handle().
     """
-    evict_minutes = _server_config.evict_after_minutes
-    min_loaded = _server_config.min_loaded
+    evict_minutes = get_config().evict_after_minutes
+    min_loaded = get_config().min_loaded
     if not evict_minutes or evict_minutes <= 0:
         return  # Eviction disabled
 
@@ -2121,7 +2169,7 @@ async def load(
             disk_match = _find_on_disk(unit_id, profile=profile)
             if disk_match:
                 proj_path = _safe_project_path(
-                    Path(_server_config.project_dir or DEFAULT_PROJECT_DIR),
+                    Path(get_config().project_dir or DEFAULT_PROJECT_DIR),
                     disk_match["project_id"],
                 )
                 if proj_path.exists():
@@ -2366,7 +2414,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
     """
     def op():
         backend = get_backend()
-        project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+        project_base = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
 
         # Search loaded binaries without triggering auto-load
         handle = None
@@ -2482,7 +2530,7 @@ async def binaries(
                 job.setdefault("unit_id", unit_id)
                 job.setdefault("analysis_id", analysis_id)
                 if "project_id" not in job:
-                    project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+                    project_base = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
                     if (project_base / job_key / ".analysis_status").exists():
                         job["project_id"] = job_key
                     elif (project_base / analysis_id / ".analysis_status").exists():
@@ -2494,7 +2542,7 @@ async def binaries(
                 results.append(_merge_live_job_entry(analysis_id, job, include_jobs_meta=jobs))
 
         # On-disk projects not yet loaded
-        projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+        projects_path = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
         if projects_path.exists():
             for _project_id, status_data in _iter_disk_status():
                 analysis_id = status_data["analysis_id"]
@@ -3765,6 +3813,11 @@ def serve_cmd(
             "Shared mode with no --restrict-path. "
             "Set --restrict-path for production deployments."
         )
+    # Resolve runtime_home now and persist it into the (still pre-live) config so
+    # error redaction and the import worker see the same resolved path. This must
+    # happen before go_live(), the last point at which config can change.
+    resolved_home = _ensure_runtime_environment(get_config().project_dir, get_config().runtime_home)
+    configure_server(runtime_home=resolved_home)
     _check_prerequisites(ghidra_dir)
     with _backend_lock:
         _backend = _init_backend(eager_load=eager_load)
@@ -3803,19 +3856,27 @@ def serve_cmd(
         from pyghidra_lite.proxy import _write_pid, _remove_pid
         _write_pid(port, os.getpid())
 
+    # Set the HTTP security holders ONCE, then assert DNS-rebinding protection is
+    # actually active before serving -- fail closed rather than expose an
+    # unprotected endpoint. These are the last writes before the config lock.
+    if transport != "stdio":
+        mcp.settings.host = host
+        mcp.settings.port = port
+        mcp.settings.transport_security = _build_transport_security(host, port, allowed_hosts)
+        ts = mcp.settings.transport_security
+        if ts is None or not ts.enable_dns_rebinding_protection:
+            raise SystemExit("refusing to serve HTTP without DNS-rebinding protection enabled")
+        if auth_token:
+            logger.info("Bearer token auth enabled for %s transport.", transport)
+
+    # Lock configuration for the lifetime of the process. From here, no in-process
+    # path can change a security setting; to change one, stop and re-run the CLI.
+    go_live()
+
     try:
         if transport == "stdio":
             mcp.run(transport="stdio")
         else:
-            mcp.settings.host = host
-            mcp.settings.port = port
-            # Enable Host/Origin validation (DNS-rebinding protection) for all
-            # HTTP family transports, and enforce bearer auth when configured.
-            mcp.settings.transport_security = _build_transport_security(
-                host, port, allowed_hosts
-            )
-            if auth_token:
-                logger.info("Bearer token auth enabled for %s transport.", transport)
             _serve_http(
                 mcp,
                 transport=transport,

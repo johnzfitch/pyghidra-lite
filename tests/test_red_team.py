@@ -433,3 +433,129 @@ class TestWorkerSelfSpawn:
         # The agent controls only the binary path (data); the program is always us.
         assert argv[0] == sys.executable
         assert argv[1:5] == ["-m", "pyghidra_lite.server", "import", str(binpath)]
+
+
+# ---------------------------------------------------------------------------
+# 12. Top-to-bottom holder impenetrability (the big picture)
+# ---------------------------------------------------------------------------
+# These don't probe one validator -- they assert that, once the server is LIVE
+# (go_live, the state during a real connection), the module's security *holders*
+# cannot be tampered with through any reachable in-process surface. This is the
+# allowlist contract: the only permitted config transition is the one-time build
+# at boot; everything after is denied by construction.
+@pytest.fixture
+def served():
+    """Put the module in its live/sealed state; restore on teardown.
+
+    go_live() flips global module state, so teardown MUST reset it or every
+    later test that calls configure_server would raise ConfigLockedError.
+    """
+    was_live = server.is_config_live()
+    server.go_live()
+    try:
+        yield
+    finally:
+        server._config_live = was_live
+
+
+class TestConfigHolderImpenetrable:
+    def test_configure_server_denied_after_go_live(self, served, tmp_path):
+        with pytest.raises(server.ConfigLockedError):
+            server.configure_server(restrict_paths=[tmp_path])
+
+    def test_config_fields_are_frozen(self):
+        cfg = server.get_config()
+        import dataclasses
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            cfg.shared = True
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            cfg.runtime_home = None
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            cfg.restrict_paths = ()
+
+    def test_restrict_paths_is_an_immutable_tuple(self):
+        rp = server.get_config().restrict_paths
+        assert isinstance(rp, tuple)
+        assert not hasattr(rp, "append")
+
+    def test_restrict_paths_coerces_any_iterable_to_tuple(self):
+        # Even when built from a list, the stored value is an immutable tuple.
+        cfg = server.ServerConfig(restrict_paths=[Path("/a"), Path("/b")])
+        assert isinstance(cfg.restrict_paths, tuple)
+
+    def test_get_config_is_a_stable_single_read_path(self):
+        assert server.get_config() is server.get_config()
+
+    def test_go_live_is_idempotent(self, served):
+        server.go_live()
+        assert server.is_config_live() is True
+
+
+class TestTransportHolderImpenetrable:
+    def test_dns_protection_is_on_when_built(self):
+        ts = server._build_transport_security("127.0.0.1", 8000)
+        assert ts is not None
+        assert ts.enable_dns_rebinding_protection is True
+
+    def test_forged_host_rejected_end_to_end_while_live(self, served):
+        # Drive the real pipeline (like TestDnsRebindingEndToEnd) while the module
+        # is in its live state: forged Host must still be 421.
+        import anyio
+
+        server.mcp.settings.transport_security = server._build_transport_security("127.0.0.1", 8000)
+        # The session manager is cached on the mcp singleton and .run() is
+        # one-shot; reset so this test gets a fresh instance.
+        server.mcp._session_manager = None
+        app = server.mcp.streamable_http_app()
+        path = server.mcp.settings.streamable_http_path
+        body = (b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":'
+                b'"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}')
+        statuses: list = []
+
+        async def run():
+            scope = {
+                "type": "http", "http_version": "1.1", "method": "POST", "path": path,
+                "raw_path": path.encode(), "query_string": b"", "scheme": "http",
+                "server": ("127.0.0.1", 8000), "client": ("203.0.113.9", 51000),
+                "headers": [(b"host", b"attacker.com:8000"), (b"content-type", b"application/json"),
+                            (b"accept", b"application/json, text/event-stream"),
+                            (b"content-length", str(len(body)).encode())],
+            }
+
+            async def receive():
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            async def send(m):
+                if m["type"] == "http.response.start":
+                    statuses.append(m["status"])
+
+            async with server.mcp.session_manager.run():
+                with anyio.move_on_after(20):
+                    await app(scope, receive, send)
+
+        anyio.run(run)
+        assert statuses and statuses[0] == 421
+
+
+class TestNoToolCanReachSettings:
+    """Adversarial tripwire: no MCP tool may carry a settings-mutation surface.
+
+    If a future tool quietly adds a way to call configure_server / go_live, write
+    _server_config, or rewrite mcp.settings, this fails -- so the immutability
+    contract can't be silently regressed. (Reading via get_config() is allowed.)
+    """
+    FORBIDDEN = ("configure_server(", "go_live(", "_server_config =",
+                 "_server_config=", "mcp.settings.", "object.__setattr__(",
+                 "_config_live")
+
+    def test_registered_tools_have_no_config_writers(self):
+        import inspect
+        tools = server.mcp._tool_manager.list_tools()
+        assert len(tools) >= 8
+        offenders = {}
+        for tool in tools:
+            src = inspect.getsource(tool.fn)
+            hits = [tok for tok in self.FORBIDDEN if tok in src]
+            if hits:
+                offenders[tool.name] = hits
+        assert not offenders, f"tool(s) carry a settings-mutation surface: {offenders}"
