@@ -74,3 +74,4 @@ server.log
 server.pid
 firebase-debug.log
 hs_err_pid*.log
+.ghidra-test/
