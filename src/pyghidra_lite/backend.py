@@ -42,7 +42,9 @@ def make_analysis_id(unit_id: str, profile: "AnalysisProfile | str") -> str:
     return f"{unit_id}-{profile_value}"
 
 
-_UNIT_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+# Use \Z, not $: in Python `$` also matches just before a trailing newline, so
+# `^[0-9a-f]{16}$` would accept "abcdef0123456789\n". \Z anchors at the very end.
+_UNIT_ID_PATTERN = re.compile(r"^[0-9a-f]{16}\Z")
 
 
 def parse_analysis_id(value: str) -> tuple[str, str] | None:

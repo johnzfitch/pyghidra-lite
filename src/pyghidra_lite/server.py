@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import shlex
@@ -13,8 +14,8 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, nullcontext
-from dataclasses import dataclass, field
+from contextlib import asynccontextmanager, nullcontext, suppress
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -26,7 +27,8 @@ from mcp.server import Server
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 from mcp.shared.exceptions import McpError
-from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
+from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData, ToolAnnotations
+from mcp.server.transport_security import TransportSecuritySettings
 
 from pyghidra_lite import __version__
 import json
@@ -113,6 +115,13 @@ _backend_lock = threading.RLock()
 _last_access: dict[str, float] = {}  # analysis_id -> time.monotonic()
 _evicted_ids: set[str] = set()  # analysis_ids evicted from memory (still on disk)
 
+# Cache of computed unit_ids keyed by (resolved path, mtime_ns, size) so that
+# re-loading an already-analyzed binary doesn't re-stream the whole file just
+# to recompute its content hash. Bounded to avoid unbounded growth.
+_unit_id_cache: dict[tuple[str, int, int], str] = {}
+_unit_id_cache_lock = threading.Lock()
+_UNIT_ID_CACHE_MAX = 256
+
 # Binaries above this threshold are auto-delegated to async analysis in load()
 _LARGE_BINARY_MB = 10
 
@@ -123,7 +132,10 @@ _jobs_mutex = threading.Lock()  # guards _active_jobs dict mutations from sync c
 _worker_semaphore: asyncio.Semaphore | None = None  # initialized in serve, default 4
 
 # Valid unit_id format: 16 lowercase hex chars (64-bit xxHash)
-_UNIT_ID_RE = re.compile(r'^[0-9a-f]{16}$')
+# \Z (not $): Python's `$` also matches before a trailing newline, so a `$`
+# anchor would accept "abcdef0123456789\n" as a valid id (log-injection / odd
+# filenames). \Z requires the match to reach the very end of the string.
+_UNIT_ID_RE = re.compile(r'^[0-9a-f]{16}\Z')
 _BOOTSTRAP_MODES = {"named", "all"}
 _BOOTSTRAP_AUTO_PREFIX = "BTFN"
 _INFO_DETAILS = ("summary", "full", "format", "sections", "entropy")
@@ -182,19 +194,55 @@ def _new_job_id() -> str:
     return secrets.token_hex(8)
 
 
-@dataclass
+# Non-terminal job statuses that count against the queue cap.
+_ACTIVE_JOB_STATES = ("queued", "analyzing", "running")
+
+
+def _reject_if_jobs_full() -> None:
+    """Raise if too many jobs are already in flight.
+
+    Background search/extract jobs previously had no cap (only analysis jobs in
+    load() did), so a client could spawn unbounded scans. Mirror the load()
+    guard so all background work shares one ceiling.
+    """
+    with _jobs_mutex:
+        active = sum(
+            1 for j in _active_jobs.values()
+            if j.get("status") in _ACTIVE_JOB_STATES
+        )
+    if active >= _MAX_QUEUED_JOBS:
+        raise ValueError(
+            f"Job queue full ({active} active). "
+            "Wait for current jobs to complete or cancel with delete()."
+        )
+
+
+@dataclass(frozen=True)
 class ServerConfig:
-    """Configuration for backend initialization and import policy."""
+    """Immutable configuration for backend initialization and import policy.
+
+    Frozen by design: a security setting (restrict_paths, shared, runtime_home,
+    ...) must not be mutable while the server is running. The only legitimate way
+    to produce one is to build it once at startup (see configure_server); there
+    is no field setter, so the MITM/tamper surface -- widening restrict_paths,
+    flipping shared, nulling runtime_home mid-session -- simply does not exist.
+    """
     project_name: str = "pyghidra_lite"
     project_dir: Path | None = None
     default_profile: AnalysisProfile = AnalysisProfile.FAST
     ghidra_dir: Path | None = None
     runtime_home: Path | None = None
-    restrict_paths: list[Path] = field(default_factory=list)
+    restrict_paths: tuple[Path, ...] = ()
     shared: bool = False  # True for SSE (shared server), False for stdio (isolated)
     autopurge_days: int | None = None  # Delete projects not opened in N days (None = off)
     evict_after_minutes: int = 30  # Unload idle binaries from memory after N minutes (0 = off)
     min_loaded: int = 2  # Always keep at least N most-recently-used binaries in memory
+
+    def __post_init__(self) -> None:
+        # Accept any iterable (e.g. a list from a CLI/test call) but store an
+        # immutable tuple, so callers cannot append to restrict_paths after the
+        # fact. object.__setattr__ is the frozen-dataclass normalization idiom.
+        object.__setattr__(self, "restrict_paths", tuple(self.restrict_paths))
 
     def resolved_restrict_paths(self) -> list[Path]:
         """Return de-duplicated, resolved restrict roots (empty = unrestricted)."""
@@ -264,26 +312,53 @@ def _ensure_runtime_environment(project_dir: Path | None, runtime_home: Path | N
 
 
 def _load_config_from_env() -> ServerConfig:
-    config = ServerConfig()
+    """Build the boot-time config from the allowlisted set of env vars."""
+    kwargs: dict = {}
     if project_name := os.getenv("PYGHIDRA_LITE_PROJECT_NAME"):
-        config.project_name = project_name
+        kwargs["project_name"] = project_name
     if project_dir := os.getenv("PYGHIDRA_LITE_PROJECT_DIR"):
-        config.project_dir = Path(project_dir)
+        kwargs["project_dir"] = Path(project_dir)
     if ghidra_dir := os.getenv("GHIDRA_INSTALL_DIR"):
-        config.ghidra_dir = Path(ghidra_dir)
+        kwargs["ghidra_dir"] = Path(ghidra_dir)
     if runtime_home := os.getenv("PYGHIDRA_LITE_RUNTIME_HOME"):
-        config.runtime_home = Path(runtime_home)
+        kwargs["runtime_home"] = Path(runtime_home)
     if default_profile := os.getenv("PYGHIDRA_LITE_DEFAULT_PROFILE"):
         try:
-            config.default_profile = AnalysisProfile(default_profile)
+            kwargs["default_profile"] = AnalysisProfile(default_profile)
         except ValueError:
             logger.warning("Ignoring invalid PYGHIDRA_LITE_DEFAULT_PROFILE=%s", default_profile)
     if restrict_paths := os.getenv("PYGHIDRA_LITE_RESTRICT_PATHS"):
-        config.restrict_paths.extend(Path(p) for p in restrict_paths.split(os.pathsep) if p)
-    return config
+        kwargs["restrict_paths"] = tuple(Path(p) for p in restrict_paths.split(os.pathsep) if p)
+    return ServerConfig(**kwargs)
 
 
 _server_config = _load_config_from_env()
+_config_live = False  # flips True once, at the serve boundary (go_live)
+
+
+class ConfigLockedError(RuntimeError):
+    """Raised when something tries to change config after the server is serving."""
+
+
+def get_config() -> ServerConfig:
+    """The single read path for the active (immutable) configuration."""
+    return _server_config
+
+
+def go_live() -> None:
+    """Lock configuration for the lifetime of the serving process.
+
+    Idempotent. Called once at the serve boundary, after all startup config is
+    applied. After this, configure_server raises: the only way to change a
+    setting is to stop the process and re-run the CLI. This is the allowlist
+    rule -- changes are permitted only while not live, none after.
+    """
+    global _config_live
+    _config_live = True
+
+
+def is_config_live() -> bool:
+    return _config_live
 
 
 def configure_server(
@@ -299,28 +374,34 @@ def configure_server(
     evict_after_minutes: int | None = None,
     min_loaded: int | None = None,
 ) -> None:
-    """Apply runtime configuration for backend and import policy."""
+    """Build and install a fresh immutable config (the only writer).
+
+    Permitted only before go_live(); raises ConfigLockedError afterwards. Each
+    call constructs a brand-new frozen ServerConfig (dataclasses.replace) rather
+    than mutating the live one, so there is no in-place write surface. restrict_paths
+    is additive, preserving the prior accumulate-on-each-call behavior.
+    """
     global _server_config
-    if project_name is not None:
-        _server_config.project_name = project_name
-    if project_dir is not None:
-        _server_config.project_dir = project_dir
-    if default_profile is not None:
-        _server_config.default_profile = default_profile
-    if ghidra_dir is not None:
-        _server_config.ghidra_dir = ghidra_dir
-    if runtime_home is not None:
-        _server_config.runtime_home = runtime_home
-    if restrict_paths:
-        _server_config.restrict_paths.extend(restrict_paths)
-    if shared is not None:
-        _server_config.shared = shared
-    if autopurge_days is not None:
-        _server_config.autopurge_days = autopurge_days
-    if evict_after_minutes is not None:
-        _server_config.evict_after_minutes = evict_after_minutes
-    if min_loaded is not None:
-        _server_config.min_loaded = min_loaded
+    if _config_live:
+        raise ConfigLockedError(
+            "Server configuration is locked while serving; stop the process and "
+            "re-run the CLI to change settings."
+        )
+    cur = _server_config
+    merged_restrict = cur.restrict_paths + tuple(restrict_paths) if restrict_paths else cur.restrict_paths
+    _server_config = replace(
+        cur,
+        project_name=cur.project_name if project_name is None else project_name,
+        project_dir=cur.project_dir if project_dir is None else project_dir,
+        default_profile=cur.default_profile if default_profile is None else default_profile,
+        ghidra_dir=cur.ghidra_dir if ghidra_dir is None else ghidra_dir,
+        runtime_home=cur.runtime_home if runtime_home is None else runtime_home,
+        restrict_paths=merged_restrict,
+        shared=cur.shared if shared is None else shared,
+        autopurge_days=cur.autopurge_days if autopurge_days is None else autopurge_days,
+        evict_after_minutes=cur.evict_after_minutes if evict_after_minutes is None else evict_after_minutes,
+        min_loaded=cur.min_loaded if min_loaded is None else min_loaded,
+    )
 
 
 def get_backend() -> GhidraBackend:
@@ -398,9 +479,11 @@ def _init_backend(eager_load: bool = False) -> GhidraBackend:
     """Initialize the backend if needed."""
     global _backend
     if _backend is None:
-        config = _server_config
+        config = get_config()
+        # Idempotent: sets XDG/JVM env and returns the resolved home. We do NOT
+        # write it back into the (frozen) config -- serve_cmd persists the
+        # resolved runtime_home before go-live so downstream reads still see it.
         resolved_runtime_home = _ensure_runtime_environment(config.project_dir, config.runtime_home)
-        config.runtime_home = resolved_runtime_home
         logger.info("Using runtime home: %s", resolved_runtime_home)
         _backend = GhidraBackend(
             project_name=config.project_name,
@@ -414,10 +497,18 @@ def _init_backend(eager_load: bool = False) -> GhidraBackend:
 
 
 def _resolve_import_path(path: str) -> Path:
-    """Resolve and optionally enforce restrict-path policy for imports."""
+    """Resolve and enforce restrict-path policy for imports.
+
+    Returns the fully resolved, canonical path (all symlinks collapsed). Callers
+    must use this resolved path for the actual import: because it is canonical,
+    re-opening it cannot be redirected by swapping a symlink component after the
+    check (the restricted-root decision is made on the real target). When the
+    resolved target lies outside every restricted root, the error reports both
+    the requested path and where it resolved to, so a blocked symlink is obvious.
+    """
     requested = Path(path).expanduser()
     resolved = requested.resolve()
-    restrict_roots = _server_config.resolved_restrict_paths()
+    restrict_roots = get_config().resolved_restrict_paths()
     if not restrict_roots:
         return resolved
     for root in restrict_roots:
@@ -426,16 +517,59 @@ def _resolve_import_path(path: str) -> Path:
                 return resolved
         except ValueError:
             continue
-    if requested != resolved:
-        raise ValueError(
-            f"Path not allowed: {requested} (resolves outside restricted directories)."
-        )
-    raise ValueError(f"Path not allowed: {resolved}")
+    raise ValueError(
+        f"Path not allowed: requested={requested}, resolves_to={resolved} "
+        "(outside restricted directories)."
+    )
+
+
+def _unit_id_for(p: Path) -> str:
+    """Compute (or reuse a cached) content-hash unit_id for a file.
+
+    compute_unit_id_streaming reads the entire file -- expensive for large
+    binaries and previously paid on every load(), even cache hits. Key the cache
+    on (resolved path, mtime_ns, size): if any of those change the file is
+    re-hashed, so a modified binary never reuses a stale id.
+    """
+    st = p.stat()
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    with _unit_id_cache_lock:
+        cached = _unit_id_cache.get(key)
+    if cached is not None:
+        return cached
+    unit_id = compute_unit_id_streaming(p)
+    with _unit_id_cache_lock:
+        if len(_unit_id_cache) >= _UNIT_ID_CACHE_MAX:
+            _unit_id_cache.clear()  # simple bounded reset; recomputation is rare
+        _unit_id_cache[key] = unit_id
+    return unit_id
+
+
+def _assert_within_restrict_roots(p: Path) -> None:
+    """Re-check that an already-resolved path is inside the restrict roots.
+
+    Defense-in-depth against a time-of-check/time-of-use swap between resolving
+    the import path and actually importing it: re-resolve right before use and
+    confirm containment still holds. No-op when no roots are configured.
+    """
+    restrict_roots = get_config().resolved_restrict_paths()
+    if not restrict_roots:
+        return
+    resolved = p.resolve()
+    for root in restrict_roots:
+        try:
+            if resolved.is_relative_to(root):
+                return
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Path not allowed: {resolved} (outside restricted directories)."
+    )
 
 
 def _iter_disk_status():
     """Yield (project_id, enriched_status_dict) for every valid .analysis_status file on disk."""
-    projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    projects_path = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
     if not projects_path.exists():
         return
     for entry in projects_path.iterdir():
@@ -474,7 +608,7 @@ def _iter_disk_status():
 
 
 def _history_path() -> Path:
-    return Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / "history.jsonl"
+    return Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / "history.jsonl"
 
 
 def _append_history(analysis_id: str, binary_name: str) -> None:
@@ -530,7 +664,7 @@ def _find_on_disk(binary: str, profile: str | None = None) -> dict | None:
     then most-recently-opened.
     Used by _get_handle to auto-lazy-load programs that exist on disk but aren't loaded.
     """
-    projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    projects_path = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
     if not projects_path.exists():
         return None
 
@@ -714,7 +848,7 @@ def _load_project_into_backend(
     project_id = status["project_id"]
     unit_id = status["unit_id"]
     profile = AnalysisProfile(status["profile"])
-    project_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id
+    project_dir = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / project_id
     if not project_dir.exists():
         return None
 
@@ -846,6 +980,42 @@ def _available_tools(caps: BinaryCapabilities) -> list[str]:
     return ["load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"]
 
 
+def _sanitize_error_text(text: str) -> str:
+    """Redact server-side absolute paths from outward-facing error text.
+
+    Internal exceptions (Ghidra/JVM, filesystem) frequently embed absolute paths
+    that disclose the project-dir layout and the server's home directory to MCP
+    clients -- a real concern for shared/network deployments. Replace the known
+    server roots with placeholders; full, unredacted detail still goes to the
+    logs via logger.exception.
+    """
+    cfg = get_config()
+    redactions: list[tuple[str, str]] = []
+
+    def add_root(value, repl: str) -> None:
+        # Exceptions report absolute paths, so redact the resolved form. Keep the
+        # raw configured form too in case it appears verbatim (e.g. a relative
+        # --project-dir like ./projects echoed back before resolution).
+        if not value:
+            return
+        raw = Path(value)
+        forms = {str(raw)}
+        with suppress(RuntimeError, OSError):
+            forms.add(str(raw.expanduser().resolve()))
+        for form in forms:
+            redactions.append((form, repl))
+
+    add_root(cfg.project_dir or DEFAULT_PROJECT_DIR, "<project-dir>")
+    add_root(cfg.runtime_home, "<runtime-home>")
+    with suppress(RuntimeError, OSError):
+        add_root(Path.home(), "~")
+    # Longest needle first so nested roots (project-dir under home) redact fully.
+    for needle, repl in sorted(redactions, key=lambda r: len(r[0]), reverse=True):
+        if needle and needle not in ("/", "") and needle in text:
+            text = text.replace(needle, repl)
+    return text
+
+
 def _guarded_tool_call(action: str, op):
     try:
         return op()
@@ -853,12 +1023,59 @@ def _guarded_tool_call(action: str, op):
         raise
     except Exception as exc:
         logger.exception("%s failed", action)
-        raise RuntimeError(f"{action} failed: {exc}") from exc
+        raise RuntimeError(f"{action} failed: {_sanitize_error_text(str(exc))}") from exc
 
 
 def _with_handle(action: str, binary: str, op):
     with _backend_lock:
         return _guarded_tool_call(action, lambda: op(_get_handle(binary)))
+
+
+async def _with_handle_async(action: str, binary: str, op):
+    """Run a blocking handle operation off the event loop.
+
+    Ghidra/JVM work (decompilation, reference walking, section iteration) is
+    synchronous and can take seconds. Executing it directly in an async tool
+    body would block the whole server -- under the shared HTTP transport a
+    single decompile would freeze progress notifications and every other
+    client's request. Offloading to a worker thread keeps the loop responsive;
+    `_backend_lock` still serializes JVM access across threads.
+    """
+    return await asyncio.to_thread(_with_handle, action, binary, op)
+
+
+def _tools_for(handle) -> GhidraTools:
+    """Return a per-handle GhidraTools, reusing its caches across calls.
+
+    GhidraTools builds a function-name index and caches function/symbol lists
+    (with a TTL). The code used to do ``GhidraTools(handle)`` fresh on every
+    info/code/functions/xrefs/search call, which threw those caches away each
+    time and forced a full getFunctions() walk on every name lookup. Caching it
+    on the handle lets the index survive between calls; it is discarded
+    automatically when the handle is evicted and reloaded (a new handle object).
+    """
+    # Read/write through __dict__ so the cache key never collides with attribute
+    # auto-vivification (e.g. MagicMock handles in tests) and so a handle without
+    # a writable __dict__ simply falls back to a fresh instance.
+    d = getattr(handle, "__dict__", None)
+    if d is not None and "_tools_cache" in d:
+        return d["_tools_cache"]
+    cached = GhidraTools(handle)
+    if d is not None:
+        d["_tools_cache"] = cached
+    return cached
+
+
+def _locked_tools(handle, work):
+    """Run a blocking GhidraTools operation under _backend_lock.
+
+    The other read tools hold _backend_lock for their whole op (via
+    _with_handle), so JVM access is serialized across worker threads. search
+    resolves its handle off-lock for metadata, but its actual Ghidra calls must
+    take the same lock so concurrent worker threads never touch the JVM at once.
+    """
+    with _backend_lock:
+        return work(_tools_for(handle))
 
 
 def _rank_sources_blocking(exclude_name: str | None = None) -> list[dict]:
@@ -1042,7 +1259,7 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
 
     # Start filesystem watcher for hot-loading completed analyses
     observer = None
-    projects_dir = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    projects_dir = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
     projects_dir.mkdir(parents=True, exist_ok=True)
     try:
         loop = asyncio.get_running_loop()
@@ -1090,6 +1307,30 @@ mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
 
 
 # =============================================================================
+# TOOL ANNOTATIONS (MCP spec behavioral hints for clients/users)
+# =============================================================================
+# Per the MCP tool-annotations guidance, every tool advertises whether it is
+# read-only, destructive, idempotent, and whether it touches the outside world.
+# These are advisory hints (untrusted by spec) but let clients render safe
+# auto-approve / confirmation UX. All pyghidra-lite tools operate on locally
+# loaded binaries (no internet), so openWorldHint is False throughout.
+
+def _read_only(title: str) -> ToolAnnotations:
+    """Annotations for a read-only, idempotent analysis tool.
+
+    Never mutates the binary, on-disk project, or server state; repeated calls
+    with the same arguments return the same result.
+    """
+    return ToolAnnotations(
+        title=title,
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+
+
+# =============================================================================
 # ASYNC ANALYSIS HELPERS
 # =============================================================================
 
@@ -1099,7 +1340,7 @@ def _read_status_file(project_id: str) -> dict:
         _validate_project_id(project_id)
     except ValueError:
         return {}
-    status_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
+    status_file = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
     try:
         fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
@@ -1114,7 +1355,7 @@ def _read_status_file(project_id: str) -> dict:
 def _write_status_file(project_id: str, data: dict):
     """Atomic write of .analysis_status for a project directory."""
     project_dir = _safe_project_path(
-        Path(_server_config.project_dir or DEFAULT_PROJECT_DIR), project_id
+        Path(get_config().project_dir or DEFAULT_PROJECT_DIR), project_id
     )
     project_dir.mkdir(parents=True, exist_ok=True)
     status_file = project_dir / ".analysis_status"
@@ -1127,7 +1368,7 @@ def _write_job_result(job_id: str, data: dict):
     """Atomic write of result.json for a scan job. Mirrors _write_status_file."""
     if not _UNIT_ID_RE.match(job_id):
         raise ValueError(f"Invalid job_id: {job_id!r}")
-    d = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / job_id
+    d = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / job_id
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / "result.json.tmp"
     tmp.write_text(json.dumps(data))
@@ -1142,7 +1383,7 @@ def _get_job_result(job_id: str) -> dict:
     """
     if not _UNIT_ID_RE.match(job_id):
         raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Invalid job_id: {job_id!r}"))
-    result_file = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR) / job_id / "result.json"
+    result_file = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / job_id / "result.json"
     if not result_file.exists():
         status = _active_jobs.get(job_id, {}).get("status", "not_found")
         raise McpError(ErrorData(
@@ -1339,17 +1580,17 @@ async def _run_worker(path: Path, analysis_id: str, profile: str, job: dict):
             sys.executable, "-m", "pyghidra_lite.server",
             "import", str(path),
             "--profile", profile,
-            "--project-dir", str(_server_config.project_dir or DEFAULT_PROJECT_DIR),
+            "--project-dir", str(get_config().project_dir or DEFAULT_PROJECT_DIR),
             "--jvm-heap", f"{heap_mb}m",
         ]
         if job.get("bootstrap_source"):
             cmd.extend(["--bootstrap", str(job["bootstrap_source"])])
             cmd.extend(["--bootstrap-mode", str(job.get("bootstrap_mode", "named"))])
 
-        if _server_config.ghidra_dir:
-            cmd.extend(["--ghidra-dir", str(_server_config.ghidra_dir)])
-        if _server_config.runtime_home:
-            cmd.extend(["--runtime-home", str(_server_config.runtime_home)])
+        if get_config().ghidra_dir:
+            cmd.extend(["--ghidra-dir", str(get_config().ghidra_dir)])
+        if get_config().runtime_home:
+            cmd.extend(["--runtime-home", str(get_config().runtime_home)])
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1569,7 +1810,7 @@ def start_project_watcher(
 
 async def _recover_in_progress_jobs():
     """Recover from server restart: detect running/stale workers from previous run."""
-    projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    projects_path = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
     if not projects_path.exists():
         return
 
@@ -1650,7 +1891,7 @@ async def _autopurge_stale_projects() -> None:
     Brand-new analyses (never opened, no history entry) are always skipped -- they
     may be freshly analyzed and waiting for an agent to start working on them.
     """
-    days = _server_config.autopurge_days
+    days = get_config().autopurge_days
     if not days or days <= 0:
         return
 
@@ -1659,7 +1900,7 @@ async def _autopurge_stale_projects() -> None:
     cutoff_str = cutoff.isoformat()
 
     last_opened = _last_opened_by_analysis_id()
-    project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+    project_base = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
 
     purged = []
     for project_id, data in _iter_disk_status():
@@ -1691,8 +1932,8 @@ async def _eviction_monitor(interval: int = 60):
     Binaries are unloaded from the JVM but kept on disk -- the next tool call
     referencing an evicted binary transparently reloads it via _get_handle().
     """
-    evict_minutes = _server_config.evict_after_minutes
-    min_loaded = _server_config.min_loaded
+    evict_minutes = get_config().evict_after_minutes
+    min_loaded = get_config().min_loaded
     if not evict_minutes or evict_minutes <= 0:
         return  # Eviction disabled
 
@@ -1793,6 +2034,9 @@ def _do_import_blocking(
     """
     tracker.update(10, "Loading file")
 
+    # Re-validate containment right before import (TOCTOU defense-in-depth).
+    _assert_within_restrict_roots(p)
+
     # Hold lock only for the import (mutates shared state)
     with _backend_lock:
         backend = get_backend()
@@ -1831,7 +2075,15 @@ def _do_import_blocking(
 # CONSOLIDATED TOOLS (8 tools replacing 58)
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Load Binary",
+        readOnlyHint=False,  # imports the binary and creates an on-disk project
+        destructiveHint=False,  # never deletes existing data (fresh re-imports in place)
+        idempotentHint=False,  # may kick off analysis / transfer bootstrap names
+        openWorldHint=False,  # operates on the local filesystem only
+    )
+)
 async def load(
     path: NonEmptyStr,
     ctx: Context,
@@ -1891,7 +2143,7 @@ async def load(
 
     kind = detect_binary_kind(p, header)
     file_size_mb = p.stat().st_size / (1024 * 1024)
-    unit_id = compute_unit_id_streaming(p)
+    unit_id = _unit_id_for(p)
     analysis_id = make_analysis_id(unit_id, profile)
     bootstrap_source = None
     bootstrap_mode = _normalize_bootstrap_mode(bootstrap_mode)
@@ -1917,7 +2169,7 @@ async def load(
             disk_match = _find_on_disk(unit_id, profile=profile)
             if disk_match:
                 proj_path = _safe_project_path(
-                    Path(_server_config.project_dir or DEFAULT_PROJECT_DIR),
+                    Path(get_config().project_dir or DEFAULT_PROJECT_DIR),
                     disk_match["project_id"],
                 )
                 if proj_path.exists():
@@ -2142,7 +2394,15 @@ async def load(
         raise RuntimeError(f"Import failed: {e}") from e
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Delete Binary",
+        readOnlyHint=False,
+        destructiveHint=True,  # permanently removes the project and any worker
+        idempotentHint=True,  # deleting an already-removed binary is a no-op
+        openWorldHint=False,
+    )
+)
 async def delete(name: NonEmptyStr, ctx: Context) -> dict:
     """Permanently remove a binary, its on-disk Ghidra project, and any running
     analysis worker. Use this to free disk space, clean up failed analyses, or
@@ -2154,7 +2414,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
     """
     def op():
         backend = get_backend()
-        project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+        project_base = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
 
         # Search loaded binaries without triggering auto-load
         handle = None
@@ -2202,7 +2462,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
         return _guarded_tool_call("delete", op)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("List Binaries"))
 async def binaries(
     ctx: Context,
     jobs: bool = False,
@@ -2270,7 +2530,7 @@ async def binaries(
                 job.setdefault("unit_id", unit_id)
                 job.setdefault("analysis_id", analysis_id)
                 if "project_id" not in job:
-                    project_base = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+                    project_base = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
                     if (project_base / job_key / ".analysis_status").exists():
                         job["project_id"] = job_key
                     elif (project_base / analysis_id / ".analysis_status").exists():
@@ -2282,7 +2542,7 @@ async def binaries(
                 results.append(_merge_live_job_entry(analysis_id, job, include_jobs_meta=jobs))
 
         # On-disk projects not yet loaded
-        projects_path = Path(_server_config.project_dir or DEFAULT_PROJECT_DIR)
+        projects_path = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
         if projects_path.exists():
             for _project_id, status_data in _iter_disk_status():
                 analysis_id = status_data["analysis_id"]
@@ -2325,8 +2585,8 @@ async def binaries(
         return _guarded_tool_call("binaries", op)
 
 
-@mcp.tool()
-def info(
+@mcp.tool(annotations=_read_only("Binary Info"))
+async def info(
     binary: NonEmptyStr,
     ctx: Context,
     detail: InfoDetailArg = "summary",
@@ -2399,7 +2659,7 @@ def info(
         if detail == "summary":
             return base
 
-        tools = GhidraTools(handle)
+        tools = _tools_for(handle)
 
         if detail == "entropy":
             try:
@@ -2517,10 +2777,10 @@ def info(
 
         return base
 
-    return _with_handle("info", binary, op)
+    return await _with_handle_async("info", binary, op)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("List Functions"))
 async def functions(
     binary: NonEmptyStr,
     ctx: Context,
@@ -2588,7 +2848,7 @@ async def functions(
         return [{"mangled": demangle, "demangled": demangle_swift(demangle)}]
 
     def op(handle):
-        tools = GhidraTools(handle)
+        tools = _tools_for(handle)
         caps = _ensure_capabilities(handle)
 
         if type == "swift":
@@ -2651,13 +2911,13 @@ async def functions(
         funcs = tools.list_functions(pattern=query, limit=limit)
         return [{"name": f.name, "addr": f.address} for f in funcs]
 
-    results = _with_handle("functions", binary, op)
+    results = await _with_handle_async("functions", binary, op)
     await _warn_if_limit_reached(ctx, "functions", limit, len(results))
     return results
 
 
-@mcp.tool()
-def code(
+@mcp.tool(annotations=_read_only("Read Code"))
+async def code(
     binary: NonEmptyStr,
     target: CodeTargetArg,
     ctx: Context,
@@ -2705,7 +2965,7 @@ def code(
     what = _validate_choice("what", what, _CODE_WHATS)
 
     def op(handle):
-        tools = GhidraTools(handle)
+        tools = _tools_for(handle)
 
         # Handle batch decompile
         if isinstance(target, list):
@@ -2805,11 +3065,11 @@ def code(
 
         return result
 
-    return _with_handle("code", binary, op)
+    return await _with_handle_async("code", binary, op)
 
 
-@mcp.tool()
-def xrefs(
+@mcp.tool(annotations=_read_only("Cross-References"))
+async def xrefs(
     binary: NonEmptyStr,
     target: XrefsTargetArg,
     ctx: Context,
@@ -2885,7 +3145,7 @@ def xrefs(
             }
 
         handle = _get_handle(binary)
-        tools = GhidraTools(handle)
+        tools = _tools_for(handle)
 
         # Batch xrefs
         if isinstance(target, list):
@@ -2903,9 +3163,8 @@ def xrefs(
                     result[t] = []
             return {"xrefs": result}
 
-        # Call graph (depth > 1)
+        # Call graph (depth > 1; Field already caps depth at 5)
         if depth > 1:
-            depth = min(depth, 5)
             graph_direction = "both" if direction == "to" else direction
             if direction == "from":
                 graph_direction = "callees"
@@ -2929,11 +3188,14 @@ def xrefs(
             ],
         }
 
-    with _backend_lock:
-        return _guarded_tool_call("xrefs", op)
+    def _run():
+        with _backend_lock:
+            return _guarded_tool_call("xrefs", op)
+
+    return await asyncio.to_thread(_run)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Search Binary"))
 async def search(
     binary: NonEmptyStr,
     query: SearchQueryArg,
@@ -3000,8 +3262,10 @@ async def search(
     mode = _validate_choice("mode", mode, _SEARCH_MODES)
     limit = _validate_minimum("limit", limit, 1)
 
-    handle = _get_handle(binary)
-    tools = GhidraTools(handle)
+    # Handle resolution may hot-load an evicted binary from disk -- offload it.
+    # JVM work below runs through _locked_tools so it is serialized with the
+    # other read tools under _backend_lock (not held during handle resolution).
+    handle = await asyncio.to_thread(_get_handle, binary)
 
     # Batch search
     if isinstance(query, list):
@@ -3010,15 +3274,16 @@ async def search(
         if type != "strings":
             raise ValueError("Batch query lists currently support type='strings' only")
         if bg:
+            _reject_if_jobs_full()
             job_id = _new_job_id()
             job: dict = {"kind": "scan", "label": "batch_search",
                          "binary": binary, "status": "queued", "job_id": job_id}
             with _jobs_mutex:
                 _active_jobs[job_id] = job
 
-            fn = lambda: {"results": tools.batch_search_strings(
+            fn = lambda: _locked_tools(handle, lambda t: {"results": t.batch_search_strings(
                 query, mode=mode, limit_per_query=limit,
-            )}
+            )})
             asyncio.create_task(_run_scan_task(job_id, job, fn))
             return {
                 "job_id": job_id,
@@ -3026,8 +3291,12 @@ async def search(
                 "hint": "Poll binaries(jobs=True); completed scan jobs include result when available.",
             }
 
-        results = tools.batch_search_strings(query, mode=mode, limit_per_query=limit)
-        return {"queries": query, "results": results}
+        return await asyncio.to_thread(
+            lambda: _locked_tools(handle, lambda t: {
+                "queries": query,
+                "results": t.batch_search_strings(query, mode=mode, limit_per_query=limit),
+            })
+        )
 
     # Single query searches
     if type != "strings" and mode != "indexed":
@@ -3035,6 +3304,7 @@ async def search(
 
     if type == "extract":
         # BunFS extraction - always background
+        _reject_if_jobs_full()
         handle_analysis_id = _handle_analysis_id(handle)
         status_match = _find_on_disk(handle_analysis_id) if handle_analysis_id else None
         status = status_match or _read_status_file(getattr(handle, "unit_id", "")) or {}
@@ -3055,57 +3325,62 @@ async def search(
             "hint": "Poll binaries(jobs=True); completed scan jobs include result when available.",
         }
 
-    if type == "blob":
-        parts = query.split(",")
-        offset = parts[0].strip()
-        size = int(parts[1].strip()) if len(parts) > 1 else 1024
-        results = tools.extract_strings_from_blob(offset, size, limit=limit)
-        return {"offset": offset, "size": size, "strings": results}
+    # Remaining single-query searches are blocking JVM work -- run off the loop,
+    # serialized under _backend_lock via _locked_tools.
+    def _single(tools) -> dict:
+        if type == "blob":
+            parts = query.split(",")
+            offset = parts[0].strip()
+            size = int(parts[1].strip()) if len(parts) > 1 else 1024
+            results = tools.extract_strings_from_blob(offset, size, limit=limit)
+            return {"offset": offset, "size": size, "strings": results}
 
-    if type == "bytes":
-        results = tools.find_bytes(query, limit=limit)
-        return {"pattern": query, "matches": results}
+        if type == "bytes":
+            results = tools.find_bytes(query, limit=limit)
+            return {"pattern": query, "matches": results}
 
-    if type == "symbols":
-        results = tools.search_symbols(query, limit=limit)
+        if type == "symbols":
+            results = tools.search_symbols(query, limit=limit)
+            return {
+                "query": query,
+                "symbols": [
+                    {"name": s.name, "address": s.address, "type": s.type}
+                    for s in results
+                ],
+            }
+
+        if type == "all":
+            return {
+                "query": query,
+                "functions": [
+                    {"name": f.name, "address": f.address}
+                    for f in tools.list_functions(pattern=query, limit=limit)
+                ],
+                "symbols": [
+                    {"name": s.name, "address": s.address, "type": s.type}
+                    for s in tools.search_symbols(query, limit=limit)
+                ],
+                "strings": [
+                    {"value": s.value, "address": s.address}
+                    for s in tools.search_strings(query, limit=limit)
+                ],
+            }
+
+        # Default: strings
+        if mode == "deep":
+            results = tools.search_strings_deep(query, limit=limit)
+            return {"query": query, "mode": "deep", "strings": results}
+
+        results = tools.search_strings(query, limit=limit)
         return {
             "query": query,
-            "symbols": [
-                {"name": s.name, "address": s.address, "type": s.type}
+            "strings": [
+                {"value": s.value, "address": s.address, "refs": s.refs}
                 for s in results
             ],
         }
 
-    if type == "all":
-        return {
-            "query": query,
-            "functions": [
-                {"name": f.name, "address": f.address}
-                for f in tools.list_functions(pattern=query, limit=limit)
-            ],
-            "symbols": [
-                {"name": s.name, "address": s.address, "type": s.type}
-                for s in tools.search_symbols(query, limit=limit)
-            ],
-            "strings": [
-                {"value": s.value, "address": s.address}
-                for s in tools.search_strings(query, limit=limit)
-            ],
-        }
-
-    # Default: strings
-    if mode == "deep":
-        results = tools.search_strings_deep(query, limit=limit)
-        return {"query": query, "mode": "deep", "strings": results}
-
-    results = tools.search_strings(query, limit=limit)
-    return {
-        "query": query,
-        "strings": [
-            {"value": s.value, "address": s.address, "refs": s.refs}
-            for s in results
-        ],
-    }
+    return await asyncio.to_thread(lambda: _locked_tools(handle, _single))
 
 
 # =============================================================================
@@ -3157,7 +3432,9 @@ def _kill_job(analysis_id: str) -> None:
 # Keep _extract_bunfs_blocking for search(type="extract")
 def _extract_bunfs_blocking(handle, out: Path) -> dict:
     """Extract the bunfs filesystem from a Bun binary into readable JS files."""
-    rt_info = GhidraTools(handle).detect_embedded_runtime(compact=False)
+    # Only the runtime detection touches the JVM -- serialize that under the
+    # backend lock; the bun subprocess below runs unlocked (it can take minutes).
+    rt_info = _locked_tools(handle, lambda t: t.detect_embedded_runtime(compact=False))
     bun_rt = next((r for r in rt_info.get("runtimes", []) if r["type"] == "bunfs"), None)
     if not bun_rt:
         raise ValueError("No bunfs payload detected.")
@@ -3175,11 +3452,17 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     strategy_used = None
 
-    bun_exe = shutil.which("bun")
-    if bun_exe:
+    # Invoke a locally pre-installed, pinned extractor DIRECTLY. The previous
+    # implementation ran `bun x bun-extract-bundled`, which resolves and executes
+    # an npm package from the network on every call -- i.e. a tool call could
+    # fetch and run arbitrary remote code. We removed that: the only thing we run
+    # here is an extractor the operator has already installed on PATH, with a
+    # fixed argument vector (no shell, no package-manager launcher).
+    extractor = shutil.which("bun-extract-bundled")
+    if extractor:
         try:
             result = subprocess.run(
-                [bun_exe, "x", "bun-extract-bundled", str(binary_path), str(out)],
+                [extractor, str(binary_path), str(out)],
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode == 0:
@@ -3188,7 +3471,11 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
             pass
 
     if strategy_used is None:
-        raise RuntimeError("bunfs extraction failed. Install bun and retry.")
+        raise RuntimeError(
+            "bunfs extraction unavailable. Install the 'bun-extract-bundled' "
+            "executable on PATH (e.g. `bun add -g bun-extract-bundled`); "
+            "pyghidra-lite no longer fetches it from the network at run time."
+        )
 
     files = list(out.rglob("*"))
     js_files = [f for f in files if f.suffix in (".js", ".ts", ".json")]
@@ -3205,52 +3492,144 @@ def _extract_bunfs_blocking(handle, out: Path) -> dict:
 # =============================================================================
 
 
-def _run_with_idle_timeout(mcp_server, idle_minutes: int) -> None:
-    """Run streamable-http server with auto-exit on idle.
+def _is_loopback_host(host: str) -> bool:
+    """True when host is a loopback bind that is not externally reachable.
 
-    Wraps the Starlette app with middleware that tracks last-request time,
-    then runs a background watchdog that exits after idle_minutes of silence.
+    Accepts the literal "localhost" and any loopback IP (127.0.0.0/8, ::1),
+    including the bracketed IPv6 form "[::1]". Non-loopback hosts and the
+    wildcard binds (0.0.0.0, ::) return False, so the caller can require auth.
+    The old guard compared against the literal "127.0.0.1" only, which let
+    127.0.0.2, ::1, hostnames, and ::-wildcard slip through.
     """
-    import threading
+    h = host.strip().lower()
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _build_transport_security(
+    host: str, port: int, extra_hosts: tuple[str, ...] = ()
+) -> TransportSecuritySettings:
+    """Build DNS-rebinding protection settings for an HTTP/SSE bind.
+
+    The MCP transport-security guidance calls for validating the Host and Origin
+    headers so a malicious web page can't rebind DNS to the local server. We
+    always allow localhost variants plus the configured bind host; operators
+    fronting the server under another hostname add it via --allowed-host.
+    """
+    hostnames = {"localhost", "127.0.0.1", "::1", "[::1]"}
+    if host and host not in ("0.0.0.0", "::"):
+        hostnames.add(host)
+
+    allowed_hosts: set[str] = set()
+    allowed_origins: set[str] = set()
+    for hn in hostnames:
+        allowed_hosts.add(f"{hn}:{port}")
+        allowed_hosts.add(f"{hn}:*")
+        allowed_origins.add(f"http://{hn}:{port}")
+        allowed_origins.add(f"https://{hn}:{port}")
+
+    for entry in extra_hosts:
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            entry = f"{entry}:*"
+        allowed_hosts.add(entry)
+        if not entry.endswith(":*"):
+            allowed_origins.add(f"http://{entry}")
+            allowed_origins.add(f"https://{entry}")
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=sorted(allowed_hosts),
+        allowed_origins=sorted(allowed_origins),
+    )
+
+
+class _BearerAuthMiddleware:
+    """ASGI middleware enforcing a static bearer token on every HTTP request.
+
+    The MCP server itself has no auth; for non-loopback binds a shared token is
+    the minimum bar so that merely reaching the port is not enough to call every
+    tool (including delete). Compared in constant time to avoid timing oracles.
+    Non-HTTP scopes (lifespan) pass through untouched.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self._expected = f"Bearer {token}"
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        headers = dict(scope.get("headers") or [])
+        provided = headers.get(b"authorization", b"").decode("latin-1")
+        if not secrets.compare_digest(provided, self._expected):
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"www-authenticate", b"Bearer"),
+                ],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b'{"error":"unauthorized"}',
+            })
+            return
+        return await self.app(scope, receive, send)
+
+
+class _IdleTracker:
+    """ASGI middleware that records the time of the last HTTP request."""
+
+    def __init__(self, app):
+        self.app = app
+        self.last_request = time.time()
+        self._lock = threading.Lock()
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            with self._lock:
+                self.last_request = time.time()
+        return await self.app(scope, receive, send)
+
+    def idle_seconds(self) -> float:
+        with self._lock:
+            return time.time() - self.last_request
+
+
+def _serve_http(
+    mcp_server,
+    *,
+    transport: str,
+    auth_token: str | None = None,
+    idle_minutes: int | None = None,
+) -> None:
+    """Serve an HTTP/SSE MCP app via uvicorn with optional auth + idle exit.
+
+    Replaces the bare mcp.run() for the HTTP family so a single path applies the
+    bearer-auth and idle-timeout middleware (DNS-rebinding protection is wired
+    in earlier via mcp.settings.transport_security).
+    """
     import uvicorn
 
-    last_request = time.time()
-    lock = threading.Lock()
+    app = mcp_server.sse_app() if transport == "sse" else mcp_server.streamable_http_app()
+    if auth_token:
+        app = _BearerAuthMiddleware(app, auth_token)
 
-    class IdleTracker:
-        """ASGI middleware that bumps the last-request timestamp."""
-        def __init__(self, app):
-            self.app = app
-
-        async def __call__(self, scope, receive, send):
-            nonlocal last_request
-            if scope["type"] == "http":
-                with lock:
-                    last_request = time.time()
-            return await self.app(scope, receive, send)
-
-    def watchdog(server: uvicorn.Server):
-        timeout_sec = idle_minutes * 60
-        # Wait for server to finish starting before checking
-        while not server.started:
-            time.sleep(0.1)
-        while server.started:
-            time.sleep(30)
-            with lock:
-                idle_sec = time.time() - last_request
-            if idle_sec >= timeout_sec:
-                logger.info(
-                    "Idle for %d minutes, shutting down.",
-                    idle_minutes,
-                )
-                server.should_exit = True
-                return
-
-    starlette_app = mcp_server.streamable_http_app()
-    wrapped = IdleTracker(starlette_app)
+    idle = None
+    if idle_minutes and idle_minutes > 0:
+        idle = _IdleTracker(app)
+        app = idle
 
     config = uvicorn.Config(
-        wrapped,
+        app,
         host=mcp_server.settings.host,
         port=mcp_server.settings.port,
         log_level=mcp_server.settings.log_level.lower(),
@@ -3261,8 +3640,19 @@ def _run_with_idle_timeout(mcp_server, idle_minutes: int) -> None:
     )
     server = uvicorn.Server(config)
 
-    watcher = threading.Thread(target=watchdog, args=(server,), daemon=True)
-    watcher.start()
+    if idle is not None:
+        def watchdog(srv: uvicorn.Server, tracker: _IdleTracker):
+            timeout_sec = idle_minutes * 60
+            while not srv.started:
+                time.sleep(0.1)
+            while srv.started:
+                time.sleep(30)
+                if tracker.idle_seconds() >= timeout_sec:
+                    logger.info("Idle for %d minutes, shutting down.", idle_minutes)
+                    srv.should_exit = True
+                    return
+
+        threading.Thread(target=watchdog, args=(server, idle), daemon=True).start()
 
     # anyio.run is used by FastMCP internally; replicate here
     import anyio
@@ -3347,6 +3737,17 @@ def cli():
     help="Auto-exit after this many minutes with no HTTP requests (shared mode only). "
          "Set by proxy auto-start; 0 or None disables.",
 )
+@click.option(
+    "--auth-token", type=str, default=None, envvar="PYGHIDRA_LITE_AUTH_TOKEN",
+    help="Require this bearer token on every HTTP/SSE request (shared mode). "
+         "Required for non-loopback binds. Reads PYGHIDRA_LITE_AUTH_TOKEN.",
+)
+@click.option(
+    "--allowed-host", "allowed_hosts", type=str, multiple=True,
+    help="Extra Host header value to accept for DNS-rebinding protection "
+         "(host:port or host:*). Repeatable. Add this when fronting the server "
+         "under a hostname other than the bind address.",
+)
 @click.argument("binaries", nargs=-1, type=click.Path(exists=True, path_type=Path))
 def serve_cmd(
     transport: str,
@@ -3364,6 +3765,8 @@ def serve_cmd(
     evict_after: int | None,
     min_loaded: int | None,
     idle_timeout: int | None,
+    auth_token: str | None,
+    allowed_hosts: tuple[str, ...],
     binaries: tuple[Path, ...],
 ):
     """Start the MCP server (default when no subcommand given)."""
@@ -3389,16 +3792,32 @@ def serve_cmd(
         evict_after_minutes=evict_after,
         min_loaded=min_loaded,
     )
-    if is_shared and host != "127.0.0.1" and not restrict_paths:
-        logger.error(
-            "--restrict-path is required when binding to non-loopback address."
-        )
-        raise SystemExit(1)
+    is_loopback = _is_loopback_host(host)
+    if is_shared and not is_loopback:
+        if not restrict_paths:
+            logger.error(
+                "--restrict-path is required when binding to a non-loopback address (%s).",
+                host,
+            )
+            raise SystemExit(1)
+        if not auth_token:
+            logger.error(
+                "--auth-token (or PYGHIDRA_LITE_AUTH_TOKEN) is required when binding to a "
+                "non-loopback address (%s): the server has no other access control, so any "
+                "host that can reach the port could call every tool, including delete.",
+                host,
+            )
+            raise SystemExit(1)
     if is_shared and not restrict_paths:
         logger.warning(
             "Shared mode with no --restrict-path. "
             "Set --restrict-path for production deployments."
         )
+    # Resolve runtime_home now and persist it into the (still pre-live) config so
+    # error redaction and the import worker see the same resolved path. This must
+    # happen before go_live(), the last point at which config can change.
+    resolved_home = _ensure_runtime_environment(get_config().project_dir, get_config().runtime_home)
+    configure_server(runtime_home=resolved_home)
     _check_prerequisites(ghidra_dir)
     with _backend_lock:
         _backend = _init_backend(eager_load=eager_load)
@@ -3437,20 +3856,33 @@ def serve_cmd(
         from pyghidra_lite.proxy import _write_pid, _remove_pid
         _write_pid(port, os.getpid())
 
+    # Set the HTTP security holders ONCE, then assert DNS-rebinding protection is
+    # actually active before serving -- fail closed rather than expose an
+    # unprotected endpoint. These are the last writes before the config lock.
+    if transport != "stdio":
+        mcp.settings.host = host
+        mcp.settings.port = port
+        mcp.settings.transport_security = _build_transport_security(host, port, allowed_hosts)
+        ts = mcp.settings.transport_security
+        if ts is None or not ts.enable_dns_rebinding_protection:
+            raise SystemExit("refusing to serve HTTP without DNS-rebinding protection enabled")
+        if auth_token:
+            logger.info("Bearer token auth enabled for %s transport.", transport)
+
+    # Lock configuration for the lifetime of the process. From here, no in-process
+    # path can change a security setting; to change one, stop and re-run the CLI.
+    go_live()
+
     try:
         if transport == "stdio":
             mcp.run(transport="stdio")
-        elif transport == "streamable-http":
-            mcp.settings.host = host
-            mcp.settings.port = port
-            if idle_timeout and idle_timeout > 0:
-                _run_with_idle_timeout(mcp, idle_timeout)
-            else:
-                mcp.run(transport="streamable-http")
         else:
-            mcp.settings.host = host
-            mcp.settings.port = port
-            mcp.run(transport="sse")
+            _serve_http(
+                mcp,
+                transport=transport,
+                auth_token=auth_token,
+                idle_minutes=idle_timeout,
+            )
     finally:
         if transport in ("streamable-http", "sse"):
             _remove_pid(port)

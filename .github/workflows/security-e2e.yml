@@ -1,0 +1,51 @@
+name: Security E2E (real Ghidra)
+
+# Heavy, JVM+Ghidra-backed end-to-end security tests. Not run on every PR --
+# triggered manually or weekly. Boots a real `pyghidra-lite serve` process and
+# attacks it over real TCP sockets (see tests/test_security_e2e.py).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+
+jobs:
+  e2e:
+    name: Real-server security attack matrix
+    runs-on: ubuntu-latest
+    env:
+      GHIDRA_VERSION: "11.2.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Ghidra ${{ env.GHIDRA_VERSION }}
+        run: |
+          set -euo pipefail
+          tag="Ghidra_${GHIDRA_VERSION}_build"
+          url=$(curl -fsSL "https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/${tag}" \
+                | jq -r '.assets[] | select(.name | test("ghidra_.*_PUBLIC_.*\\.zip$")) | .browser_download_url')
+          test -n "$url"
+          curl -fsSL -o ghidra.zip "$url"
+          unzip -q ghidra.zip -d "$HOME/ghidra"
+          echo "GHIDRA_INSTALL_DIR=$(echo "$HOME"/ghidra/ghidra_*_PUBLIC)" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Security E2E (real server, real sockets)
+        env:
+          PYGHIDRA_E2E: "1"
+        run: uv run pytest tests/test_security_e2e.py -v

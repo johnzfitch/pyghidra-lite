@@ -91,12 +91,186 @@ def test_upsert_jvm_option_preserves_existing_flags(monkeypatch: pytest.MonkeyPa
     assert "-Xmx4g" in opts
 
 
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        ("127.0.0.1", True),
+        ("localhost", True),
+        ("LOCALHOST", True),
+        ("::1", True),
+        ("[::1]", True),
+        ("127.0.0.2", True),  # all of 127.0.0.0/8 is loopback
+        ("0.0.0.0", False),
+        ("::", False),
+        ("10.0.0.5", False),
+        ("example.com", False),
+    ],
+)
+def test_is_loopback_host(host: str, expected: bool) -> None:
+    assert server._is_loopback_host(host) is expected
+
+
+def test_build_transport_security_allows_localhost_and_bind_host() -> None:
+    ts = server._build_transport_security("0.0.0.0", 9000, ("proxy.internal:9000",))
+    assert ts.enable_dns_rebinding_protection is True
+    assert "localhost:9000" in ts.allowed_hosts
+    assert "127.0.0.1:9000" in ts.allowed_hosts
+    assert "proxy.internal:9000" in ts.allowed_hosts
+    assert "http://localhost:9000" in ts.allowed_origins
+    # Wildcard bind itself is never an allowed Host header value.
+    assert "0.0.0.0:9000" not in ts.allowed_hosts
+
+
+def _drive_asgi(app, headers: list[tuple[bytes, bytes]]):
+    """Invoke an ASGI app once with an http scope, capturing the response start."""
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    async def downstream(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    middleware = server._BearerAuthMiddleware(downstream, "s3cret")
+    scope = {"type": "http", "headers": headers}
+    asyncio.run(middleware(scope, receive, send))
+    return sent
+
+
+def test_bearer_auth_rejects_missing_token() -> None:
+    sent = _drive_asgi(None, headers=[])
+    assert sent[0]["status"] == 401
+
+
+def test_bearer_auth_rejects_wrong_token() -> None:
+    sent = _drive_asgi(None, headers=[(b"authorization", b"Bearer nope")])
+    assert sent[0]["status"] == 401
+
+
+def test_bearer_auth_accepts_correct_token() -> None:
+    sent = _drive_asgi(None, headers=[(b"authorization", b"Bearer s3cret")])
+    assert sent[0]["status"] == 200
+
+
+def test_unit_id_for_caches_until_file_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """unit_id is cached by (path, mtime, size) and recomputed when content changes."""
+    monkeypatch.setattr(server, "_unit_id_cache", {})
+    calls = {"n": 0}
+
+    def fake_hash(p):
+        calls["n"] += 1
+        return f"{calls['n']:016x}"
+
+    monkeypatch.setattr(server, "compute_unit_id_streaming", fake_hash)
+
+    f = tmp_path / "bin"
+    f.write_bytes(b"abc")
+    first = server._unit_id_for(f)
+    second = server._unit_id_for(f)
+    assert first == second
+    assert calls["n"] == 1  # second call served from cache
+
+    # Changing size (and mtime) busts the cache.
+    f.write_bytes(b"abcd")
+    third = server._unit_id_for(f)
+    assert calls["n"] == 2
+    assert third != first
+
+
 def test_guarded_tool_call_preserves_validation_errors() -> None:
     def op():
         raise ValueError("bad")
 
     with pytest.raises(ValueError, match="bad"):
         server._guarded_tool_call("test", op)
+
+
+def test_guarded_tool_call_redacts_paths_in_generic_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unexpected exceptions must not leak absolute server paths to clients."""
+    project_dir = tmp_path / "projects"
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=project_dir))
+
+    leaky = str(project_dir / "abcdef0123456789" / "secret.gpr")
+
+    def op():
+        raise KeyError(f"boom at {leaky}")
+
+    with pytest.raises(RuntimeError) as exc:
+        server._guarded_tool_call("decompile", op)
+
+    msg = str(exc.value)
+    assert str(project_dir) not in msg
+    assert "<project-dir>" in msg
+
+
+def test_sanitize_redacts_relative_project_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative --project-dir must still redact the absolute paths in errors."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=Path("./projects")))
+
+    abs_leak = str((tmp_path / "projects" / "abcdef0123456789").resolve())
+    out = server._sanitize_error_text(f"boom at {abs_leak}/p.gpr")
+
+    assert abs_leak not in out
+    assert "<project-dir>" in out
+
+
+def test_locked_tools_holds_backend_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_locked_tools must hold _backend_lock while the JVM work runs."""
+    import threading
+
+    monkeypatch.setattr(server, "_tools_for", lambda h: "TOOLS")
+    captured: dict = {}
+
+    def work(tools):
+        captured["tools"] = tools
+        # A different thread must NOT be able to grab the lock while we hold it.
+        result: dict = {}
+
+        def other():
+            result["got"] = server._backend_lock.acquire(blocking=False)
+            if result["got"]:
+                server._backend_lock.release()
+
+        t = threading.Thread(target=other)
+        t.start()
+        t.join()
+        captured["other_got_lock"] = result["got"]
+        return "RESULT"
+
+    out = server._locked_tools(object(), work)
+    assert out == "RESULT"
+    assert captured["tools"] == "TOOLS"
+    assert captured["other_got_lock"] is False
+
+
+def test_assert_within_restrict_roots_rejects_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.touch()
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(restrict_paths=[root]))
+
+    # Inside an allowed root: passes.
+    inside = root / "ok.bin"
+    inside.touch()
+    server._assert_within_restrict_roots(inside)
+
+    # Outside every root: rejected.
+    with pytest.raises(ValueError):
+        server._assert_within_restrict_roots(outside)
 
 
 def test_available_tools_always_returns_8_consolidated() -> None:
@@ -151,6 +325,39 @@ def test_tool_schemas_publish_enum_and_bounds() -> None:
         "strings", "symbols", "bytes", "all", "blob", "extract"
     ]
     assert search_schema["properties"]["mode"]["enum"] == ["indexed", "deep"]
+
+
+def test_all_tools_declare_annotations() -> None:
+    """Every consolidated tool must publish MCP behavioral annotations."""
+    tools = server.mcp._tool_manager._tools
+    expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"}
+    assert set(tools) == expected
+    for name, tool in tools.items():
+        assert tool.annotations is not None, f"{name} is missing annotations"
+        assert tool.annotations.title, f"{name} is missing a title"
+
+
+def test_read_only_tools_marked_read_only_and_idempotent() -> None:
+    """Analysis tools must advertise readOnlyHint + idempotentHint, not destructive."""
+    tools = server.mcp._tool_manager._tools
+    for name in ("binaries", "info", "functions", "code", "xrefs", "search"):
+        ann = tools[name].annotations
+        assert ann.readOnlyHint is True, f"{name} should be read-only"
+        assert ann.idempotentHint is True, f"{name} should be idempotent"
+        assert ann.destructiveHint is False, f"{name} should not be destructive"
+        assert ann.openWorldHint is False, f"{name} operates on local binaries only"
+
+
+def test_mutating_tools_have_correct_hints() -> None:
+    """delete is destructive; load mutates but is non-destructive."""
+    tools = server.mcp._tool_manager._tools
+    delete_ann = tools["delete"].annotations
+    assert delete_ann.readOnlyHint is False
+    assert delete_ann.destructiveHint is True
+
+    load_ann = tools["load"].annotations
+    assert load_ann.readOnlyHint is False
+    assert load_ann.destructiveHint is False
 
 
 def test_load_validation_failure_returns_mcp_tool_error(
@@ -367,7 +574,9 @@ def test_total_tool_count_is_8() -> None:
     """Tool consolidation: 58 tools -> 8 consolidated tools."""
     import re
     src = open("src/pyghidra_lite/server.py").read()
-    count = len(re.findall(r"^@mcp\.tool\(\)", src, re.MULTILINE))
+    # Decorators now carry MCP tool annotations, e.g. @mcp.tool(annotations=...),
+    # so match the opening @mcp.tool( rather than the bare ().
+    count = len(re.findall(r"^@mcp\.tool\(", src, re.MULTILINE))
     assert count == 8, f"Expected exactly 8 @mcp.tool() decorators, found {count}"
 
 
