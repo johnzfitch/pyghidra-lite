@@ -740,6 +740,8 @@ class PeTools:
         try:
             em = self.program.getExternalManager()
             for lib_name in em.getExternalLibraryNames():
+                if count >= limit:
+                    break
                 locs = em.getExternalLocations(lib_name)
                 while locs.hasNext():
                     if count >= limit:

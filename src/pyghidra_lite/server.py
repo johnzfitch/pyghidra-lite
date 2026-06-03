@@ -2666,8 +2666,9 @@ async def info(
         calls and tells you where to investigate next.**
 
       - "format": raw format-specific headers. Returns ELF details (debug info,
-        stripped status, machine type) or Mach-O details (CPU type, segment count,
-        code signature, entrypoint). Use when you need format-level metadata beyond
+        stripped status, machine type), Mach-O details (CPU type, segment count,
+        code signature, entrypoint), or PE details (machine, section/import/DLL
+        counts, .NET detection). Use when you need format-level metadata beyond
         what summary provides.
 
       - "sections": full memory/section layout with addresses, sizes, and
@@ -2683,7 +2684,7 @@ async def info(
         detail: Level of detail:
             - "summary" (default): basic info + capabilities
             - "full": triage with top functions, imports, strings
-            - "format": raw format headers (ELF/Mach-O specific)
+            - "format": raw format headers (ELF/Mach-O/PE specific)
             - "sections": memory/section layout
             - "entropy": per-section entropy analysis
     """
