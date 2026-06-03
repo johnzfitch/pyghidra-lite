@@ -3647,6 +3647,7 @@ async def annotate(
         from ghidra.program.model.symbol import SourceType
         prog = handle.program
         tx_id = prog.startTransaction(f"annotate:{action}")
+        success = False
         try:
             if action == "rename":
                 func.setName(new_value, SourceType.USER_DEFINED)
@@ -3654,10 +3655,9 @@ async def annotate(
                 func.setComment(new_value or None)
             else:
                 _apply_prototype(prog, func, new_value)
-            prog.endTransaction(tx_id, True)
-        except Exception:
-            prog.endTransaction(tx_id, False)
-            raise
+            success = True
+        finally:
+            prog.endTransaction(tx_id, success)
         get_backend().save_program(handle)
         tools.invalidate_cache()
         return {
