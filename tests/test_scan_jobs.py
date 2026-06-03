@@ -483,7 +483,8 @@ class TestConsolidatedToolsRegistered:
         fn = server.mcp._tool_manager._tools["search"].fn
         assert inspect.iscoroutinefunction(fn)
 
-    def test_total_tool_count_is_8(self):
+    def test_total_tool_count_is_9(self):
         tools = server.mcp._tool_manager._tools
-        expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"}
+        expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search",
+                    "annotate"}
         assert set(tools.keys()) == expected, f"Expected {expected}, got {set(tools.keys())}"

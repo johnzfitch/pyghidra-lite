@@ -1,10 +1,10 @@
 """pyghidra-lite: Lightweight MCP server for reverse engineering."""
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 from pyghidra_lite.analyzer import GhidraAnalyzer
 from pyghidra_lite.backend import GhidraBackend
-from pyghidra_lite.formats import ElfTools, MachOTools
+from pyghidra_lite.formats import ElfTools, MachOTools, PeTools
 from pyghidra_lite.lang import ObjCTools, SwiftTools, demangle_swift
 from pyghidra_lite.models import AnalysisProfile
 from pyghidra_lite.tools import GhidraTools
@@ -18,5 +18,6 @@ __all__ = [
     "MachOTools",
     "ObjCTools",
     "ElfTools",
+    "PeTools",
     "demangle_swift",
 ]

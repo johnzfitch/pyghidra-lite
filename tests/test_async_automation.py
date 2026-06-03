@@ -568,14 +568,15 @@ class TestMCPToolRegistration:
         assert "async" in doc.lower() or "10MB" in doc
 
     def test_total_tool_count(self):
-        """Should have exactly 8 consolidated tools."""
+        """Should have exactly 9 tools: 8 read tools + the opt-in annotate write tool."""
         tools = server.mcp._tool_manager._tools
-        assert len(tools) == 8, f"Expected 8 tools, got {len(tools)}: {sorted(tools.keys())}"
+        assert len(tools) == 9, f"Expected 9 tools, got {len(tools)}: {sorted(tools.keys())}"
 
-    def test_all_8_tools_registered(self):
-        """All 8 consolidated tools should be registered."""
+    def test_all_9_tools_registered(self):
+        """All 8 read tools plus the annotate write tool should be registered."""
         tools = server.mcp._tool_manager._tools
-        expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"}
+        expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search",
+                    "annotate"}
         assert expected == set(tools.keys()), f"Missing: {expected - set(tools.keys())}"
 
 

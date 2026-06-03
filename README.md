@@ -9,6 +9,8 @@
 
 Token-efficient MCP server for Ghidra-based reverse engineering. Analyze ELF, Mach-O, and PE binaries with Swift, Objective-C, and Hermes support.
 
+**Bottom line:** a lean, security-first Ghidra MCP. It is **read-only by default** — analysis tools never mutate your binaries or the server's configuration (which is frozen for the life of the process). The one tool that writes, `annotate` (rename / comment / prototype), is **opt-in** (`--allow-write`) and **human-confirmed**: every change is approved by you through an MCP elicitation prompt before it's committed, and it fails closed if your client can't ask. You get an analyst-agent that can persist its findings — under supervision — without giving up the read-only safety story.
+
 ## Quick Start
 
 **1. Prerequisites**
@@ -194,9 +196,10 @@ pyghidra-lite serve -t streamable-http --host 0.0.0.0 \
 Clients then send `Authorization: Bearer <token>` on every request. Terminate TLS
 at a reverse proxy for remote access.
 
-## Tools (8)
+## Tools (9)
 
-pyghidra-lite provides 8 consolidated tools that auto-detect format (ELF/Mach-O/PE) and language (Swift/ObjC/Hermes):
+pyghidra-lite provides 8 read-only analysis tools plus 1 opt-in write tool, all
+auto-detecting format (ELF/Mach-O/PE) and language (Swift/ObjC/Hermes):
 
 | Tool | Purpose | Key Parameters |
 |------|---------|----------------|
@@ -208,6 +211,12 @@ pyghidra-lite provides 8 consolidated tools that auto-detect format (ELF/Mach-O/
 | `code` | Decompile or disassemble | `binary`, `target`, `what?` (decompile/asm), `cfg?` |
 | `xrefs` | References and call graphs | `binary`, `target`, `direction?`, `depth?`, `diff?` |
 | `search` | Find strings, bytes, symbols | `binary`, `query`, `type?`, `mode?`, `bg?` |
+| `annotate` 🔒 | Rename / comment / set prototype | `binary`, `target`, `action`, `name?`/`comment?`/`prototype?` |
+
+🔒 `annotate` is the only tool that writes. It is disabled unless the server is
+started with `--allow-write`, and every change requires interactive
+confirmation (MCP elicitation) before it is committed — clients that can't
+confirm get a preview only. See [Writing back](#writing-back).
 
 ### Examples
 
@@ -247,6 +256,31 @@ Use the `type` and `detail` parameters to access format/language-specific featur
 
 - `bootstrap_mode="named"`: transfer only meaningful source names (default).
 - `bootstrap_mode="all"`: also assign stable synthetic labels to source `FUN_*` functions during transfer, which is useful for large version-to-version bootstrap workflows where uniqueness matters more than semantics.
+
+## Writing back
+
+By default pyghidra-lite is **read-only** — no tool mutates your binaries. To let
+an agent persist findings (rename a function, attach a comment, fix a prototype),
+start the server with `--allow-write`:
+
+```bash
+pyghidra-lite serve --allow-write          # or PYGHIDRA_LITE_ALLOW_WRITE=1
+```
+
+Then the `annotate` tool becomes usable:
+
+```python
+annotate("mybinary", target="FUN_00401000", action="rename", name="parse_header")
+annotate("mybinary", target="parse_header", action="comment", comment="validates the v2 header")
+annotate("mybinary", target="parse_header", action="prototype", prototype="int parse_header(char *buf, int len)")
+```
+
+Every call is **human-confirmed**: the server sends an MCP elicitation prompt
+showing the exact `old -> new` change, and only commits if you accept. If the
+server was started without `--allow-write`, the tool refuses; if your MCP client
+doesn't support elicitation, the tool returns a preview with `applied: false`
+and writes nothing (fail closed). Confirmed changes are written in a single
+Ghidra transaction and saved to the on-disk project.
 
 ## Analysis Profiles
 

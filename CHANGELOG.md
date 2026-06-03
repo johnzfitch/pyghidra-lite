@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-03
+
+### Added
+- **`annotate` write tool (opt-in, human-confirmed)**: the first tool that
+  writes back to a binary, consolidating rename / comment / prototype into one
+  command. It is **off by default** and only acts when the server is started
+  with `--allow-write` (or `PYGHIDRA_LITE_ALLOW_WRITE=1`); otherwise every call
+  is refused. Each individual change is gated behind an **MCP elicitation**
+  prompt the human must accept, showing the exact `old -> new` before
+  committing. If the client can't elicit, the call returns a preview with
+  `applied=false` and writes nothing (**fail closed**). Writes use a single
+  Ghidra transaction, persist to the on-disk project, and invalidate the
+  per-handle caches.
+- **PE imports / IAT analysis**: PE (Windows) binaries graduate from
+  detection-only to a real capability via a new `PeTools`. `info(detail="format")`
+  now reports PE structure (bits, machine, section/import/DLL counts, .NET
+  detection) and `functions(type="imports")` enriches each PE import with its
+  source DLL and IAT/thunk address.
+- **First PR-blocking CI** (`.github/workflows/ci.yml`): runs the (JVM-free)
+  test suite on every push and pull request, plus an informational `ruff` lint
+  pass.
+
+### Changed
+- `ServerConfig` gains an immutable `allow_write` field (default `False`),
+  threaded through `configure_server` and the `serve` CLI.
+
+### Tests
+- New `tests/test_write_tools.py` (gating, validation, elicitation fail-closed,
+  commit orchestration) and `tests/test_wiring.py` (advertised tools/capabilities
+  map to real implementations; analysis tools stay read-only).
+
 ## [0.7.0] - 2026-05-31
 
 ### Added

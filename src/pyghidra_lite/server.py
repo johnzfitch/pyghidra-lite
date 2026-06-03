@@ -25,9 +25,16 @@ import secrets
 import click
 from mcp.server import Server
 from mcp.server.fastmcp import Context, FastMCP
-from pydantic import Field
+from pydantic import BaseModel, Field
 from mcp.shared.exceptions import McpError
-from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData, ToolAnnotations
+from mcp.types import (
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    ClientCapabilities,
+    ElicitationCapability,
+    ErrorData,
+    ToolAnnotations,
+)
 from mcp.server.transport_security import TransportSecuritySettings
 
 from pyghidra_lite import __version__
@@ -144,6 +151,7 @@ _CODE_WHATS = ("decompile", "asm", "bytes", "string")
 _XREF_DIRECTIONS = ("to", "from")
 _SEARCH_TYPES = ("strings", "symbols", "bytes", "all", "blob", "extract")
 _SEARCH_MODES = ("indexed", "deep")
+_ANNOTATE_ACTIONS = ("rename", "comment", "prototype")
 _MAX_BATCH_XREF_TARGETS = 20
 _MAX_BATCH_SEARCH_QUERIES = 20
 _MAX_QUEUED_JOBS = 32
@@ -176,6 +184,7 @@ InfoDetailArg = Literal["summary", "full", "format", "sections", "entropy"]
 FunctionsTypeArg = Literal["all", "swift", "objc", "imports", "exports", "types", "got", "dylibs"]
 CodeWhatArg = Literal["decompile", "asm", "bytes", "string"]
 XrefsDirectionArg = Literal["to", "from"]
+AnnotateActionArg = Literal["rename", "comment", "prototype"]
 SearchTypeArg = Literal["strings", "symbols", "bytes", "all", "blob", "extract"]
 SearchModeArg = Literal["indexed", "deep"]
 CodeTargetArg = NonEmptyStr | Annotated[list[NonEmptyStr], Field(min_length=1)]
@@ -237,6 +246,7 @@ class ServerConfig:
     autopurge_days: int | None = None  # Delete projects not opened in N days (None = off)
     evict_after_minutes: int = 30  # Unload idle binaries from memory after N minutes (0 = off)
     min_loaded: int = 2  # Always keep at least N most-recently-used binaries in memory
+    allow_write: bool = False  # Opt-in write tools (annotate). Off by default: read-only.
 
     def __post_init__(self) -> None:
         # Accept any iterable (e.g. a list from a CLI/test call) but store an
@@ -329,6 +339,8 @@ def _load_config_from_env() -> ServerConfig:
             logger.warning("Ignoring invalid PYGHIDRA_LITE_DEFAULT_PROFILE=%s", default_profile)
     if restrict_paths := os.getenv("PYGHIDRA_LITE_RESTRICT_PATHS"):
         kwargs["restrict_paths"] = tuple(Path(p) for p in restrict_paths.split(os.pathsep) if p)
+    if "PYGHIDRA_LITE_ALLOW_WRITE" in os.environ:
+        kwargs["allow_write"] = _parse_bool(os.getenv("PYGHIDRA_LITE_ALLOW_WRITE"))
     return ServerConfig(**kwargs)
 
 
@@ -373,6 +385,7 @@ def configure_server(
     autopurge_days: int | None = None,
     evict_after_minutes: int | None = None,
     min_loaded: int | None = None,
+    allow_write: bool | None = None,
 ) -> None:
     """Build and install a fresh immutable config (the only writer).
 
@@ -401,6 +414,7 @@ def configure_server(
         autopurge_days=cur.autopurge_days if autopurge_days is None else autopurge_days,
         evict_after_minutes=cur.evict_after_minutes if evict_after_minutes is None else evict_after_minutes,
         min_loaded=cur.min_loaded if min_loaded is None else min_loaded,
+        allow_write=cur.allow_write if allow_write is None else allow_write,
     )
 
 
@@ -1328,6 +1342,47 @@ def _read_only(title: str) -> ToolAnnotations:
         idempotentHint=True,
         openWorldHint=False,
     )
+
+
+def _write_annotation(title: str) -> ToolAnnotations:
+    """Annotations for an opt-in, human-confirmed write tool (annotate).
+
+    Mutates the in-memory program and the on-disk project, so it is not
+    read-only. destructiveHint is False (rename/comment/prototype are reversible
+    relabelings, not data loss); idempotentHint is False because applying a
+    prototype/comment can differ from the prior value. openWorldHint stays False
+    -- writes only touch locally loaded binaries, never the network.
+    """
+    return ToolAnnotations(
+        title=title,
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+
+
+# Reject control characters and absurd lengths in a new symbol name. Ghidra
+# itself accepts most strings, so this is a light guard, not a parser.
+_SYMBOL_NAME_MAX = 255
+
+
+def _validate_symbol_name(name: str) -> str:
+    """Validate a user-supplied symbol name for the annotate(rename) action."""
+    stripped = name.strip()
+    if not stripped:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="name must be non-empty"))
+    if len(stripped) > _SYMBOL_NAME_MAX:
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message=f"name too long (max {_SYMBOL_NAME_MAX} chars)",
+        ))
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in stripped):
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message="name must not contain control characters",
+        ))
+    return stripped
 
 
 # =============================================================================
@@ -2713,6 +2768,18 @@ async def info(
                     "has_code_signature": macho_info.has_code_signature,
                     "entrypoint": macho_info.entrypoint,
                 }
+            elif caps.is_pe:
+                from pyghidra_lite.formats import PeTools
+                pe_info = PeTools(handle).get_pe_info()
+                base["pe"] = {
+                    "bits": pe_info.bits,
+                    "endian": pe_info.endian,
+                    "machine": pe_info.machine,
+                    "num_sections": pe_info.num_sections,
+                    "num_imports": pe_info.num_imports,
+                    "num_dlls": pe_info.num_dlls,
+                    "is_dotnet": pe_info.is_dotnet,
+                }
             return base
 
         # detail == "full" - triage mode
@@ -2809,7 +2876,8 @@ async def functions(
 
       - "imports": imported functions with automatic capability tagging (crypto,
         network, file, process, memory, jni). Shows which system capabilities
-        the binary uses and which libraries provide them.
+        the binary uses and which libraries provide them. For PE binaries each
+        row also includes the source DLL and its IAT/thunk address (iat_addr).
 
       - "exports": exported symbols - the binary's public API surface. Use to
         understand what a shared library exposes.
@@ -2874,6 +2942,17 @@ async def functions(
             ]
 
         if type == "imports":
+            if caps.is_pe:
+                # PE: use the ExternalManager-backed view so each import carries its
+                # source DLL and IAT/thunk address. Flattened to the same shape as
+                # other formats (one row per imported function).
+                from pyghidra_lite.formats import PeTools
+                grouped = PeTools(handle).list_imports_by_dll(pattern=query, limit=limit)
+                return [
+                    {"name": f["name"], "library": g["dll"],
+                     "iat_addr": f.get("iat_addr"), "tags": f.get("tags") or []}
+                    for g in grouped for f in g["functions"]
+                ]
             imports = tools.list_imports(pattern=query, limit=limit)
             return [
                 {"name": i.name, "library": i.library, "tags": i.tags or []}
@@ -3384,6 +3463,215 @@ async def search(
 
 
 # =============================================================================
+# WRITE TOOL (opt-in, human-confirmed)
+# =============================================================================
+# annotate is the only tool that mutates a binary. It is OFF unless the operator
+# started the server with --allow-write, and every individual change is gated
+# behind an MCP elicitation prompt the human must accept. If the client cannot
+# elicit, the write fails closed (preview only). This keeps the default posture
+# read-only while letting an analyst-agent persist its findings under supervision.
+
+class _ConfirmWrite(BaseModel):
+    """Elicitation schema for the per-change human confirmation (primitive-only)."""
+    confirm: bool = Field(default=False, description="Apply this change to the binary?")
+
+
+async def _confirm_or_refuse(ctx: Context, summary: str) -> bool:
+    """Ask the human to confirm a write via MCP elicitation; fail closed.
+
+    Returns True only when the client advertises elicitation support AND the
+    user explicitly accepts. A client that cannot elicit, a declined/cancelled
+    prompt, or any transport error all yield False -- no write happens.
+    """
+    try:
+        supported = ctx.session.check_client_capability(
+            ClientCapabilities(elicitation=ElicitationCapability())
+        )
+    except Exception:
+        return False
+    if not supported:
+        return False
+    try:
+        result = await ctx.elicit(message=summary, schema=_ConfirmWrite)
+    except Exception:
+        # McpError (client errored) or any client/transport failure -> no write.
+        return False
+    return getattr(result, "action", None) == "accept" and bool(
+        getattr(getattr(result, "data", None), "confirm", False)
+    )
+
+
+def _annotate_summary(action: str, preview: dict, new_value: str) -> str:
+    """Human-readable description of the pending change for the confirm prompt."""
+    target = preview.get("target")
+    addr = preview.get("target_addr")
+    old = preview.get("old", "")
+    if action == "rename":
+        return f"Rename function {old} -> {new_value} (at {addr})?"
+    if action == "comment":
+        return f"Set comment on {target} (at {addr}):\n{new_value}"
+    return f"Apply prototype to {target} (at {addr}):\n  was: {old}\n  new: {new_value}"
+
+
+def _apply_prototype(prog, func, signature_text: str) -> None:
+    """Parse a C prototype and apply it to func within the caller's transaction."""
+    from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+    from ghidra.app.util.parser import FunctionSignatureParser
+    from ghidra.program.model.symbol import SourceType
+    from ghidra.util.task import TaskMonitor
+
+    parser = FunctionSignatureParser(prog.getDataTypeManager(), None)
+    try:
+        sig = parser.parse(func.getSignature(), signature_text)
+    except Exception as exc:
+        raise ValueError(f"could not parse prototype: {_sanitize_error_text(str(exc))}") from exc
+    if sig is None:
+        raise ValueError("could not parse prototype")
+    cmd = ApplyFunctionSignatureCmd(func.getEntryPoint(), sig, SourceType.USER_DEFINED)
+    if not cmd.applyTo(prog, TaskMonitor.DUMMY):
+        raise ValueError(f"failed to apply prototype: {cmd.getStatusMsg()}")
+
+
+@mcp.tool(annotations=_write_annotation("Annotate Binary"))
+async def annotate(
+    binary: NonEmptyStr,
+    target: NonEmptyStr,
+    action: AnnotateActionArg,
+    ctx: Context,
+    name: str = "",
+    comment: str = "",
+    prototype: str = "",
+) -> dict:
+    """Persist an analysis finding back into the binary: rename a function, set a
+    comment, or apply a corrected prototype. **This is the only tool that writes.**
+
+    Writes are opt-in and human-supervised:
+
+      - The server must be started with `--allow-write`; otherwise every call is
+        refused (the default posture is strictly read-only).
+      - Each change requires interactive confirmation: the server elicits a
+        yes/no from you (the human) showing the exact old -> new before it
+        commits. If your client can't show that prompt, the call returns a
+        preview with applied=false and writes nothing (fail closed).
+
+    The action parameter selects what to write:
+
+      - "rename": give a function a meaningful name. Pass name=. Reversible.
+      - "comment": attach a plate comment to a function. Pass comment=.
+      - "prototype": apply a C function signature (e.g. "int parse(char *buf, int len)").
+        Pass prototype=. Updates parameter types and return type.
+
+    Args:
+        binary: Binary name or unit_id.
+        target: Function name or 0x-address to annotate.
+        action: "rename", "comment", or "prototype".
+        name: New function name (action="rename").
+        comment: Comment text (action="comment").
+        prototype: C signature (action="prototype").
+
+    Returns:
+        {binary, target, action, old, new, applied, reason?}. applied is False
+        (with a reason) when the change was not confirmed.
+    """
+    # 1) Gate: writes are opt-in. This must be the first thing the tool does so a
+    #    read-only server never resolves a handle or builds a preview for a write.
+    if not get_config().allow_write:
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message=(
+                "Write operations are disabled: the server is running read-only. "
+                "Restart with `pyghidra-lite serve --allow-write` and reconnect to "
+                "enable annotate (rename/comment/prototype)."
+            ),
+        ))
+
+    action = _validate_choice("action", action, _ANNOTATE_ACTIONS)
+
+    # 2) Per-action validation; new_value is exactly what we will write.
+    if action == "rename":
+        new_value = _validate_symbol_name(name)
+    elif action == "comment":
+        if not comment.strip():
+            raise McpError(ErrorData(code=INVALID_PARAMS, message="comment must be non-empty"))
+        new_value = comment
+    else:  # prototype
+        if not prototype.strip():
+            raise McpError(ErrorData(code=INVALID_PARAMS, message="prototype must be non-empty"))
+        new_value = prototype.strip()
+
+    # 3) Preview (read-only): resolve the function and capture the current value
+    #    so the human sees the exact old -> new and so commit can detect drift.
+    def _preview_op(handle):
+        tools = _tools_for(handle)
+        func = tools._find_function(target)
+        if func is None:
+            raise ValueError(f"Function not found: {target}")
+        if action == "rename":
+            old = func.getName()
+        elif action == "comment":
+            old = func.getComment() or ""
+        else:
+            try:
+                old = str(func.getSignature().getPrototypeString())
+            except Exception:
+                old = str(func.getSignature())
+        return {
+            "binary": handle.name,
+            "target": target,
+            "target_addr": str(func.getEntryPoint()),
+            "action": action,
+            "old": old,
+            "new": new_value,
+        }
+
+    preview = await _with_handle_async("annotate", binary, _preview_op)
+
+    # 4) Human-in-the-loop confirmation. Fail closed on decline/cancel/unsupported.
+    if not await _confirm_or_refuse(ctx, _annotate_summary(action, preview, new_value)):
+        return {
+            **preview,
+            "applied": False,
+            "reason": "change not confirmed (elicitation declined, cancelled, or unsupported)",
+        }
+
+    # 5) Commit under the backend lock: re-resolve and re-verify the target hasn't
+    #    moved since the preview, then write in a single transaction and persist.
+    def _commit_op(handle):
+        tools = _tools_for(handle)
+        func = tools._find_function(target)
+        if func is None:
+            raise ValueError(f"Function not found: {target}")
+        if str(func.getEntryPoint()) != preview["target_addr"]:
+            raise ValueError("binary changed since preview; aborting write")
+        from ghidra.program.model.symbol import SourceType
+        prog = handle.program
+        tx_id = prog.startTransaction(f"annotate:{action}")
+        try:
+            if action == "rename":
+                func.setName(new_value, SourceType.USER_DEFINED)
+            elif action == "comment":
+                func.setComment(new_value or None)
+            else:
+                _apply_prototype(prog, func, new_value)
+            prog.endTransaction(tx_id, True)
+        except Exception:
+            prog.endTransaction(tx_id, False)
+            raise
+        get_backend().save_program(handle)
+        tools.invalidate_cache()
+        return {
+            "binary": handle.name,
+            "target": target,
+            "action": action,
+            "old": preview["old"],
+            "new": new_value,
+            "applied": True,
+        }
+
+    return await _with_handle_async("annotate", binary, _commit_op)
+
+
+# =============================================================================
 # LEGACY TOOL ALIASES (hidden from model, route to consolidated tools)
 # =============================================================================
 
@@ -3733,6 +4021,12 @@ def cli():
     help="Always keep at least this many most-recently-used binaries in memory (default 2).",
 )
 @click.option(
+    "--allow-write/--no-allow-write", default=False, envvar="PYGHIDRA_LITE_ALLOW_WRITE",
+    help="Enable the annotate write tool (rename/comment/prototype). Off by default "
+         "(read-only). Each write still requires interactive confirmation from the "
+         "user via MCP elicitation; clients that can't confirm get a preview only.",
+)
+@click.option(
     "--idle-timeout", type=int, default=None,
     help="Auto-exit after this many minutes with no HTTP requests (shared mode only). "
          "Set by proxy auto-start; 0 or None disables.",
@@ -3764,6 +4058,7 @@ def serve_cmd(
     autopurge_days: int | None,
     evict_after: int | None,
     min_loaded: int | None,
+    allow_write: bool,
     idle_timeout: int | None,
     auth_token: str | None,
     allowed_hosts: tuple[str, ...],
@@ -3791,7 +4086,10 @@ def serve_cmd(
         autopurge_days=autopurge_days,
         evict_after_minutes=evict_after,
         min_loaded=min_loaded,
+        allow_write=allow_write,
     )
+    if allow_write:
+        logger.info("Write tools enabled (annotate); each change requires user confirmation.")
     is_loopback = _is_loopback_host(host)
     if is_shared and not is_loopback:
         if not restrict_paths:

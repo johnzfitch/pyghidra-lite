@@ -824,6 +824,19 @@ class GhidraBackend:
         )
         return stats
 
+    def save_program(self, handle: ProgramHandle) -> bool:
+        """Persist a program's current state back to its on-disk project.
+
+        Returns True if the program belongs to a known project and was saved,
+        False otherwise. Used by the annotate write tool after committing a
+        rename/comment/prototype transaction so the change survives eviction and
+        restart (mirrors how transfer_analysis persists its renames).
+        """
+        if handle.analysis_id in self._projects:
+            self._projects[handle.analysis_id].save(handle.program)
+            return True
+        return False
+
     def _apply_profile(self, handle: ProgramHandle, profile: AnalysisProfile) -> None:
         """Apply analysis profile settings."""
         from ghidra.program.model.listing import Program
