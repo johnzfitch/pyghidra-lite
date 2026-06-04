@@ -645,3 +645,140 @@ class MachOTools:
             "vmsize": linkedit.vmsize,
             "note": "Code signature data present (detailed parsing not implemented)",
         }
+
+
+# =============================================================================
+# PE (Portable Executable / Windows) format tools
+# =============================================================================
+
+
+@dataclass
+class PeInfo:
+    """Summary of PE binary structure."""
+    is_pe: bool
+    bits: int | None = None  # 32 or 64
+    endian: str | None = None  # PE is little-endian
+    machine: str | None = None  # x86, x86_64, ARM, etc.
+    num_sections: int = 0
+    num_imports: int = 0
+    num_dlls: int = 0
+    is_dotnet: bool = False  # managed (.NET / CLR) image
+
+
+class PeTools:
+    """PE-specific analysis tools (imports / IAT enumeration)."""
+
+    def __init__(self, handle: "ProgramHandle"):
+        self.handle = handle
+        self.program = handle.program
+
+    def is_pe(self) -> bool:
+        """Check if binary is PE (Windows) format."""
+        fmt = self.handle.metadata.get("Executable Format", "")
+        return "PE" in fmt or "Portable Executable" in fmt
+
+    def get_pe_info(self) -> PeInfo:
+        """Get PE binary structure summary."""
+        if not self.is_pe():
+            return PeInfo(is_pe=False)
+
+        metadata = self.handle.metadata
+
+        bits = None
+        addr_size = metadata.get("Address Size", "")
+        if "64" in addr_size:
+            bits = 64
+        elif "32" in addr_size:
+            bits = 32
+
+        endian = metadata.get("Endian", "").lower()
+        endian = "little" if "little" in endian else ("big" if "big" in endian else None)
+
+        machine = metadata.get("Processor", "") or None
+
+        num_sections = sum(1 for _ in self.program.getMemory().getBlocks())
+
+        # Count imports / DLLs from the (format-agnostic) external symbol table and
+        # detect managed images by the presence of the CLR runtime import.
+        dlls: set[str] = set()
+        num_imports = 0
+        is_dotnet = False
+        st = self.program.getSymbolTable()
+        for sym in st.getExternalSymbols():
+            num_imports += 1
+            lib = str(sym.getParentNamespace())
+            if lib and lib != "EXTERNAL":
+                dlls.add(lib)
+            if "mscoree" in lib.lower() or "mscoree" in sym.getName().lower():
+                is_dotnet = True
+
+        return PeInfo(
+            is_pe=True,
+            bits=bits,
+            endian=endian,
+            machine=machine,
+            num_sections=num_sections,
+            num_imports=num_imports,
+            num_dlls=len(dlls),
+            is_dotnet=is_dotnet,
+        )
+
+    def list_imports_by_dll(self, pattern: str = "", limit: int = 50) -> list[dict]:
+        """List PE imports grouped by DLL, with capability tags and IAT addresses.
+
+        Prefers Ghidra's ExternalManager (gives the importing DLL and the IAT/thunk
+        address per function); falls back to the external symbol table when the PE
+        loader did not populate ExternalLocations, so a sparse image still returns
+        its imports.
+        """
+        from pyghidra_lite.tools import get_capability_tags
+
+        groups: dict[str, list[dict]] = {}
+        count = 0
+        used_em = False
+
+        try:
+            em = self.program.getExternalManager()
+            for lib_name in em.getExternalLibraryNames():
+                if count >= limit:
+                    break
+                locs = em.getExternalLocations(lib_name)
+                while locs.hasNext():
+                    if count >= limit:
+                        break
+                    loc = locs.next()
+                    fname = loc.getLabel() or loc.getOriginalImportedName() or ""
+                    if not fname:
+                        continue
+                    if pattern and pattern.lower() not in fname.lower():
+                        continue
+                    addr = loc.getAddress()
+                    groups.setdefault(str(lib_name), []).append({
+                        "name": fname,
+                        "iat_addr": str(addr) if addr is not None else None,
+                        "tags": get_capability_tags(fname) or [],
+                    })
+                    count += 1
+                    used_em = True
+        except Exception as exc:
+            logger.debug("PE ExternalManager enumeration failed: %s", exc)
+
+        if not used_em:
+            groups = {}
+            count = 0
+            st = self.program.getSymbolTable()
+            for sym in st.getExternalSymbols():
+                if count >= limit:
+                    break
+                fname = sym.getName()
+                if pattern and pattern.lower() not in fname.lower():
+                    continue
+                lib = str(sym.getParentNamespace())
+                groups.setdefault(lib, []).append({
+                    "name": fname,
+                    "iat_addr": None,
+                    "tags": get_capability_tags(fname) or [],
+                })
+                count += 1
+
+        return [{"dll": dll, "functions": funcs} for dll, funcs in sorted(groups.items())]

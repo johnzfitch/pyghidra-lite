@@ -45,9 +45,14 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --extra dev
 
       - name: Security E2E (real server, real sockets)
         env:
           PYGHIDRA_E2E: "1"
         run: uv run pytest tests/test_security_e2e.py -v
+
+      - name: Write-tool E2E (real JVM + Ghidra writes)
+        env:
+          PYGHIDRA_E2E: "1"
+        run: uv run pytest tests/test_write_e2e.py -v

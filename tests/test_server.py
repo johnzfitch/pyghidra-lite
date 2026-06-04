@@ -330,7 +330,8 @@ def test_tool_schemas_publish_enum_and_bounds() -> None:
 def test_all_tools_declare_annotations() -> None:
     """Every consolidated tool must publish MCP behavioral annotations."""
     tools = server.mcp._tool_manager._tools
-    expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search"}
+    expected = {"load", "delete", "binaries", "info", "functions", "code", "xrefs", "search",
+                "annotate"}
     assert set(tools) == expected
     for name, tool in tools.items():
         assert tool.annotations is not None, f"{name} is missing annotations"
@@ -570,14 +571,14 @@ def test_file_consolidation_lang_importable() -> None:
     assert demangle_swift is not None
 
 
-def test_total_tool_count_is_8() -> None:
-    """Tool consolidation: 58 tools -> 8 consolidated tools."""
+def test_total_tool_count_is_9() -> None:
+    """Tool consolidation: 58 tools -> 8 read tools + 1 opt-in write tool (annotate)."""
     import re
     src = open("src/pyghidra_lite/server.py").read()
     # Decorators now carry MCP tool annotations, e.g. @mcp.tool(annotations=...),
     # so match the opening @mcp.tool( rather than the bare ().
     count = len(re.findall(r"^@mcp\.tool\(", src, re.MULTILINE))
-    assert count == 8, f"Expected exactly 8 @mcp.tool() decorators, found {count}"
+    assert count == 9, f"Expected exactly 9 @mcp.tool() decorators, found {count}"
 
 
 # =============================================================================
