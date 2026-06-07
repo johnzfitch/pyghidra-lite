@@ -3606,6 +3606,71 @@ def _apply_prototype(prog, func, signature_text: str) -> None:
         raise ValueError(f"failed to apply prototype: {cmd.getStatusMsg()}")
 
 
+# --- write audit journal + volume warning ------------------------------------
+# MCP elicitation can't stop an auto-approving client from self-confirming, so
+# every write -- and every declined/failed attempt -- is appended to a JSONL
+# journal next to the on-disk projects. Each entry records old -> new, so the
+# journal doubles as an undo log; a flood of entries is the signal that an
+# auto-agent is churning. A per-session counter also nudges via ctx.warning.
+
+_audit_lock = threading.Lock()
+_annotate_attempts = 0
+_ANNOTATE_WARN_EVERY = 25  # nudge every N write attempts in a session
+
+
+def _audit_log_path() -> Path:
+    """Location of the append-only annotate audit journal."""
+    try:
+        base = get_backend().project_dir
+    except Exception:
+        base = get_config().project_dir or DEFAULT_PROJECT_DIR
+    return Path(base) / "annotate_audit.jsonl"
+
+
+def _audit_write(preview: dict, outcome: str, detail: str = "") -> None:
+    """Append one record to the audit journal. Best-effort: never raises, never
+    blocks a tool call -- auditing must not be able to break (or gate) a write."""
+    from datetime import UTC, datetime
+
+    record = {
+        "ts": datetime.now(UTC).isoformat(),
+        "binary": preview.get("binary"),
+        "unit_id": preview.get("unit_id"),
+        "analysis_id": preview.get("analysis_id"),
+        "action": preview.get("action"),
+        "target": preview.get("target"),
+        "addr": preview.get("target_addr"),
+        "old": preview.get("old"),
+        "new": preview.get("new"),
+        "outcome": outcome,
+    }
+    if detail:
+        record["detail"] = _sanitize_error_text(detail)
+    try:
+        path = _audit_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, separators=(",", ":"), default=str)
+        with _audit_lock, open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        logger.info("annotate %s: %s %r -> %r on %s",
+                    outcome, record["action"], record["old"], record["new"], record["binary"])
+    except Exception as exc:
+        logger.warning("annotate audit log write failed: %s", exc)
+
+
+async def _note_write_volume(ctx: Context, binary: str) -> None:
+    """Increment the session write-attempt counter; nudge on threshold crossings."""
+    global _annotate_attempts
+    _annotate_attempts += 1
+    n = _annotate_attempts
+    if n % _ANNOTATE_WARN_EVERY == 0:
+        with suppress(Exception):
+            await ctx.warning(
+                f"annotate has been called {n} times this session (latest target on "
+                f"{binary}). All writes are recorded in {_audit_log_path()}."
+            )
+
+
 @mcp.tool(annotations=_write_annotation("Annotate Binary"))
 async def annotate(
     binary: NonEmptyStr,
@@ -3627,6 +3692,9 @@ async def annotate(
         yes/no from you (the human) showing the exact old -> new before it
         commits. If your client can't show that prompt, the call returns a
         preview with applied=false and writes nothing (fail closed).
+      - Every write (and every declined/failed attempt) is appended to an
+        audit journal next to the projects, recording old -> new -- so changes
+        stay accountable and reversible even under an auto-approving client.
 
     The action parameter selects what to write:
 
@@ -3691,6 +3759,8 @@ async def annotate(
                 old = str(func.getSignature())
         return {
             "binary": handle.name,
+            "unit_id": getattr(handle, "unit_id", None),
+            "analysis_id": getattr(handle, "analysis_id", None),
             "target": target,
             "target_addr": str(func.getEntryPoint()),
             "action": action,
@@ -3700,8 +3770,13 @@ async def annotate(
 
     preview = await _with_handle_async("annotate", binary, _preview_op)
 
+    # Count the attempt and nudge if write volume is high this session. Elicitation
+    # can't stop an auto-approving client, so a flood of writes should be loud.
+    await _note_write_volume(ctx, binary)
+
     # 4) Human-in-the-loop confirmation. Fail closed on decline/cancel/unsupported.
     if not await _confirm_or_refuse(ctx, _annotate_summary(action, preview, new_value)):
+        _audit_write(preview, "declined")
         return {
             **preview,
             "applied": False,
@@ -3742,7 +3817,13 @@ async def annotate(
             "applied": True,
         }
 
-    return await _with_handle_async("annotate", binary, _commit_op)
+    try:
+        result = await _with_handle_async("annotate", binary, _commit_op)
+    except Exception as exc:
+        _audit_write(preview, "failed", detail=str(exc))
+        raise
+    _audit_write(preview, "applied")
+    return result
 
 
 # =============================================================================
@@ -4162,8 +4243,6 @@ def serve_cmd(
         min_loaded=min_loaded,
         allow_write=allow_write,
     )
-    if allow_write:
-        logger.info("Write tools enabled (annotate); each change requires user confirmation.")
     is_loopback = _is_loopback_host(host)
     if is_shared and not is_loopback:
         if not restrict_paths:
@@ -4193,6 +4272,12 @@ def serve_cmd(
     _check_prerequisites(ghidra_dir)
     with _backend_lock:
         _backend = _init_backend(eager_load=eager_load)
+
+    if allow_write:
+        logger.info(
+            "Write tools enabled (annotate); each change requires user confirmation. "
+            "Audit journal: %s", _audit_log_path(),
+        )
 
     # Detect capabilities for all pre-loaded binaries
     for prog_name in _backend.list_programs():
