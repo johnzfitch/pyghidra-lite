@@ -262,6 +262,43 @@ def test_audit_write_never_raises(monkeypatch):
     server._audit_write(_AUDIT_PREVIEW, "applied")  # must not raise
 
 
+def test_audit_write_rejects_symlink(tmp_path, monkeypatch):
+    import os
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlinks not supported on this platform")
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+
+    # Create a target file and a symlink pointing to it
+    target = tmp_path / "target.txt"
+    target.write_text("secure data\n")
+    audit_path = tmp_path / "annotate_audit.jsonl"
+    audit_path.symlink_to(target)
+
+    # Calling _audit_write should NOT write to the target (or through the symlink)
+    server._audit_write(_AUDIT_PREVIEW, "applied")
+
+    # The target file must remain untouched
+    assert target.read_text() == "secure data\n"
+
+
+def test_audit_write_uses_private_permissions(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+
+    server._audit_write(_AUDIT_PREVIEW, "applied")
+
+    audit_path = tmp_path / "annotate_audit.jsonl"
+    assert audit_path.exists()
+    # On POSIX, check permissions are 0o600 (owner read/write only)
+    if os.name == "posix":
+        mode = audit_path.stat().st_mode & 0o777
+        assert mode == 0o600
+
+
 def test_audit_log_path_uses_config_fallback(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_backend", None)
     monkeypatch.setattr(server, "_server_config",
