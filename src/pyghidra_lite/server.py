@@ -3583,7 +3583,11 @@ def _audit_write(preview: dict, outcome: str, detail: str = "") -> None:
         path = _audit_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, separators=(",", ":"), default=str)
-        with _audit_lock, open(path, "a", encoding="utf-8") as fh:
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(path), flags, mode=0o600)
+        with _audit_lock, open(fd, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
         logger.info("annotate %s: %s %r -> %r on %s",
                     outcome, record["action"], record["old"], record["new"], record["binary"])
