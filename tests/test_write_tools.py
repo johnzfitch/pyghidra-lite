@@ -7,6 +7,8 @@ program, so the orchestration tests assert *that* commit is (or is not) invoked
 rather than re-implementing Ghidra.
 """
 import asyncio
+import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -174,6 +176,8 @@ def test_annotate_fail_closed_skips_commit(monkeypatch):
         return dict(_PREVIEW)
 
     monkeypatch.setattr(server, "_with_handle_async", fake_with_handle_async)
+    audited = []
+    monkeypatch.setattr(server, "_audit_write", lambda preview, outcome, **kw: audited.append(outcome))
     ctx = _FakeCtx(supports=False)  # cannot confirm -> fail closed
 
     result = asyncio.run(server.annotate(
@@ -182,6 +186,7 @@ def test_annotate_fail_closed_skips_commit(monkeypatch):
     assert result["applied"] is False
     assert "not confirmed" in result["reason"]
     assert calls == ["annotate"]  # only the preview op ran; commit was skipped
+    assert audited == ["declined"]  # the refused attempt is journaled
 
 
 def test_annotate_confirmed_runs_commit(monkeypatch):
@@ -196,6 +201,8 @@ def test_annotate_confirmed_runs_commit(monkeypatch):
         return {**_PREVIEW, "applied": True}
 
     monkeypatch.setattr(server, "_with_handle_async", fake_with_handle_async)
+    audited = []
+    monkeypatch.setattr(server, "_audit_write", lambda preview, outcome, **kw: audited.append(outcome))
     ctx = _FakeCtx(supports=True, result=AcceptedElicitation(data=_ConfirmWrite(confirm=True)))
 
     result = asyncio.run(server.annotate(
@@ -203,3 +210,60 @@ def test_annotate_confirmed_runs_commit(monkeypatch):
     ))
     assert result["applied"] is True
     assert len(calls) == 2  # preview + commit
+    assert audited == ["applied"]  # the committed write is journaled
+
+
+# --------------------------------------------------------------------------- #
+# Audit journal
+# --------------------------------------------------------------------------- #
+
+_AUDIT_PREVIEW = {
+    "binary": "b", "unit_id": "u", "analysis_id": "a", "action": "rename",
+    "target": "FUN_1", "target_addr": "0x1000", "old": "FUN_1", "new": "foo",
+}
+
+
+def test_audit_write_appends_jsonl(tmp_path, monkeypatch):
+    # No backend -> _audit_log_path falls back to the config project_dir.
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+
+    server._audit_write(_AUDIT_PREVIEW, "applied")
+    server._audit_write({**_AUDIT_PREVIEW, "old": "foo", "new": "bar"}, "declined")
+
+    path = tmp_path / "annotate_audit.jsonl"
+    assert path.exists()
+    lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert lines[0]["outcome"] == "applied"
+    assert lines[0]["action"] == "rename"
+    assert lines[0]["old"] == "FUN_1" and lines[0]["new"] == "foo"
+    assert lines[0]["addr"] == "0x1000"
+    assert "ts" in lines[0]
+    assert lines[1]["outcome"] == "declined"
+
+
+def test_audit_write_records_detail(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    server._audit_write(_AUDIT_PREVIEW, "failed", detail="boom")
+    rec = json.loads((tmp_path / "annotate_audit.jsonl").read_text().splitlines()[0])
+    assert rec["outcome"] == "failed"
+    assert "boom" in rec["detail"]
+
+
+def test_audit_write_never_raises(monkeypatch):
+    # A broken journal path must not be able to break (or block) a tool call.
+    def boom():
+        raise OSError("nope")
+    monkeypatch.setattr(server, "_audit_log_path", boom)
+    server._audit_write(_AUDIT_PREVIEW, "applied")  # must not raise
+
+
+def test_audit_log_path_uses_config_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    assert server._audit_log_path() == Path(tmp_path) / "annotate_audit.jsonl"
