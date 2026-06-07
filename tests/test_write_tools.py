@@ -267,3 +267,25 @@ def test_audit_log_path_uses_config_fallback(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_server_config",
                         ServerConfig(allow_write=True, project_dir=tmp_path))
     assert server._audit_log_path() == Path(tmp_path) / "annotate_audit.jsonl"
+
+
+# --------------------------------------------------------------------------- #
+# Write-volume counter (must be per client session, not process-global)
+# --------------------------------------------------------------------------- #
+
+def test_write_attempts_are_per_session():
+    server._write_attempts_by_session.clear()
+    ctx_a = _FakeCtx(supports=True)
+    ctx_b = _FakeCtx(supports=True)
+    assert server._bump_write_attempts(ctx_a) == 1
+    assert server._bump_write_attempts(ctx_a) == 2
+    assert server._bump_write_attempts(ctx_b) == 1  # B's count is independent of A
+    assert server._bump_write_attempts(ctx_a) == 3
+
+
+def test_write_attempts_global_fallback_without_session():
+    class _NoSession:
+        session = None
+
+    before = server._annotate_attempts
+    assert server._bump_write_attempts(_NoSession()) == before + 1
