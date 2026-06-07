@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext, suppress
@@ -3541,7 +3542,12 @@ def _apply_prototype(prog, func, signature_text: str) -> None:
 # auto-agent is churning. A per-session counter also nudges via ctx.warning.
 
 _audit_lock = threading.Lock()
-_annotate_attempts = 0
+# Write-attempt counters, genuinely per client session: a shared HTTP/SSE server
+# serves many sessions from one process, so a module-global counter would leak
+# one client's volume into another's warnings. Keyed weakly so entries vanish
+# when a session ends; falls back to a global only if no usable session exists.
+_write_attempts_by_session: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_annotate_attempts = 0  # fallback counter (stdio/no-session)
 _ANNOTATE_WARN_EVERY = 25  # nudge every N write attempts in a session
 
 
@@ -3585,16 +3591,36 @@ def _audit_write(preview: dict, outcome: str, detail: str = "") -> None:
         logger.warning("annotate audit log write failed: %s", exc)
 
 
+def _bump_write_attempts(ctx: Context) -> int:
+    """Increment and return this session's write-attempt count.
+
+    Per-session via a weak-keyed map on ctx.session; if no session is usable as
+    a weak key, fall back to a process-global counter so the nudge still fires.
+    """
+    global _annotate_attempts
+    session = getattr(ctx, "session", None)
+    if session is not None:
+        try:
+            n = _write_attempts_by_session.get(session, 0) + 1
+            _write_attempts_by_session[session] = n
+            return n
+        except TypeError:
+            pass  # session not weak-referenceable/hashable -> global fallback
+    _annotate_attempts += 1
+    return _annotate_attempts
+
+
 async def _note_write_volume(ctx: Context, binary: str) -> None:
     """Increment the session write-attempt counter; nudge on threshold crossings."""
-    global _annotate_attempts
-    _annotate_attempts += 1
-    n = _annotate_attempts
+    n = _bump_write_attempts(ctx)
     if n % _ANNOTATE_WARN_EVERY == 0:
         with suppress(Exception):
+            # Only the journal's filename is sent to the client -- the full path
+            # is server-side detail (logged locally), not for remote disclosure.
             await ctx.warning(
                 f"annotate has been called {n} times this session (latest target on "
-                f"{binary}). All writes are recorded in {_audit_log_path()}."
+                f"{binary}). All writes are recorded in the audit journal "
+                f"({_audit_log_path().name})."
             )
 
 
