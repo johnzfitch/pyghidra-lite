@@ -299,6 +299,60 @@ def test_audit_write_uses_private_permissions(tmp_path, monkeypatch):
         assert mode == 0o600
 
 
+def test_audit_write_required_fails_closed(monkeypatch):
+    # required=True must surface a journal failure as an McpError so the caller
+    # can refuse the write; required=False still swallows the same failure.
+    def boom(record):
+        raise OSError("disk full")
+    monkeypatch.setattr(server, "_audit_append", boom)
+    with pytest.raises(McpError):
+        server._audit_write(_AUDIT_PREVIEW, "applied", required=True)
+    server._audit_write(_AUDIT_PREVIEW, "declined")  # best-effort: must not raise
+
+
+def test_audit_log_injection_is_escaped(tmp_path, monkeypatch):
+    # A malicious value with an embedded newline + fake JSON must not forge a
+    # second journal line -- json.dumps escapes it inside one string field.
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    evil = 'x"}\n{"outcome":"applied","new":"FORGED'
+    server._audit_write({**_AUDIT_PREVIEW, "new": evil}, "applied")
+    lines = [line for line in (tmp_path / "annotate_audit.jsonl").read_text().splitlines()
+             if line.strip()]
+    assert len(lines) == 1  # exactly one record, no forged line
+    rec = json.loads(lines[0])
+    assert rec["new"] == evil  # newline preserved verbatim inside the field
+
+
+def test_audit_journal_rotates(tmp_path, monkeypatch):
+    # The journal must not grow without bound: rotation keeps a bounded backup set.
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    monkeypatch.setattr(server, "_AUDIT_MAX_BYTES", 200)
+    for _ in range(20):
+        server._audit_write(_AUDIT_PREVIEW, "applied")
+    path = tmp_path / "annotate_audit.jsonl"
+    assert path.exists()
+    assert (tmp_path / "annotate_audit.jsonl.1").exists()  # a backup was rotated out
+    assert path.stat().st_size < server._AUDIT_MAX_BYTES + 1024  # current stays bounded
+
+
+def test_audit_refuses_symlinked_journal(tmp_path, monkeypatch):
+    # O_NOFOLLOW: a symlinked journal path is refused so an attacker can't
+    # redirect the audit trail to clobber another file.
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    target = tmp_path / "evil_target"
+    target.write_text("")
+    (tmp_path / "annotate_audit.jsonl").symlink_to(target)
+    with pytest.raises(McpError):
+        server._audit_write(_AUDIT_PREVIEW, "applied", required=True)
+    assert target.read_text() == ""  # nothing written through the symlink
+
+
 def test_audit_log_path_uses_config_fallback(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_backend", None)
     monkeypatch.setattr(server, "_server_config",
