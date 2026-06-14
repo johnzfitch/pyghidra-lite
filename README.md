@@ -20,7 +20,7 @@ JDK 21+ and Ghidra 11.x are required.
 ```bash
 # macOS
 brew install openjdk@21
-brew install --cask ghidra
+brew install ghidra
 
 # Ubuntu/Debian
 sudo apt install openjdk-21-jdk
@@ -31,7 +31,7 @@ sudo pacman -S jdk21-openjdk
 yay -S ghidra
 ```
 
-Ghidra at `/opt/ghidra` or `~/ghidra` is found automatically. Set `GHIDRA_INSTALL_DIR` only for non-standard paths.
+Ghidra installed via Homebrew (`brew install ghidra`) or to `/opt/ghidra` or `~/ghidra` is found automatically. Set `GHIDRA_INSTALL_DIR` only for non-standard paths.
 
 **2. Install pyghidra-lite**
 
