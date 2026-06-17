@@ -7,6 +7,8 @@ program, so the orchestration tests assert *that* commit is (or is not) invoked
 rather than re-implementing Ghidra.
 """
 import asyncio
+import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -174,6 +176,8 @@ def test_annotate_fail_closed_skips_commit(monkeypatch):
         return dict(_PREVIEW)
 
     monkeypatch.setattr(server, "_with_handle_async", fake_with_handle_async)
+    audited = []
+    monkeypatch.setattr(server, "_audit_write", lambda preview, outcome, **kw: audited.append(outcome))
     ctx = _FakeCtx(supports=False)  # cannot confirm -> fail closed
 
     result = asyncio.run(server.annotate(
@@ -182,6 +186,7 @@ def test_annotate_fail_closed_skips_commit(monkeypatch):
     assert result["applied"] is False
     assert "not confirmed" in result["reason"]
     assert calls == ["annotate"]  # only the preview op ran; commit was skipped
+    assert audited == ["declined"]  # the refused attempt is journaled
 
 
 def test_annotate_confirmed_runs_commit(monkeypatch):
@@ -196,6 +201,8 @@ def test_annotate_confirmed_runs_commit(monkeypatch):
         return {**_PREVIEW, "applied": True}
 
     monkeypatch.setattr(server, "_with_handle_async", fake_with_handle_async)
+    audited = []
+    monkeypatch.setattr(server, "_audit_write", lambda preview, outcome, **kw: audited.append(outcome))
     ctx = _FakeCtx(supports=True, result=AcceptedElicitation(data=_ConfirmWrite(confirm=True)))
 
     result = asyncio.run(server.annotate(
@@ -203,3 +210,173 @@ def test_annotate_confirmed_runs_commit(monkeypatch):
     ))
     assert result["applied"] is True
     assert len(calls) == 2  # preview + commit
+    assert audited == ["applied"]  # the committed write is journaled
+
+
+# --------------------------------------------------------------------------- #
+# Audit journal
+# --------------------------------------------------------------------------- #
+
+_AUDIT_PREVIEW = {
+    "binary": "b", "unit_id": "u", "analysis_id": "a", "action": "rename",
+    "target": "FUN_1", "target_addr": "0x1000", "old": "FUN_1", "new": "foo",
+}
+
+
+def test_audit_write_appends_jsonl(tmp_path, monkeypatch):
+    # No backend -> _audit_log_path falls back to the config project_dir.
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+
+    server._audit_write(_AUDIT_PREVIEW, "applied")
+    server._audit_write({**_AUDIT_PREVIEW, "old": "foo", "new": "bar"}, "declined")
+
+    path = tmp_path / "annotate_audit.jsonl"
+    assert path.exists()
+    lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert lines[0]["outcome"] == "applied"
+    assert lines[0]["action"] == "rename"
+    assert lines[0]["old"] == "FUN_1" and lines[0]["new"] == "foo"
+    assert lines[0]["addr"] == "0x1000"
+    assert "ts" in lines[0]
+    assert lines[1]["outcome"] == "declined"
+
+
+def test_audit_write_records_detail(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    server._audit_write(_AUDIT_PREVIEW, "failed", detail="boom")
+    rec = json.loads((tmp_path / "annotate_audit.jsonl").read_text().splitlines()[0])
+    assert rec["outcome"] == "failed"
+    assert "boom" in rec["detail"]
+
+
+def test_audit_write_never_raises(monkeypatch):
+    # A broken journal path must not be able to break (or block) a tool call.
+    def boom():
+        raise OSError("nope")
+    monkeypatch.setattr(server, "_audit_log_path", boom)
+    server._audit_write(_AUDIT_PREVIEW, "applied")  # must not raise
+
+
+def test_audit_write_rejects_symlink(tmp_path, monkeypatch):
+    import os
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlinks not supported on this platform")
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+
+    # Create a target file and a symlink pointing to it
+    target = tmp_path / "target.txt"
+    target.write_text("secure data\n")
+    audit_path = tmp_path / "annotate_audit.jsonl"
+    audit_path.symlink_to(target)
+
+    # Calling _audit_write should NOT write to the target (or through the symlink)
+    server._audit_write(_AUDIT_PREVIEW, "applied")
+
+    # The target file must remain untouched
+    assert target.read_text() == "secure data\n"
+
+
+def test_audit_write_uses_private_permissions(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+
+    server._audit_write(_AUDIT_PREVIEW, "applied")
+
+    audit_path = tmp_path / "annotate_audit.jsonl"
+    assert audit_path.exists()
+    # On POSIX, check permissions are 0o600 (owner read/write only)
+    if os.name == "posix":
+        mode = audit_path.stat().st_mode & 0o777
+        assert mode == 0o600
+
+
+def test_audit_write_required_fails_closed(monkeypatch):
+    # required=True must surface a journal failure as an McpError so the caller
+    # can refuse the write; required=False still swallows the same failure.
+    def boom(record):
+        raise OSError("disk full")
+    monkeypatch.setattr(server, "_audit_append", boom)
+    with pytest.raises(McpError):
+        server._audit_write(_AUDIT_PREVIEW, "applied", required=True)
+    server._audit_write(_AUDIT_PREVIEW, "declined")  # best-effort: must not raise
+
+
+def test_audit_log_injection_is_escaped(tmp_path, monkeypatch):
+    # A malicious value with an embedded newline + fake JSON must not forge a
+    # second journal line -- json.dumps escapes it inside one string field.
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    evil = 'x"}\n{"outcome":"applied","new":"FORGED'
+    server._audit_write({**_AUDIT_PREVIEW, "new": evil}, "applied")
+    lines = [line for line in (tmp_path / "annotate_audit.jsonl").read_text().splitlines()
+             if line.strip()]
+    assert len(lines) == 1  # exactly one record, no forged line
+    rec = json.loads(lines[0])
+    assert rec["new"] == evil  # newline preserved verbatim inside the field
+
+
+def test_audit_journal_rotates(tmp_path, monkeypatch):
+    # The journal must not grow without bound: rotation keeps a bounded backup set.
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    monkeypatch.setattr(server, "_AUDIT_MAX_BYTES", 200)
+    for _ in range(20):
+        server._audit_write(_AUDIT_PREVIEW, "applied")
+    path = tmp_path / "annotate_audit.jsonl"
+    assert path.exists()
+    assert (tmp_path / "annotate_audit.jsonl.1").exists()  # a backup was rotated out
+    assert path.stat().st_size < server._AUDIT_MAX_BYTES + 1024  # current stays bounded
+
+
+def test_audit_refuses_symlinked_journal(tmp_path, monkeypatch):
+    # O_NOFOLLOW: a symlinked journal path is refused so an attacker can't
+    # redirect the audit trail to clobber another file.
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    target = tmp_path / "evil_target"
+    target.write_text("")
+    (tmp_path / "annotate_audit.jsonl").symlink_to(target)
+    with pytest.raises(McpError):
+        server._audit_write(_AUDIT_PREVIEW, "applied", required=True)
+    assert target.read_text() == ""  # nothing written through the symlink
+
+
+def test_audit_log_path_uses_config_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_backend", None)
+    monkeypatch.setattr(server, "_server_config",
+                        ServerConfig(allow_write=True, project_dir=tmp_path))
+    assert server._audit_log_path() == Path(tmp_path) / "annotate_audit.jsonl"
+
+
+# --------------------------------------------------------------------------- #
+# Write-volume counter (must be per client session, not process-global)
+# --------------------------------------------------------------------------- #
+
+def test_write_attempts_are_per_session():
+    server._write_attempts_by_session.clear()
+    ctx_a = _FakeCtx(supports=True)
+    ctx_b = _FakeCtx(supports=True)
+    assert server._bump_write_attempts(ctx_a) == 1
+    assert server._bump_write_attempts(ctx_a) == 2
+    assert server._bump_write_attempts(ctx_b) == 1  # B's count is independent of A
+    assert server._bump_write_attempts(ctx_a) == 3
+
+
+def test_write_attempts_global_fallback_without_session():
+    class _NoSession:
+        session = None
+
+    before = server._annotate_attempts
+    assert server._bump_write_attempts(_NoSession()) == before + 1

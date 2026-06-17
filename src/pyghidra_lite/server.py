@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext, suppress
@@ -3745,6 +3746,150 @@ def _apply_prototype(prog, func, signature_text: str) -> None:
         raise ValueError(f"failed to apply prototype: {cmd.getStatusMsg()}")
 
 
+# --- write audit journal + volume warning ------------------------------------
+# MCP elicitation can't stop an auto-approving client from self-confirming, so
+# every write -- and every declined/failed attempt -- is appended to a JSONL
+# journal next to the on-disk projects. Each entry records old -> new, so the
+# journal doubles as an undo log; a flood of entries is the signal that an
+# auto-agent is churning. A per-session counter also nudges via ctx.warning.
+
+_audit_lock = threading.Lock()
+# Write-attempt counters, genuinely per client session: a shared HTTP/SSE server
+# serves many sessions from one process, so a module-global counter would leak
+# one client's volume into another's warnings. Keyed weakly so entries vanish
+# when a session ends; falls back to a global only if no usable session exists.
+_write_attempts_by_session: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_annotate_attempts = 0  # fallback counter (stdio/no-session)
+_ANNOTATE_WARN_EVERY = 25  # nudge every N write attempts in a session
+_AUDIT_MAX_BYTES = 5 * 1024 * 1024  # rotate the journal past this size
+_AUDIT_MAX_BACKUPS = 5  # keep this many rotated journals (bounds disk use)
+_AUDIT_FILENAME = "annotate_audit.jsonl"
+
+
+def _audit_log_path() -> Path:
+    """Location of the append-only annotate audit journal."""
+    try:
+        base = get_backend().project_dir
+    except Exception:
+        base = get_config().project_dir or DEFAULT_PROJECT_DIR
+    return Path(base) / _AUDIT_FILENAME
+
+
+def _rotate_audit_if_needed(path: Path) -> None:
+    """Size-based rotation so the journal can't grow without bound. Best-effort:
+    rotation problems must never block a write. Held under _audit_lock."""
+    try:
+        if not path.exists() or path.stat().st_size < _AUDIT_MAX_BYTES:
+            return
+        # Shift .(N-1) -> .N, ..., .1 -> .2, then current -> .1. The oldest is
+        # dropped, so disk use is bounded at ~(_AUDIT_MAX_BACKUPS + 1) * max size.
+        for i in range(_AUDIT_MAX_BACKUPS - 1, 0, -1):
+            src = path.with_name(f"{path.name}.{i}")
+            if src.exists():
+                os.replace(src, path.with_name(f"{path.name}.{i + 1}"))
+        os.replace(path, path.with_name(f"{path.name}.1"))
+    except OSError as exc:
+        logger.warning("annotate audit log rotation skipped: %s", exc)
+
+
+def _audit_append(record: dict) -> None:
+    """Append one JSON line to the journal, hardened. Raises on any failure so
+    callers can choose to fail closed.
+
+    - O_NOFOLLOW refuses a symlinked journal path (an attacker can't redirect the
+      audit trail to clobber another file).
+    - 0o600 keeps the trail owner-only.
+    - json.dumps escapes control chars, so a malicious old/new/comment value
+      cannot forge extra lines via embedded newlines.
+    """
+    path = _audit_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, separators=(",", ":"), default=str)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):  # POSIX only; harmless to omit on Windows
+        flags |= os.O_NOFOLLOW
+    with _audit_lock:
+        _rotate_audit_if_needed(path)
+        fd = os.open(path, flags, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+
+def _audit_write(preview: dict, outcome: str, detail: str = "", *, required: bool = False) -> None:
+    """Record one annotate outcome in the audit journal.
+
+    With required=True the call fails closed: if the entry can't be durably
+    written, an McpError is raised so the caller can refuse the write rather than
+    apply an unrecorded change. With required=False (declined/compensating notes,
+    where nothing irreversible happened) failures are swallowed and only logged.
+    """
+    from datetime import UTC, datetime
+
+    record = {
+        "ts": datetime.now(UTC).isoformat(),
+        "binary": preview.get("binary"),
+        "unit_id": preview.get("unit_id"),
+        "analysis_id": preview.get("analysis_id"),
+        "action": preview.get("action"),
+        "target": preview.get("target"),
+        "addr": preview.get("target_addr"),
+        "old": preview.get("old"),
+        "new": preview.get("new"),
+        "outcome": outcome,
+    }
+    if detail:
+        record["detail"] = _sanitize_error_text(detail)
+    try:
+        _audit_append(record)
+        logger.info("annotate %s: %s %r -> %r on %s",
+                    outcome, record["action"], record["old"], record["new"], record["binary"])
+    except Exception as exc:
+        logger.warning("annotate audit log write failed: %s", exc)
+        if required:
+            raise McpError(ErrorData(
+                code=INTERNAL_ERROR,
+                message=(
+                    "Write aborted: the change could not be recorded in the audit journal, "
+                    "and this server records every write before applying it. Ensure the "
+                    "project directory is writable and the journal is not a symlink "
+                    f"({_AUDIT_FILENAME})."
+                ),
+            )) from exc
+
+
+def _bump_write_attempts(ctx: Context) -> int:
+    """Increment and return this session's write-attempt count.
+
+    Per-session via a weak-keyed map on ctx.session; if no session is usable as
+    a weak key, fall back to a process-global counter so the nudge still fires.
+    """
+    global _annotate_attempts
+    session = getattr(ctx, "session", None)
+    if session is not None:
+        try:
+            n = _write_attempts_by_session.get(session, 0) + 1
+            _write_attempts_by_session[session] = n
+            return n
+        except TypeError:
+            pass  # session not weak-referenceable/hashable -> global fallback
+    _annotate_attempts += 1
+    return _annotate_attempts
+
+
+async def _note_write_volume(ctx: Context, binary: str) -> None:
+    """Increment the session write-attempt counter; nudge on threshold crossings."""
+    n = _bump_write_attempts(ctx)
+    if n % _ANNOTATE_WARN_EVERY == 0:
+        with suppress(Exception):
+            # Only the journal's filename is sent to the client -- the full path
+            # is server-side detail (logged locally), not for remote disclosure.
+            await ctx.warning(
+                f"annotate has been called {n} times this session (latest target on "
+                f"{binary}). All writes are recorded in the audit journal "
+                f"({_AUDIT_FILENAME})."
+            )
+
+
 @mcp.tool(annotations=_write_annotation("Annotate Binary"))
 async def annotate(
     binary: NonEmptyStr,
@@ -3766,6 +3911,11 @@ async def annotate(
         yes/no from you (the human) showing the exact old -> new before it
         commits. If your client can't show that prompt, the call returns a
         preview with applied=false and writes nothing (fail closed).
+      - Every write is recorded in an audit journal next to the projects
+        *before* it is applied (fail closed: if the change can't be journaled,
+        it isn't committed), and declined/failed attempts are logged too. Each
+        entry records old -> new, so changes stay accountable and reversible
+        even under an auto-approving client.
 
     The action parameter selects what to write:
 
@@ -3830,6 +3980,8 @@ async def annotate(
                 old = str(func.getSignature())
         return {
             "binary": handle.name,
+            "unit_id": getattr(handle, "unit_id", None),
+            "analysis_id": getattr(handle, "analysis_id", None),
             "target": target,
             "target_addr": str(func.getEntryPoint()),
             "action": action,
@@ -3839,8 +3991,13 @@ async def annotate(
 
     preview = await _with_handle_async("annotate", binary, _preview_op)
 
+    # Count the attempt and nudge if write volume is high this session. Elicitation
+    # can't stop an auto-approving client, so a flood of writes should be loud.
+    await _note_write_volume(ctx, binary)
+
     # 4) Human-in-the-loop confirmation. Fail closed on decline/cancel/unsupported.
     if not await _confirm_or_refuse(ctx, _annotate_summary(action, preview, new_value)):
+        _audit_write(preview, "declined")
         return {
             **preview,
             "applied": False,
@@ -3881,7 +4038,16 @@ async def annotate(
             "applied": True,
         }
 
-    return await _with_handle_async("annotate", binary, _commit_op)
+    # Fail-closed audit: durably record the intended write BEFORE committing, so a
+    # committed change can never go unrecorded. If the journal can't be written
+    # this raises and nothing is committed; a rare commit failure afterwards gets
+    # a best-effort compensating "failed" note.
+    _audit_write(preview, "applied", required=True)
+    try:
+        return await _with_handle_async("annotate", binary, _commit_op)
+    except Exception as exc:
+        _audit_write(preview, "failed", detail=str(exc))
+        raise
 
 
 # =============================================================================
@@ -4302,8 +4468,6 @@ def serve_cmd(
         min_loaded=min_loaded,
         allow_write=allow_write,
     )
-    if allow_write:
-        logger.info("Write tools enabled (annotate); each change requires user confirmation.")
     is_loopback = _is_loopback_host(host)
     if is_shared and not is_loopback:
         if not restrict_paths:
@@ -4333,6 +4497,12 @@ def serve_cmd(
     _check_prerequisites(ghidra_dir)
     with _backend_lock:
         _backend = _init_backend(eager_load=eager_load)
+
+    if allow_write:
+        logger.info(
+            "Write tools enabled (annotate); each change requires user confirmation. "
+            "Audit journal: %s", _audit_log_path(),
+        )
 
     # Detect capabilities for all pre-loaded binaries
     for prog_name in _backend.list_programs():
