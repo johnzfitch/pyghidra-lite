@@ -225,22 +225,30 @@ def test_sanitize_redacts_relative_project_dir(
     assert "<project-dir>" in out
 
 
-def test_locked_tools_holds_backend_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_locked_tools must hold _backend_lock while the JVM work runs."""
+def test_locked_tools_serializes_same_handle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_locked_tools holds the per-handle lock while the JVM work runs, so
+    concurrent ops on the SAME binary serialize. (Different binaries get distinct
+    locks and run concurrently -- asserted at the end.)"""
     import threading
 
     monkeypatch.setattr(server, "_tools_for", lambda h: "TOOLS")
     captured: dict = {}
 
+    class _Handle:  # writable __dict__ so it gets a real per-handle lock
+        pass
+
+    handle = _Handle()
+    hlock = server._handle_lock(handle)
+
     def work(tools):
         captured["tools"] = tools
-        # A different thread must NOT be able to grab the lock while we hold it.
+        # Another thread must NOT be able to grab THIS handle's lock while held.
         result: dict = {}
 
         def other():
-            result["got"] = server._backend_lock.acquire(blocking=False)
+            result["got"] = hlock.acquire(blocking=False)
             if result["got"]:
-                server._backend_lock.release()
+                hlock.release()
 
         t = threading.Thread(target=other)
         t.start()
@@ -248,10 +256,12 @@ def test_locked_tools_holds_backend_lock(monkeypatch: pytest.MonkeyPatch) -> Non
         captured["other_got_lock"] = result["got"]
         return "RESULT"
 
-    out = server._locked_tools(object(), work)
+    out = server._locked_tools(handle, work)
     assert out == "RESULT"
     assert captured["tools"] == "TOOLS"
     assert captured["other_got_lock"] is False
+    # A different handle is locked independently -> cross-binary concurrency.
+    assert server._handle_lock(_Handle()) is not hlock
 
 
 def test_assert_within_restrict_roots_rejects_escape(

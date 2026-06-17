@@ -32,6 +32,8 @@ _GHIDRA_SEARCH_PATHS = [
     "/opt/ghidra",
     "/usr/share/ghidra",
     "/usr/local/share/ghidra",
+    "/opt/homebrew/opt/ghidra/libexec",
+    "/usr/local/opt/ghidra/libexec",
     Path.home() / "ghidra",
 ]
 

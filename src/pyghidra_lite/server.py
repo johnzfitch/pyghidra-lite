@@ -14,7 +14,7 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, nullcontext, suppress
+from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Annotated, Literal
@@ -121,6 +121,76 @@ _capabilities: dict[str, BinaryCapabilities] = {}
 _backend_lock = threading.RLock()
 _last_access: dict[str, float] = {}  # analysis_id -> time.monotonic()
 _evicted_ids: set[str] = set()  # analysis_ids evicted from memory (still on disk)
+
+# Lock taxonomy (read this before touching the locking):
+#
+#   _backend_lock  - coarse mutex protecting backend STRUCTURE: the
+#                    backend.programs / _projects tables, project open/close
+#                    (openProject), and every backend mutation (load/evict/
+#                    delete/bootstrap). Held briefly for table reads, longer for
+#                    the one-time hot-load of a project from disk.
+#
+#   per-handle lock - serializes JVM WORK on a single program (decompile, xref
+#                    walk, section iteration, capability detection). Stored on
+#                    each handle via _handle_lock(). Ops on DIFFERENT binaries
+#                    run concurrently; ops on the SAME binary serialize.
+#
+# Why per-handle: Ghidra programs are independent DomainObjects and each handle
+# owns its own DecompInterface, so concurrent work on distinct programs is the
+# model Ghidra itself uses for parallel decompilation. Previously every read
+# held the single _backend_lock for its whole duration, so a slow/30s decompile
+# (or a one-time project open) on binary A froze trivial reads on binary B and
+# wedged every other agent behind the global lock -- the reported hang.
+#
+# LOCK ORDERING (never violate): _backend_lock -> per-handle lock. Acquire the
+# backend lock first if both are needed; never take the backend lock while
+# holding a per-handle lock. Read ops resolve the handle under _backend_lock,
+# RELEASE it, then take the per-handle lock for the JVM op -- so the two never
+# nest on the hot read path. Capability detection uses only the per-handle lock.
+#
+# Set to False to fall back to single-lock serialization (every JVM call under
+# _backend_lock) if concurrent multi-program access is ever found unstable.
+_PER_HANDLE_JVM_LOCKING = True
+
+
+def _handle_lock(handle) -> "threading.RLock":
+    """Return the per-handle JVM lock, creating it on first use.
+
+    The lock lives on the handle's __dict__ (like the _tools_cache in
+    _tools_for), so it travels with the handle's lifetime and is discarded for
+    free when the handle is evicted/reloaded as a new object. Handles without a
+    writable __dict__ (e.g. MagicMock test doubles) fall back to the global lock.
+    Creation is done under _backend_lock so two threads racing to first-touch the
+    same handle agree on one lock object.
+    """
+    if not _PER_HANDLE_JVM_LOCKING:
+        return _backend_lock
+    d = getattr(handle, "__dict__", None)
+    if d is None:
+        return _backend_lock
+    lock = d.get("_jvm_lock")
+    if lock is None:
+        with _backend_lock:
+            lock = d.get("_jvm_lock")
+            if lock is None:
+                lock = threading.RLock()
+                d["_jvm_lock"] = lock
+    return lock
+
+
+@contextmanager
+def _handle_locks(*handles):
+    """Acquire several per-handle locks at once in a stable global order.
+
+    Sorting by id() gives every caller the same acquisition order, so two
+    operations touching the same pair of binaries (e.g. a symbol diff) can never
+    deadlock by grabbing the locks in opposite orders.
+    """
+    locks = sorted({id(h): _handle_lock(h) for h in handles}.values(), key=id)
+    with ExitStack() as stack:
+        for lk in locks:
+            stack.enter_context(lk)
+        yield
 
 # Cache of computed unit_ids keyed by (resolved path, mtime_ns, size) so that
 # re-loading an already-analyzed binary doesn't re-stream the whole file just
@@ -790,6 +860,20 @@ def _touch_access(handle) -> None:
 
 
 def _get_handle(binary: str, profile: str | None = None):
+    """Resolve a name/unit_id/analysis_id to a loaded handle.
+
+    Holds _backend_lock for the whole resolution -- including the one-time
+    hot-load it may trigger -- so callers MUST NOT wrap this in _backend_lock and
+    MUST NOT already hold a per-handle lock (ordering is _backend_lock -> handle
+    lock). _backend_lock is reentrant, so the hot-load path re-acquires it
+    safely. The returned handle is then used by the caller under its per-handle
+    lock, by which point _backend_lock has been released.
+    """
+    with _backend_lock:
+        return _resolve_handle_locked(binary, profile)
+
+
+def _resolve_handle_locked(binary: str, profile: str | None = None):
     backend = get_backend()
     handle = _handle_by_analysis_id(backend, binary)
     if handle is not None:
@@ -844,6 +928,25 @@ def _handle_by_unit_id(backend: GhidraBackend, unit_id: str):
     return None
 
 
+def _sweep_project_locks(project_dir: Path) -> None:
+    """Remove leftover Ghidra lock files from a single project directory.
+
+    When a process that held a Ghidra project dies (crash, SIGKILL, OOM) it
+    leaves a `.lock`/`.lock~` behind, and GhidraProject.openProject() then blocks
+    indefinitely waiting on it -- the failure mode that hung a trivial read for
+    45 minutes. The startup sweep only catches locks from *previous* server runs;
+    a worker killed mid-session leaves one the long-lived backend never clears.
+    We only ever hot-load COMPLETED analyses (no live worker owns the project at
+    that point), so clearing a stale lock right before opening is safe and bounds
+    openProject. Hot-load is serialized under _backend_lock, so no other thread
+    in this process is opening the same project concurrently.
+    """
+    for pattern in ("*.lock", "*.lock~"):
+        for lock in project_dir.glob(pattern):
+            with suppress(OSError):
+                lock.unlink()
+
+
 def _load_project_into_backend(
     backend: GhidraBackend,
     analysis_id: str,
@@ -876,6 +979,9 @@ def _load_project_into_backend(
             logger.warning("Ghidra project missing for analysis_id=%s at %s", analysis_id, project_dir)
             return None
 
+        # Clear any stale lock left by a crashed worker before opening, so
+        # openProject() can't block forever waiting on a dead process's lock.
+        _sweep_project_locks(project_dir)
         project = GhidraProject.openProject(project_str, project_id, True)
         backend._projects[analysis_id] = project
 
@@ -963,12 +1069,17 @@ def _apply_bootstrap_transfer(
         raise ValueError(f"Bootstrap source {source_binary!r} is not analyzed yet")
     if not dest_handle.analyzed:
         raise ValueError("Destination binary must be analyzed before bootstrap can run")
-    stats = backend.transfer_analysis(
-        source_handle.name,
-        dest_handle.name,
-        label_fun_star=(mode == "all"),
-        fun_star_prefix=_BOOTSTRAP_AUTO_PREFIX,
-    )
+    # transfer_analysis WRITES to the destination program (and reads the source).
+    # Reads no longer hold _backend_lock, so take both per-handle locks to keep
+    # this write serialized against concurrent reads/writes of either program.
+    # Callers already hold _backend_lock, so ordering stays _backend_lock -> handle.
+    with _handle_locks(source_handle, dest_handle):
+        stats = backend.transfer_analysis(
+            source_handle.name,
+            dest_handle.name,
+            label_fun_star=(mode == "all"),
+            fun_star_prefix=_BOOTSTRAP_AUTO_PREFIX,
+        )
     stats["mode"] = mode
     if mode == "all":
         stats["synthetic_prefix"] = _BOOTSTRAP_AUTO_PREFIX
@@ -976,7 +1087,12 @@ def _apply_bootstrap_transfer(
 
 
 def _ensure_capabilities(handle) -> BinaryCapabilities:
-    with _backend_lock:
+    # Detection reads section/block names from this one program (JVM work), so it
+    # belongs under the per-handle lock, not the global lock -- otherwise it would
+    # take _backend_lock while a read op already holds the handle lock, inverting
+    # the lock order. _capabilities is keyed by unit_id; dict writes for distinct
+    # keys are GIL-atomic and same-key writes are serialized by the handle lock.
+    with _handle_lock(handle):
         caps = _capabilities.get(handle.unit_id)
         if not caps:
             caps = detect_capabilities(handle)
@@ -1041,8 +1157,15 @@ def _guarded_tool_call(action: str, op):
 
 
 def _with_handle(action: str, binary: str, op):
-    with _backend_lock:
-        return _guarded_tool_call(action, lambda: op(_get_handle(binary)))
+    def run():
+        # Resolve under _backend_lock (released by _get_handle on return), then
+        # run the JVM op under the per-handle lock so a slow op on one binary
+        # never blocks reads of another. Same-binary ops still serialize.
+        handle = _get_handle(binary)
+        with _handle_lock(handle):
+            return op(handle)
+
+    return _guarded_tool_call(action, run)
 
 
 async def _with_handle_async(action: str, binary: str, op):
@@ -1053,9 +1176,26 @@ async def _with_handle_async(action: str, binary: str, op):
     body would block the whole server -- under the shared HTTP transport a
     single decompile would freeze progress notifications and every other
     client's request. Offloading to a worker thread keeps the loop responsive;
-    `_backend_lock` still serializes JVM access across threads.
+    the per-handle lock taken inside _with_handle serializes JVM access to the
+    SAME program across threads while letting different programs run concurrently.
     """
     return await asyncio.to_thread(_with_handle, action, binary, op)
+
+
+def _run_locked(fn):
+    """Run fn() while holding _backend_lock; meant to be dispatched via
+    asyncio.to_thread from async code.
+
+    _backend_lock can be held by a worker thread for the full duration of a JVM
+    op (an entire decompile/analysis runs under it). Acquiring it directly on the
+    event-loop thread therefore freezes the whole HTTP transport until that op
+    returns -- the failure mode that wedged the server. Async callers must take
+    the lock only inside a worker thread, which is what this wrapper provides.
+    _backend_lock is reentrant (RLock), so fn may itself call lock-taking helpers
+    (e.g. _ensure_capabilities) without deadlocking.
+    """
+    with _backend_lock:
+        return fn()
 
 
 def _tools_for(handle) -> GhidraTools:
@@ -1081,14 +1221,14 @@ def _tools_for(handle) -> GhidraTools:
 
 
 def _locked_tools(handle, work):
-    """Run a blocking GhidraTools operation under _backend_lock.
+    """Run a blocking GhidraTools operation under the handle's per-handle lock.
 
-    The other read tools hold _backend_lock for their whole op (via
-    _with_handle), so JVM access is serialized across worker threads. search
-    resolves its handle off-lock for metadata, but its actual Ghidra calls must
-    take the same lock so concurrent worker threads never touch the JVM at once.
+    Mirrors _with_handle: the JVM calls for one program are serialized against
+    other ops on that same program, but ops on different programs run
+    concurrently. The handle is resolved off-lock by the caller (search resolves
+    via _get_handle), and the JVM work happens here under the per-handle lock.
     """
-    with _backend_lock:
+    with _handle_lock(handle):
         return work(_tools_for(handle))
 
 
@@ -1100,7 +1240,10 @@ def _rank_sources_blocking(exclude_name: str | None = None) -> list[dict]:
     reflects how useful a source binary is for future bootstrap runs.
     Results are sorted descending -- index 0 is the richest source.
 
-    Lock is held only to snapshot the handles list; JVM enumeration runs unlocked.
+    _backend_lock is held only to snapshot the handles list; each handle's JVM
+    enumeration then runs under that handle's own lock (so a concurrent read of a
+    different binary is unaffected, but we never enumerate a program a writer is
+    mutating).
     """
     with _backend_lock:
         backend = get_backend()
@@ -1110,18 +1253,19 @@ def _rank_sources_blocking(exclude_name: str | None = None) -> list[dict]:
     for handle in handles:
         if exclude_name and handle.name == exclude_name:
             continue
-        fm = handle.program.getFunctionManager()
-        total = fm.getFunctionCount()
-        meaningful_named = 0
-        synthetic_named = 0
-        for func in fm.getFunctions(True):
-            name = func.getName()
-            if name.startswith(("FUN_", "thunk_FUN_")):
-                continue
-            if _is_bootstrap_auto_name(name):
-                synthetic_named += 1
-            else:
-                meaningful_named += 1
+        with _handle_lock(handle):
+            fm = handle.program.getFunctionManager()
+            total = fm.getFunctionCount()
+            meaningful_named = 0
+            synthetic_named = 0
+            for func in fm.getFunctions(True):
+                name = func.getName()
+                if name.startswith(("FUN_", "thunk_FUN_")):
+                    continue
+                if _is_bootstrap_auto_name(name):
+                    synthetic_named += 1
+                else:
+                    meaningful_named += 1
         transferable = meaningful_named + synthetic_named
         results.append({
             "name": handle.name,
@@ -1268,6 +1412,10 @@ def detect_container_type(path: Path) -> str | None:
 @asynccontextmanager
 async def server_lifespan(server: Server) -> AsyncIterator[None]:
     global _backend
+    # JVM init (pyghidra.start -> jpype.startJVM) MUST run on the main thread:
+    # JVM startup installs signal handlers, and Python rejects signal.signal()
+    # off the main thread. Startup is single-threaded anyway, so there is nothing
+    # to offload here -- holding the lock briefly on the loop is fine pre-serving.
     with _backend_lock:
         _init_backend()
 
@@ -2000,46 +2148,76 @@ async def _eviction_monitor(interval: int = 60):
 
     while True:
         await asyncio.sleep(interval)
+        # Run the lock-protected pass in a worker thread. _backend_lock can be
+        # held for a long time by an in-flight JVM/Ghidra call; acquiring it
+        # directly on the event-loop thread would freeze the whole HTTP
+        # transport (no health checks, no new-session initialize) until that
+        # call returns -- i.e. a single slow/hung decompile takes the server
+        # offline. Offloading keeps the loop responsive, mirroring every tool
+        # path (see _with_handle_async).
+        evicted = await asyncio.to_thread(_evict_idle_tick, min_loaded, evict_seconds)
+        if evicted:
+            logger.info("Evicted %d idle binary(ies): %s", len(evicted), ", ".join(evicted))
+
+
+def _evict_idle_tick(min_loaded: int, evict_seconds: float) -> list[str]:
+    """One eviction pass; returns the names evicted. Runs in a worker thread.
+
+    Holds _backend_lock only here (off the event loop) so a long-running JVM
+    call that has the lock can never block the asyncio loop.
+    """
+    with _backend_lock:
+        if _backend is None:
+            return []
+        loaded_ids = [
+            h.analysis_id
+            for h in _backend.programs.values()
+            if h.analysis_id
+        ]
+    if len(loaded_ids) <= min_loaded:
+        return []
+
+    now = time.monotonic()
+    # Build (analysis_id, last_access) pairs; untracked binaries use load time 0
+    # so they're evicted first
+    scored = [(aid, _last_access.get(aid, 0.0)) for aid in loaded_ids]
+    # Sort by most recent access (keep the freshest)
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # Evict idle binaries beyond min_loaded
+    candidates = scored[min_loaded:]  # protect the N most recent
+    evicted = []
+    for aid, last_ts in candidates:
+        idle_sec = now - last_ts
+        if idle_sec < evict_seconds:
+            continue
+        # Don't evict binaries with active analysis jobs
+        with _jobs_mutex:
+            if aid in _active_jobs and _active_jobs[aid].get("status") in ("queued", "analyzing", "running"):
+                continue
         with _backend_lock:
             if _backend is None:
+                break
+            handle = _handle_by_analysis_id(_backend, aid)
+            if handle is None:
                 continue
-            loaded_ids = [
-                h.analysis_id
-                for h in _backend.programs.values()
-                if h.analysis_id
-            ]
-        if len(loaded_ids) <= min_loaded:
-            continue
-
-        now = time.monotonic()
-        # Build (analysis_id, last_access) pairs; untracked binaries use load time 0
-        # so they're evicted first
-        scored = [(aid, _last_access.get(aid, 0.0)) for aid in loaded_ids]
-        # Sort by most recent access (keep the freshest)
-        scored.sort(key=lambda x: x[1], reverse=True)
-
-        # Evict idle binaries beyond min_loaded
-        candidates = scored[min_loaded:]  # protect the N most recent
-        evicted = []
-        for aid, last_ts in candidates:
-            idle_sec = now - last_ts
-            if idle_sec < evict_seconds:
+            # evict() closes the program; don't pull it out from under an
+            # in-flight read. Take the per-handle lock non-blocking: if a read op
+            # holds it, skip this binary and retry next tick rather than stalling
+            # the eviction pass (and _backend_lock with it) on a slow decompile.
+            # Ordering stays _backend_lock -> handle lock.
+            hlock = _handle_lock(handle)
+            if not hlock.acquire(blocking=False):
                 continue
-            # Don't evict binaries with active analysis jobs
-            with _jobs_mutex:
-                if aid in _active_jobs and _active_jobs[aid].get("status") in ("queued", "analyzing", "running"):
-                    continue
-            with _backend_lock:
-                if _backend is None:
-                    break
+            try:
                 name = _backend.evict(aid)
                 if name:
                     _last_access.pop(aid, None)
                     _evicted_ids.add(aid)
                     evicted.append(name)
-
-        if evicted:
-            logger.info("Evicted %d idle binary(ies): %s", len(evicted), ", ".join(evicted))
+            finally:
+                hlock.release()
+    return evicted
 
 
 async def _stale_job_monitor(interval: int = 30):
@@ -2208,8 +2386,9 @@ async def load(
 
     if bootstrap:
         _require_backend()
-        with _backend_lock:
-            bootstrap_source = _normalize_bootstrap_source(bootstrap, analysis_id)
+        bootstrap_source = await asyncio.to_thread(
+            _run_locked, lambda: _normalize_bootstrap_source(bootstrap, analysis_id)
+        )
 
     # Auto-delegate large binaries to async analysis to avoid MCP timeouts.
     if analyze and file_size_mb >= _LARGE_BINARY_MB:
@@ -2218,9 +2397,10 @@ async def load(
         # fresh=True: purge everything before any caching checks so the
         # subsequent import and worker spawn always start from a clean slate.
         if fresh:
-            with _backend_lock:
-                if _backend:
-                    _backend._purge_analysis(analysis_id)
+            await asyncio.to_thread(
+                _run_locked,
+                lambda: _backend._purge_analysis(analysis_id) if _backend else None,
+            )
             disk_match = _find_on_disk(unit_id, profile=profile)
             if disk_match:
                 proj_path = _safe_project_path(
@@ -2235,11 +2415,13 @@ async def load(
 
         # Already loaded in memory?
         if not fresh:
-            with _backend_lock:
-                loaded_handles = list(_backend.programs.values()) if _backend else []
+            loaded_handles = await asyncio.to_thread(
+                _run_locked,
+                lambda: list(_backend.programs.values()) if _backend else [],
+            )
             for h in loaded_handles:
                 if h.analysis_id == analysis_id and h.analyzed:
-                    caps = _ensure_capabilities(h)
+                    caps = await asyncio.to_thread(_ensure_capabilities, h)
                     result = {
                         "unit_id": unit_id,
                         "analysis_id": analysis_id,
@@ -2251,10 +2433,12 @@ async def load(
                         "capabilities": _format_capabilities(caps),
                     }
                     if bootstrap_source:
-                        with _backend_lock:
-                            stats = _apply_bootstrap_transfer(
+                        stats = await asyncio.to_thread(
+                            _run_locked,
+                            lambda: _apply_bootstrap_transfer(
                                 get_backend(), bootstrap_source, h, mode=bootstrap_mode
-                            )
+                            ),
+                        )
                         result["bootstrap"] = _bootstrap_meta(bootstrap_source, stats)
                     return result
 
@@ -2271,12 +2455,13 @@ async def load(
                     except Exception as e:
                         hot_load_error = str(e)
                     # Verify program actually loaded (hot-load can silently fail)
-                    hot_loaded = False
-                    with _backend_lock:
-                        if _backend:
-                            hot_loaded = any(
-                                h.analysis_id == disk_match["analysis_id"] for h in _backend.programs.values()
-                            )
+                    hot_loaded = await asyncio.to_thread(
+                        _run_locked,
+                        lambda: bool(_backend) and any(
+                            h.analysis_id == disk_match["analysis_id"]
+                            for h in _backend.programs.values()
+                        ),
+                    )
                     result = {
                         "unit_id": unit_id,
                         "analysis_id": disk_match["analysis_id"],
@@ -2294,16 +2479,23 @@ async def load(
                     elif not hot_loaded:
                         result["hot_load_error"] = "Program not found in backend after load"
                     if hot_loaded and bootstrap_source:
-                        with _backend_lock:
-                            dest_handle = _handle_by_analysis_id(get_backend(), disk_match["analysis_id"])
-                            if dest_handle is not None:
+                        def _bootstrap_disk_locked():
+                            with _backend_lock:
+                                dest_handle = _handle_by_analysis_id(
+                                    get_backend(), disk_match["analysis_id"]
+                                )
+                                if dest_handle is None:
+                                    return False, None
                                 stats = _apply_bootstrap_transfer(
                                     get_backend(),
                                     bootstrap_source,
                                     dest_handle,
                                     mode=bootstrap_mode,
                                 )
-                                result["bootstrap"] = _bootstrap_meta(bootstrap_source, stats)
+                                return True, _bootstrap_meta(bootstrap_source, stats)
+                        found, meta = await asyncio.to_thread(_bootstrap_disk_locked)
+                        if found:
+                            result["bootstrap"] = meta
                     return result
             except (json.JSONDecodeError, OSError):
                 pass
@@ -2486,10 +2678,20 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
         if handle is not None:
             unit_id = handle.unit_id
             analysis_id = handle.analysis_id
-            _capabilities.pop(unit_id, None)
-            deleted = backend.delete_program(handle.name)
-            if not deleted:
-                raise RuntimeError(f"Failed to delete {handle.name!r} from Ghidra project")
+            # delete_program closes the program; don't yank it out from under an
+            # in-flight read. Non-blocking acquire so we never stall _backend_lock
+            # on a slow decompile -- fail clean and let the caller retry. Ordering
+            # stays _backend_lock (held via _run_locked) -> per-handle lock.
+            hlock = _handle_lock(handle)
+            if not hlock.acquire(blocking=False):
+                raise ValueError(f"{name!r} is busy with another operation; retry in a moment.")
+            try:
+                _capabilities.pop(unit_id, None)
+                deleted = backend.delete_program(handle.name)
+                if not deleted:
+                    raise RuntimeError(f"Failed to delete {handle.name!r} from Ghidra project")
+            finally:
+                hlock.release()
             _kill_job(analysis_id)
             project_id = analysis_id if (project_base / analysis_id).exists() else unit_id
             shutil.rmtree(_safe_project_path(project_base, project_id), onerror=_rmtree_warn)
@@ -2513,8 +2715,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
             "analysis_id": disk_match["analysis_id"],
         }
 
-    with _backend_lock:
-        return _guarded_tool_call("delete", op)
+    return await asyncio.to_thread(_run_locked, lambda: _guarded_tool_call("delete", op))
 
 
 @mcp.tool(annotations=_read_only("List Binaries"))
@@ -2636,8 +2837,7 @@ async def binaries(
 
         return results
 
-    with _backend_lock:
-        return _guarded_tool_call("binaries", op)
+    return await asyncio.to_thread(_run_locked, lambda: _guarded_tool_call("binaries", op))
 
 
 @mcp.tool(annotations=_read_only("Binary Info"))
@@ -3198,14 +3398,17 @@ async def xrefs(
     direction = _validate_choice("direction", direction, _XREF_DIRECTIONS)
     depth = _validate_minimum("depth", depth, 1)
 
-    def op():
+    def op(handle, handle_b=None):
+        # Handles are pre-resolved by work() (which holds _backend_lock only for
+        # resolution) and the JVM work below runs under their per-handle lock(s).
+        # op() must NOT call _get_handle here -- that would take _backend_lock
+        # while holding a per-handle lock, inverting the lock order.
         # Symbol diff mode
         if diff:
             import heapq
             if not isinstance(target, str):
                 raise ValueError("diff=True requires target to be a single binary name or unit_id")
-            handle_a = _get_handle(binary)
-            handle_b = _get_handle(target)
+            handle_a = handle
 
             def _get_symbols(handle) -> set[str]:
                 st = handle.program.getSymbolTable()
@@ -3224,7 +3427,6 @@ async def xrefs(
                 "num_common": len(syms_a & syms_b),
             }
 
-        handle = _get_handle(binary)
         tools = _tools_for(handle)
 
         # Batch xrefs
@@ -3269,8 +3471,18 @@ async def xrefs(
         }
 
     def _run():
-        with _backend_lock:
-            return _guarded_tool_call("xrefs", op)
+        def work():
+            # Resolve the binaries op() will touch (diff compares two) under
+            # _backend_lock, then run the JVM work under their per-handle lock(s).
+            # Resolving here -- not inside op() -- keeps the lock order
+            # _backend_lock -> handle lock (op() never re-acquires _backend_lock).
+            handle = _get_handle(binary)
+            handle_b = _get_handle(target) if (diff and isinstance(target, str)) else None
+            lock_handles = [handle] + ([handle_b] if handle_b is not None else [])
+            with _handle_locks(*lock_handles):
+                return op(handle, handle_b)
+
+        return _guarded_tool_call("xrefs", work)
 
     return await asyncio.to_thread(_run)
 
@@ -3721,8 +3933,9 @@ def _kill_job(analysis_id: str) -> None:
 # Keep _extract_bunfs_blocking for search(type="extract")
 def _extract_bunfs_blocking(handle, out: Path) -> dict:
     """Extract the bunfs filesystem from a Bun binary into readable JS files."""
-    # Only the runtime detection touches the JVM -- serialize that under the
-    # backend lock; the bun subprocess below runs unlocked (it can take minutes).
+    # Only the runtime detection touches the JVM -- serialize that under this
+    # binary's per-handle lock; the bun subprocess below runs unlocked (it can
+    # take minutes) and so never blocks reads of this or any other binary.
     rt_info = _locked_tools(handle, lambda t: t.detect_embedded_runtime(compact=False))
     bun_rt = next((r for r in rt_info.get("runtimes", []) if r["type"] == "bunfs"), None)
     if not bun_rt:
