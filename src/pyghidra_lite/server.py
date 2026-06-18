@@ -762,12 +762,14 @@ def _find_on_disk(binary: str, profile: str | None = None) -> dict | None:
             status = data.get("status")
             if status == "complete":
                 return data
-            msg = f"Analysis {binary!r} found but status={status!r}"
             if status in ("analyzing", "queued"):
-                msg += ". Poll binaries(jobs=True) and match analysis_id for progress."
-            elif status == "error":
-                msg += f": {data.get('error', 'unknown error')}"
-            raise ValueError(msg)
+                raise ValueError(
+                    f"Analysis {binary!r} found but status={status!r}. "
+                    "Poll binaries(jobs=True) and match analysis_id for progress."
+                )
+            # A prior attempt errored: don't treat it as a permanent tombstone --
+            # return no match so the caller re-imports. Still visible via binaries().
+            return None
 
     # Fast path: exact unit_id match
     if _UNIT_ID_RE.match(binary):
@@ -781,12 +783,14 @@ def _find_on_disk(binary: str, profile: str | None = None) -> dict | None:
             if status == "complete":
                 matches.append(data)
                 continue
-            msg = f"Unit {binary!r} found but status={status!r}"
             if status in ("analyzing", "queued"):
-                msg += ". Poll binaries(jobs=True) and match unit_id for progress."
-            elif status == "error":
-                msg += f": {data.get('error', 'unknown error')}"
-            raise ValueError(msg)
+                raise ValueError(
+                    f"Unit {binary!r} found but status={status!r}. "
+                    "Poll binaries(jobs=True) and match unit_id for progress."
+                )
+            # A prior attempt errored: skip it rather than raising forever; the caller
+            # re-imports and binaries() still surfaces the failure.
+            continue
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
