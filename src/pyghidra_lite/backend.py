@@ -28,6 +28,27 @@ logger = logging.getLogger(__name__)
 # Standard project location
 DEFAULT_PROJECT_DIR = Path.home() / ".local" / "share" / "pyghidra-lite" / "projects"
 
+
+def _assert_ghidra_safe_project_dir(project_dir: Path) -> None:
+    """Fail fast if the project dir has a dot-leading path component.
+
+    Ghidra 12's ProjectLocator validates the whole absolute project path via
+    GhidraURL.checkValidProjectPath -> NamingUtilities.checkName, which rejects any
+    element starting with '.' ("Path element starting with '.' is not permitted").
+    DEFAULT_PROJECT_DIR lives under ~/.local/..., so on Ghidra 12 every import there
+    dies with that cryptic Java error deep inside an async worker (phase=import).
+    Surface it here, at startup, with actionable guidance instead.
+    """
+    abs_dir = Path(project_dir).expanduser().absolute()
+    dotted = [p for p in abs_dir.parts if p not in ("/", "") and p.startswith(".")]
+    if dotted:
+        raise ValueError(
+            "Project directory has path component(s) starting with '.': "
+            f"{', '.join(dotted)} (in {abs_dir}). Ghidra rejects these, so analysis "
+            "would fail at import. Set PYGHIDRA_LITE_PROJECT_DIR (or --project-dir) to "
+            "a path with no dot-leading components, e.g. ~/pyghidra-lite/projects."
+        )
+
 # Common Ghidra install locations to search (in priority order)
 _GHIDRA_SEARCH_PATHS = [
     "/opt/ghidra",
@@ -243,6 +264,8 @@ class GhidraBackend:
         """
         if self._started:
             return
+
+        _assert_ghidra_safe_project_dir(self.project_dir)
 
         install_dir = find_ghidra_install(self.ghidra_dir)
         if install_dir is None:
