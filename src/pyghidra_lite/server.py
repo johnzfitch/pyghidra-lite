@@ -744,7 +744,10 @@ def _find_on_disk(binary: str, profile: str | None = None) -> dict | None:
 
     Accepts exact analysis_id, unit_id, or binary filename.
     When profile is provided, it is used to disambiguate multiple analyses of the same binary.
-    Raises ValueError for in-progress/errored unit_ids.
+    Raises ValueError for in-progress matches (status analyzing/queued) so the caller can
+    poll for progress, and for genuinely unexpected/corrupt status values. A status of
+    'error' is treated as "no usable cache" (returns None / is skipped) so the caller can
+    re-import; the failure stays visible via binaries().
     For ambiguous filename matches, logs a warning and selects never-opened first,
     then most-recently-opened.
     Used by _get_handle to auto-lazy-load programs that exist on disk but aren't loaded.
@@ -762,12 +765,21 @@ def _find_on_disk(binary: str, profile: str | None = None) -> dict | None:
             status = data.get("status")
             if status == "complete":
                 return data
-            msg = f"Analysis {binary!r} found but status={status!r}"
             if status in ("analyzing", "queued"):
-                msg += ". Poll binaries(jobs=True) and match analysis_id for progress."
-            elif status == "error":
-                msg += f": {data.get('error', 'unknown error')}"
-            raise ValueError(msg)
+                raise ValueError(
+                    f"Analysis {binary!r} found but status={status!r}. "
+                    "Poll binaries(jobs=True) and match analysis_id for progress."
+                )
+            if status == "error":
+                # A prior attempt errored: don't treat it as a permanent tombstone --
+                # return no match so the caller re-imports. Still visible via binaries().
+                return None
+            # Anything else (missing/corrupt status) is unexpected -- surface it rather
+            # than silently swallowing it as a cache miss.
+            raise ValueError(
+                f"Analysis {binary!r} found but has unexpected status={status!r}. "
+                "The on-disk .analysis_status record may be corrupt."
+            )
 
     # Fast path: exact unit_id match
     if _UNIT_ID_RE.match(binary):
@@ -781,12 +793,21 @@ def _find_on_disk(binary: str, profile: str | None = None) -> dict | None:
             if status == "complete":
                 matches.append(data)
                 continue
-            msg = f"Unit {binary!r} found but status={status!r}"
             if status in ("analyzing", "queued"):
-                msg += ". Poll binaries(jobs=True) and match unit_id for progress."
-            elif status == "error":
-                msg += f": {data.get('error', 'unknown error')}"
-            raise ValueError(msg)
+                raise ValueError(
+                    f"Unit {binary!r} found but status={status!r}. "
+                    "Poll binaries(jobs=True) and match unit_id for progress."
+                )
+            if status == "error":
+                # A prior attempt errored: skip it rather than raising forever; the caller
+                # re-imports and binaries() still surfaces the failure.
+                continue
+            # Anything else (missing/corrupt status) is unexpected -- surface it rather
+            # than silently swallowing it as a cache miss.
+            raise ValueError(
+                f"Unit {binary!r} found but has unexpected status={status!r}. "
+                "The on-disk .analysis_status record may be corrupt."
+            )
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
