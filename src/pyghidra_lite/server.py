@@ -884,23 +884,47 @@ def _touch_access(handle) -> None:
 def _get_handle(binary: str, profile: str | None = None):
     """Resolve a name/unit_id/analysis_id to a loaded handle.
 
-    Holds _backend_lock for the whole resolution -- including the one-time
-    hot-load it may trigger -- so callers MUST NOT wrap this in _backend_lock and
-    MUST NOT already hold a per-handle lock (ordering is _backend_lock -> handle
-    lock). _backend_lock is reentrant, so the hot-load path re-acquires it
-    safely. The returned handle is then used by the caller under its per-handle
-    lock, by which point _backend_lock has been released.
+    Fast resolution (in-memory table reads + a disk scan) runs under a BRIEF
+    _backend_lock. If the binary isn't loaded yet, the one-time hot-load
+    (openProject) runs OFF _backend_lock -- serialized per-analysis inside
+    _hot_load_blocking -- so a slow or blocked open of one binary can't freeze reads
+    of other (already-loaded) binaries or the backend tables. Callers MUST NOT
+    already hold _backend_lock or a per-handle lock.
     """
     with _backend_lock:
-        return _resolve_handle_locked(binary, profile)
+        handle, disk_match = _resolve_loaded_or_disk(binary, profile)
+    if handle is not None:
+        return handle
+
+    # Not in memory but present on disk: hot-load without holding _backend_lock.
+    analysis_id = disk_match["analysis_id"]
+    loaded = _hot_load_blocking(analysis_id)
+    with _backend_lock:
+        handle = _handle_by_analysis_id(get_backend(), analysis_id)
+    if handle is not None:
+        _touch_access(handle)
+        return handle
+    if loaded:
+        raise RuntimeError(
+            f"Hot-loaded {analysis_id!r} but program not found in backend; "
+            "internal name mismatch -- try the full program name from binaries()"
+        )
+    raise RuntimeError(f"Hot-load failed for {analysis_id!r}; check server logs")
 
 
-def _resolve_handle_locked(binary: str, profile: str | None = None):
+def _resolve_loaded_or_disk(binary: str, profile: str | None = None):
+    """Return (loaded_handle, None) if already in memory, or (None, disk_match) if a
+    completed project exists on disk and must be hot-loaded.
+
+    Runs under _backend_lock (table reads + disk scan only -- it never opens a
+    project). Raises ValueError for not-found / ambiguous, or (from _find_on_disk)
+    for an in-progress analysis.
+    """
     backend = get_backend()
     handle = _handle_by_analysis_id(backend, binary)
     if handle is not None:
         _touch_access(handle)
-        return handle
+        return handle, None
 
     if _UNIT_ID_RE.match(binary):
         loaded_matches = [
@@ -909,7 +933,7 @@ def _resolve_handle_locked(binary: str, profile: str | None = None):
         ]
         if len(loaded_matches) == 1:
             _touch_access(loaded_matches[0])
-            return loaded_matches[0]
+            return loaded_matches[0], None
         if len(loaded_matches) > 1:
             raise ValueError(
                 f"Multiple loaded analyses found for unit {binary!r}. Use analysis_id or full program name from binaries()."
@@ -918,28 +942,16 @@ def _resolve_handle_locked(binary: str, profile: str | None = None):
     try:
         h = backend.get_program(binary)
         _touch_access(h)
-        return h
+        return h, None
     except ValueError:
         pass
 
-    # Auto-lazy-load: find a completed project on disk by analysis_id, unit_id, or filename
-    # (raises ValueError for in-progress/ambiguous -- let that propagate)
+    # Auto-lazy-load: find a completed project on disk by analysis_id, unit_id, or
+    # filename (raises ValueError for in-progress/ambiguous -- let that propagate).
     disk_match = _find_on_disk(binary, profile=profile)
     if disk_match:
-        analysis_id = disk_match["analysis_id"]
-        loaded = _hot_load_blocking(analysis_id)  # RLock allows reentry; one-time cost per session
-        handle = _handle_by_analysis_id(backend, analysis_id)
-        if handle is not None:
-            _touch_access(handle)
-            return handle
-        if loaded:
-            raise RuntimeError(
-                f"Hot-loaded {analysis_id!r} but program not found in backend; "
-                "internal name mismatch -- try the full program name from binaries()"
-            )
-        raise RuntimeError(f"Hot-load failed for {analysis_id!r}; check server logs")
+        return None, disk_match
 
-    # Nothing found
     raise ValueError(f"Binary not found: {binary!r}. Use binaries() to list available names and IDs.")
 
 
@@ -960,13 +972,32 @@ def _sweep_project_locks(project_dir: Path) -> None:
     a worker killed mid-session leaves one the long-lived backend never clears.
     We only ever hot-load COMPLETED analyses (no live worker owns the project at
     that point), so clearing a stale lock right before opening is safe and bounds
-    openProject. Hot-load is serialized under _backend_lock, so no other thread
-    in this process is opening the same project concurrently.
+    openProject. Hot-load is serialized per-analysis by _load_lock_for(), so no
+    other thread in this process is opening the same project concurrently.
     """
     for pattern in ("*.lock", "*.lock~"):
         for lock in project_dir.glob(pattern):
             with suppress(OSError):
                 lock.unlink()
+
+
+# Per-analysis-id load locks. The hot-load path (_hot_load_blocking) opens a project
+# under its analysis's lock here -- NEVER under _backend_lock -- so a slow or blocked
+# open serializes only same-analysis loads, while reads of other (already-loaded)
+# binaries and the backend tables stay responsive. The lock is acquired ONLY in
+# _hot_load_blocking, which is always called off _backend_lock, so it can never invert
+# against _backend_lock (no deadlock). Bounded by distinct analyses seen (small).
+_load_locks: dict[str, threading.Lock] = {}
+_load_locks_guard = threading.Lock()
+
+
+def _load_lock_for(analysis_id: str) -> "threading.Lock":
+    with _load_locks_guard:
+        lock = _load_locks.get(analysis_id)
+        if lock is None:
+            lock = threading.Lock()
+            _load_locks[analysis_id] = lock
+        return lock
 
 
 def _load_project_into_backend(
@@ -976,8 +1007,16 @@ def _load_project_into_backend(
     update_capabilities: bool = False,
     append_history: bool = False,
 ):
-    """Load a completed on-disk project into the provided backend."""
-    handle = _handle_by_analysis_id(backend, analysis_id)
+    """Load a completed on-disk project into the provided backend.
+
+    The slow JVM work (openProject/openProgram) runs with NO _backend_lock held; only
+    the brief publish into backend._projects/programs takes it. Reached off-lock by
+    the hot-load path (_hot_load_blocking), so a slow open never freezes the rest of
+    the server. _backend_lock is reentrant, so the rare caller that already holds it
+    (bootstrap source resolution) still works -- that path keeps its old behavior.
+    """
+    with _backend_lock:
+        handle = _handle_by_analysis_id(backend, analysis_id)
     if handle is not None:
         return handle
 
@@ -1004,28 +1043,60 @@ def _load_project_into_backend(
         # Clear any stale lock left by a crashed worker before opening, so
         # openProject() can't block forever waiting on a dead process's lock.
         _sweep_project_locks(project_dir)
+        # Slow JVM work -- NO _backend_lock held on the hot-load path.
         project = GhidraProject.openProject(project_str, project_id, True)
-        backend._projects[analysis_id] = project
 
-        root_folder = project.getRootFolder()
-        for domain_file in root_folder.getFiles():
+        loaded_name = None
+        loaded_handle = None
+        for domain_file in project.getRootFolder().getFiles():
             if str(domain_file.getContentType()) != "Program":
                 continue
             prog_name = domain_file.getName()
             program = project.openProgram("/", prog_name, False)
             handle = backend._init_program_handle(program, prog_name, profile=profile, unit_id=unit_id)
             handle.analyzed = True
-            backend.programs[prog_name] = handle
-            if update_capabilities:
-                _ensure_capabilities(handle)
-            if append_history:
-                binary_name = status.get("binary_name", prog_name)
-                _append_history(analysis_id, binary_name)
-            logger.info("Loaded %s from project cache (analysis_id=%s)", prog_name, analysis_id)
-            return handle
+            loaded_name, loaded_handle = prog_name, handle
+            break
 
-        logger.warning("No Program entries found in project %s", analysis_id)
-        return None
+        if loaded_handle is None:
+            with suppress(Exception):
+                project.close()
+            logger.warning("No Program entries found in project %s", analysis_id)
+            return None
+
+        # Publish into the backend tables under a brief _backend_lock. We opened the
+        # project + program (and its decompiler) off-lock, so both cleanup branches
+        # below must release them two-step -- close(program) then close() -- matching
+        # the convention at evict/get_program/close; a bare project.close() would
+        # strand the program's native decompiler until GC.
+        with _backend_lock:
+            if _backend is None or backend is not _backend:
+                # The backend was torn down (shutdown / re-init) while we held no lock.
+                # Don't publish an open project into dead tables -- drop what we opened.
+                with suppress(Exception):
+                    project.close(loaded_handle.program)
+                with suppress(Exception):
+                    project.close()
+                return None
+            existing = _handle_by_analysis_id(backend, analysis_id)
+            if existing is not None:
+                # Lost the race: another thread already published this analysis. Drop
+                # our duplicate open so it doesn't leak.
+                with suppress(Exception):
+                    project.close(loaded_handle.program)
+                with suppress(Exception):
+                    project.close()
+                return existing
+            backend._projects[analysis_id] = project
+            backend.programs[loaded_name] = loaded_handle
+
+        if update_capabilities:
+            _ensure_capabilities(loaded_handle)
+        if append_history:
+            binary_name = status.get("binary_name", loaded_name)
+            _append_history(analysis_id, binary_name)
+        logger.info("Loaded %s from project cache (analysis_id=%s)", loaded_name, analysis_id)
+        return loaded_handle
     except Exception as exc:
         logger.error("Failed to load project %s into backend: %s", analysis_id, exc)
         return None
@@ -1869,21 +1940,33 @@ async def _run_scan_task(job_id: str, job: dict, fn):
 
 
 def _hot_load_blocking(analysis_id: str) -> bool:
-    """Load a completed project into the running backend (blocking, runs in thread pool).
+    """Load a completed project into the running backend (blocking; runs in a worker
+    thread). Returns True if the program is now loaded (here or already).
 
-    Returns True if the program is now in backend.programs (loaded here or already loaded),
-    False if it could not be loaded.
+    openProject runs OFF _backend_lock, serialized per-analysis by _load_lock_for(),
+    so a slow/blocked open of one binary never freezes reads of others or the backend
+    tables. The load lock is acquired only here, and only when _backend_lock is NOT
+    held, so it can never invert against _backend_lock (no deadlock).
     """
+    if _backend is None:
+        return False
+    # Cheap pre-check: already loaded? (brief table read, lock released immediately)
     with _backend_lock:
-        if _backend is None:
-            return False
-        handle = _load_project_into_backend(
+        if _handle_by_analysis_id(_backend, analysis_id) is not None:
+            return True
+    # Serialize loads of THIS analysis; the slow open happens off _backend_lock.
+    with _load_lock_for(analysis_id):
+        with _backend_lock:
+            if _backend is None:
+                return False
+            if _handle_by_analysis_id(_backend, analysis_id) is not None:
+                return True
+        return _load_project_into_backend(
             _backend,
             analysis_id,
             update_capabilities=True,
             append_history=True,
-        )
-        return handle is not None
+        ) is not None
 
 
 async def _hot_load(analysis_id: str) -> None:
