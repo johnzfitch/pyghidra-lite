@@ -206,10 +206,13 @@ _LARGE_BINARY_MB = 10
 # Hard ceiling on a single blocking Ghidra project/program open. openProject is an
 # uninterruptible JNI call; a project left unclean by a dead writer can wedge it
 # forever (root cause: cross-process project handoff introduced in f9185dc). We run the
-# open on a throwaway daemon thread and stop waiting past this timeout, then self-heal
-# the on-disk project. Generous enough for a legitimate large load; finite so a wedge
-# can never freeze a session again. Override with PYGHIDRA_LITE_OPEN_TIMEOUT.
-_OPEN_TIMEOUT = float(os.getenv("PYGHIDRA_LITE_OPEN_TIMEOUT", "120"))
+# open on a throwaway daemon thread and stop waiting past this timeout, then self-heal.
+# Set generously: this bounds LOADING an already-analyzed program (seconds to tens of
+# seconds even for huge programs), not analysis, so a healthy open never trips it -- but
+# a genuine wedge can no longer freeze a session. The self-heal is non-destructive
+# (project moved aside, not deleted) so even a false timeout loses nothing.
+# Override with PYGHIDRA_LITE_OPEN_TIMEOUT.
+_OPEN_TIMEOUT = float(os.getenv("PYGHIDRA_LITE_OPEN_TIMEOUT", "300"))
 
 # Hard ceiling on an import-worker subprocess. Analysis is legitimately slow, so this is
 # large; it only stops a genuinely wedged worker from holding a job (and a semaphore
@@ -1043,25 +1046,46 @@ def _run_bounded(fn, timeout: float, op_desc: str):
 
 
 def _purge_wedged_project(analysis_id: str, reason: str) -> None:
-    """Self-heal: drop an on-disk project that couldn't be opened so the next load
+    """Self-heal: set aside an on-disk project that couldn't be opened so the next load
     re-imports a clean copy instead of re-wedging on the same bad state.
 
-    Clears any in-memory backend entry (under _backend_lock -- never while holding it,
-    matching the load-lock -> _backend_lock ordering) then removes the project dir.
-    Safe: only ever touches a validated analysis_id dir under the project base.
+    NON-DESTRUCTIVE: the project is *moved* to ``<id>.wedged`` rather than deleted, so a
+    false timeout on a merely-slow-but-healthy open never loses a completed analysis. The
+    aside copy uses a name that fails project-id validation, so disk scans skip it; at
+    most one is kept per analysis (a prior one is dropped first). The original path is
+    cleared, so the next load re-imports cleanly. In-memory tables are cleared under
+    _backend_lock (load-lock -> _backend_lock ordering; never the reverse). Only ever
+    touches a validated analysis_id dir under the project base.
     """
     project_base = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
     try:
         proj_path = _safe_project_path(project_base, analysis_id)
     except ValueError:
-        logger.error("self-heal: refusing to purge invalid analysis_id %r", analysis_id)
+        logger.error("self-heal: refusing to touch invalid analysis_id %r", analysis_id)
         return
-    logger.warning("self-heal: purging wedged project %s (%s)", analysis_id, reason)
+    # Move into a nested ".wedged/" dir (not a sibling): _iter_disk_status scans only
+    # top-level dirs for a .analysis_status, and ".wedged/" has none directly, so the
+    # set-aside copy -- which keeps its own status file -- is invisible to disk scans
+    # and can't be re-matched/re-loaded.
+    aside = project_base / ".wedged" / analysis_id
+    logger.warning(
+        "self-heal: setting aside wedged project %s -> .wedged/%s (%s)",
+        analysis_id, analysis_id, reason,
+    )
+    # Drop any previous aside copy so these can't accumulate, then move the current one
+    # out of the way. (Moving, not deleting, keeps a recoverable copy of the data.)
+    with suppress(Exception):
+        if aside.exists():
+            shutil.rmtree(aside, onerror=_rmtree_warn)
+    with suppress(Exception):
+        if proj_path.exists():
+            aside.parent.mkdir(parents=True, exist_ok=True)
+            proj_path.rename(aside)
+    # Clear any in-memory remnant (a no-op for a never-published wedge; its on-disk
+    # rmtree is also a no-op now that the dir has been moved aside).
     if _backend is not None:
         with _backend_lock, suppress(Exception):
             _backend._purge_analysis(analysis_id)
-    with suppress(Exception):
-        shutil.rmtree(proj_path, onerror=_rmtree_warn)
 
 
 def _load_project_into_backend(
