@@ -335,7 +335,9 @@ class GhidraBackend:
         try:
             if locator.exists():
                 logger.debug(f"Opening existing project: {project_key}")
-                return GhidraProject.openProject(project_str, project_key, True)
+                # doRestore=False: we never restore a saved session, only read/write
+                # program data, so skip Ghidra's restore() path.
+                return GhidraProject.openProject(project_str, project_key, False)
             else:
                 logger.info(f"Creating new project: {project_key}")
                 return GhidraProject.createProject(project_str, project_key, False)
@@ -346,7 +348,7 @@ class GhidraBackend:
                 lock_file.unlink(missing_ok=True)
                 try:
                     if locator.exists():
-                        return GhidraProject.openProject(project_str, project_key, True)
+                        return GhidraProject.openProject(project_str, project_key, False)
                     else:
                         return GhidraProject.createProject(project_str, project_key, False)
                 except Exception as retry_e:

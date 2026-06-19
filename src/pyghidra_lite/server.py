@@ -203,6 +203,38 @@ _UNIT_ID_CACHE_MAX = 256
 # Binaries above this threshold are auto-delegated to async analysis in load()
 _LARGE_BINARY_MB = 10
 
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var, falling back to `default` on missing/invalid.
+
+    Never raises -- a malformed override must not stop the module from importing (and
+    thus the server from starting).
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r (not a number); using default %s", name, raw, default)
+        return default
+
+
+# Hard ceiling on a single blocking Ghidra project/program open. openProject is an
+# uninterruptible JNI call; a project left unclean by a dead writer can wedge it
+# forever (root cause: cross-process project handoff introduced in f9185dc). We run the
+# open on a throwaway daemon thread and stop waiting past this timeout, then self-heal.
+# Set generously: this bounds LOADING an already-analyzed program (seconds to tens of
+# seconds even for huge programs), not analysis, so a healthy open never trips it -- but
+# a genuine wedge can no longer freeze a session. The self-heal is non-destructive
+# (project moved aside, not deleted) so even a false timeout loses nothing.
+# Override with PYGHIDRA_LITE_OPEN_TIMEOUT.
+_OPEN_TIMEOUT = _env_float("PYGHIDRA_LITE_OPEN_TIMEOUT", 300.0)
+
+# Hard ceiling on an import-worker subprocess. Analysis is legitimately slow, so this is
+# large; it only stops a genuinely wedged worker from holding a job (and a semaphore
+# slot) forever. Override with PYGHIDRA_LITE_WORKER_TIMEOUT.
+_WORKER_TIMEOUT = _env_float("PYGHIDRA_LITE_WORKER_TIMEOUT", 1800.0)
+
 # Async job tracking for analyze_binary
 _active_jobs: dict[str, dict] = {}  # unit_id -> job dict
 _active_jobs_lock: asyncio.Lock | None = None  # initialized in serve
@@ -1000,6 +1032,78 @@ def _load_lock_for(analysis_id: str) -> "threading.Lock":
         return lock
 
 
+def _run_bounded(fn, timeout: float, op_desc: str):
+    """Run a blocking (JNI) callable on a throwaway daemon thread, bounded by `timeout`.
+
+    Ghidra's openProject/openProgram are uninterruptible native calls; a project left
+    unclean by a dead writer can block one forever (the wedge this whole module guards
+    against). We cannot interrupt the call, so we run it on a daemon thread and stop
+    waiting after `timeout`. Returns fn()'s result; re-raises any exception fn raised;
+    raises TimeoutError if it didn't finish in time. On timeout the daemon thread is
+    abandoned -- the caller MUST purge the underlying project dir so the stranded open
+    hits missing files and unwinds on its own (it holds no Python lock).
+    """
+    box: dict = {}
+
+    def _target():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001 -- ferried to the waiting thread
+            box["error"] = exc
+
+    t = threading.Thread(target=_target, name="ghidra-open", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"{op_desc} exceeded {timeout:.0f}s (project likely wedged)")
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def _purge_wedged_project(analysis_id: str, reason: str) -> None:
+    """Self-heal: set aside an on-disk project that couldn't be opened so the next load
+    re-imports a clean copy instead of re-wedging on the same bad state.
+
+    NON-DESTRUCTIVE: the project is *moved* to ``<id>.wedged`` rather than deleted, so a
+    false timeout on a merely-slow-but-healthy open never loses a completed analysis. The
+    aside copy uses a name that fails project-id validation, so disk scans skip it; at
+    most one is kept per analysis (a prior one is dropped first). The original path is
+    cleared, so the next load re-imports cleanly. In-memory tables are cleared under
+    _backend_lock (load-lock -> _backend_lock ordering; never the reverse). Only ever
+    touches a validated analysis_id dir under the project base.
+    """
+    project_base = Path(get_config().project_dir or DEFAULT_PROJECT_DIR)
+    try:
+        proj_path = _safe_project_path(project_base, analysis_id)
+    except ValueError:
+        logger.error("self-heal: refusing to touch invalid analysis_id %r", analysis_id)
+        return
+    # Move into a nested ".wedged/" dir (not a sibling): _iter_disk_status scans only
+    # top-level dirs for a .analysis_status, and ".wedged/" has none directly, so the
+    # set-aside copy -- which keeps its own status file -- is invisible to disk scans
+    # and can't be re-matched/re-loaded.
+    aside = project_base / ".wedged" / analysis_id
+    logger.warning(
+        "self-heal: setting aside wedged project %s -> .wedged/%s (%s)",
+        analysis_id, analysis_id, reason,
+    )
+    # Drop any previous aside copy so these can't accumulate, then move the current one
+    # out of the way. (Moving, not deleting, keeps a recoverable copy of the data.)
+    with suppress(Exception):
+        if aside.exists():
+            shutil.rmtree(aside, onerror=_rmtree_warn)
+    with suppress(Exception):
+        if proj_path.exists():
+            aside.parent.mkdir(parents=True, exist_ok=True)
+            proj_path.rename(aside)
+    # Clear any in-memory remnant (a no-op for a never-published wedge; its on-disk
+    # rmtree is also a no-op now that the dir has been moved aside).
+    if _backend is not None:
+        with _backend_lock, suppress(Exception):
+            _backend._purge_analysis(analysis_id)
+
+
 def _load_project_into_backend(
     backend: GhidraBackend,
     analysis_id: str,
@@ -1041,22 +1145,38 @@ def _load_project_into_backend(
             return None
 
         # Clear any stale lock left by a crashed worker before opening, so
-        # openProject() can't block forever waiting on a dead process's lock.
+        # openProject() can't block waiting on a dead process's lock.
         _sweep_project_locks(project_dir)
-        # Slow JVM work -- NO _backend_lock held on the hot-load path.
-        project = GhidraProject.openProject(project_str, project_id, True)
 
-        loaded_name = None
-        loaded_handle = None
-        for domain_file in project.getRootFolder().getFiles():
-            if str(domain_file.getContentType()) != "Program":
-                continue
-            prog_name = domain_file.getName()
-            program = project.openProgram("/", prog_name, False)
-            handle = backend._init_program_handle(program, prog_name, profile=profile, unit_id=unit_id)
-            handle.analyzed = True
-            loaded_name, loaded_handle = prog_name, handle
-            break
+        # Slow JVM work -- NO _backend_lock held on the hot-load path, and BOUNDED:
+        # openProject/openProgram are uninterruptible native calls, and a project left
+        # unclean by a dead writer can wedge them forever (the exact hang this fixes).
+        # We run the whole open on a throwaway thread and self-heal if it blows the
+        # timeout. doRestore=False: we open completed projects only to read programs,
+        # never to restore a session, so we skip Ghidra's restore() path entirely.
+        def _open_and_load():
+            proj = GhidraProject.openProject(project_str, project_id, False)
+            lname = lhandle = None
+            for domain_file in proj.getRootFolder().getFiles():
+                if str(domain_file.getContentType()) != "Program":
+                    continue
+                pname = domain_file.getName()
+                prog = proj.openProgram("/", pname, False)
+                h = backend._init_program_handle(prog, pname, profile=profile, unit_id=unit_id)
+                h.analyzed = True
+                lname, lhandle = pname, h
+                break
+            return proj, lname, lhandle
+
+        try:
+            project, loaded_name, loaded_handle = _run_bounded(
+                _open_and_load, _OPEN_TIMEOUT, f"open+load({analysis_id})"
+            )
+        except TimeoutError as exc:
+            # The cached project is wedged. Purge it so the next load re-imports a clean
+            # copy; the abandoned open thread unwinds once its files are gone.
+            _purge_wedged_project(analysis_id, str(exc))
+            return None
 
         if loaded_handle is None:
             with suppress(Exception):
@@ -1896,7 +2016,31 @@ async def _run_worker(path: Path, analysis_id: str, profile: str, job: dict):
             )
             job["pid"] = proc.pid
 
-            _stdout, stderr_bytes = await proc.communicate()
+            # Bound the worker: a genuinely wedged import (e.g. openProject on an
+            # unclean project) would otherwise hang this job -- and hold a semaphore
+            # slot -- forever. On timeout, kill it and report a clear error.
+            try:
+                _stdout, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=_WORKER_TIMEOUT
+                )
+            except TimeoutError:
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                with suppress(Exception):
+                    await proc.wait()
+                job["status"] = "error"
+                job["error"] = (
+                    f"Import worker exceeded {_WORKER_TIMEOUT:.0f}s and was killed "
+                    f"(analysis_id={analysis_id})."
+                )
+                _parsed = parse_analysis_id(analysis_id)
+                _err_status = {"status": "error", "phase": "import", "error": job["error"]}
+                if _parsed is not None:
+                    _err_status["unit_id"] = _parsed[0]
+                    _err_status["profile"] = _parsed[1]
+                _write_status_file(job.get("project_id", analysis_id), _err_status)
+                asyncio.get_running_loop().call_later(300, _active_jobs.pop, analysis_id, None)
+                return
             returncode = proc.returncode if proc.returncode is not None else -1
 
             if returncode == 0:
@@ -2567,41 +2711,54 @@ async def load(
                             for h in _backend.programs.values()
                         ),
                     )
-                    result = {
-                        "unit_id": unit_id,
-                        "analysis_id": disk_match["analysis_id"],
-                        "binary_name": p.name,
-                        "kind": kind,
-                        "profile": status_data.get("profile"),
-                        "status": "ready" if hot_loaded else "load_failed",
-                        "functions": status_data.get("functions"),
-                        "capabilities": status_data.get("capabilities", []),
-                    }
                     if hot_loaded:
-                        result["hot_loaded"] = True
-                    if hot_load_error:
-                        result["hot_load_error"] = hot_load_error
-                    elif not hot_loaded:
-                        result["hot_load_error"] = "Program not found in backend after load"
-                    if hot_loaded and bootstrap_source:
-                        def _bootstrap_disk_locked():
-                            with _backend_lock:
-                                dest_handle = _handle_by_analysis_id(
-                                    get_backend(), disk_match["analysis_id"]
-                                )
-                                if dest_handle is None:
-                                    return False, None
-                                stats = _apply_bootstrap_transfer(
-                                    get_backend(),
-                                    bootstrap_source,
-                                    dest_handle,
-                                    mode=bootstrap_mode,
-                                )
-                                return True, _bootstrap_meta(bootstrap_source, stats)
-                        found, meta = await asyncio.to_thread(_bootstrap_disk_locked)
-                        if found:
-                            result["bootstrap"] = meta
-                    return result
+                        result = {
+                            "unit_id": unit_id,
+                            "analysis_id": disk_match["analysis_id"],
+                            "binary_name": p.name,
+                            "kind": kind,
+                            "profile": status_data.get("profile"),
+                            "status": "ready",
+                            "functions": status_data.get("functions"),
+                            "capabilities": status_data.get("capabilities", []),
+                            "hot_loaded": True,
+                        }
+                        if bootstrap_source:
+                            def _bootstrap_disk_locked():
+                                with _backend_lock:
+                                    dest_handle = _handle_by_analysis_id(
+                                        get_backend(), disk_match["analysis_id"]
+                                    )
+                                    if dest_handle is None:
+                                        return False, None
+                                    stats = _apply_bootstrap_transfer(
+                                        get_backend(),
+                                        bootstrap_source,
+                                        dest_handle,
+                                        mode=bootstrap_mode,
+                                    )
+                                    return True, _bootstrap_meta(bootstrap_source, stats)
+                            found, meta = await asyncio.to_thread(_bootstrap_disk_locked)
+                            if found:
+                                result["bootstrap"] = meta
+                        return result
+
+                    # Hot-load failed: the cached project is unusable -- a dead writer
+                    # left it unclean, or the bounded open timed out and self-healed it.
+                    # Purge any remaining cache and fall through to a fresh re-import
+                    # rather than returning a dead "load_failed" (the old behavior that
+                    # left the user stuck) or hanging.
+                    logger.warning(
+                        "hot-load failed for %s (%s); purging cache and re-importing",
+                        disk_match["analysis_id"],
+                        hot_load_error or "program not found in backend after load",
+                    )
+                    await asyncio.to_thread(
+                        _purge_wedged_project,
+                        disk_match["analysis_id"],
+                        hot_load_error or "hot-load failed",
+                    )
+                    disk_match = None  # force the import path below
             except (json.JSONDecodeError, OSError):
                 pass
 
