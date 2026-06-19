@@ -1043,11 +1043,26 @@ def _load_project_into_backend(
             logger.warning("No Program entries found in project %s", analysis_id)
             return None
 
-        # Publish into the backend tables under a brief _backend_lock. Double-check
-        # nobody else published this analysis while we were opening; if so, drop ours.
+        # Publish into the backend tables under a brief _backend_lock. We opened the
+        # project + program (and its decompiler) off-lock, so both cleanup branches
+        # below must release them two-step -- close(program) then close() -- matching
+        # the convention at evict/get_program/close; a bare project.close() would
+        # strand the program's native decompiler until GC.
         with _backend_lock:
+            if _backend is None or backend is not _backend:
+                # The backend was torn down (shutdown / re-init) while we held no lock.
+                # Don't publish an open project into dead tables -- drop what we opened.
+                with suppress(Exception):
+                    project.close(loaded_handle.program)
+                with suppress(Exception):
+                    project.close()
+                return None
             existing = _handle_by_analysis_id(backend, analysis_id)
             if existing is not None:
+                # Lost the race: another thread already published this analysis. Drop
+                # our duplicate open so it doesn't leak.
+                with suppress(Exception):
+                    project.close(loaded_handle.program)
                 with suppress(Exception):
                     project.close()
                 return existing
