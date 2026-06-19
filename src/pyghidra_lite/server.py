@@ -203,6 +203,22 @@ _UNIT_ID_CACHE_MAX = 256
 # Binaries above this threshold are auto-delegated to async analysis in load()
 _LARGE_BINARY_MB = 10
 
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var, falling back to `default` on missing/invalid.
+
+    Never raises -- a malformed override must not stop the module from importing (and
+    thus the server from starting).
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r (not a number); using default %s", name, raw, default)
+        return default
+
+
 # Hard ceiling on a single blocking Ghidra project/program open. openProject is an
 # uninterruptible JNI call; a project left unclean by a dead writer can wedge it
 # forever (root cause: cross-process project handoff introduced in f9185dc). We run the
@@ -212,12 +228,12 @@ _LARGE_BINARY_MB = 10
 # a genuine wedge can no longer freeze a session. The self-heal is non-destructive
 # (project moved aside, not deleted) so even a false timeout loses nothing.
 # Override with PYGHIDRA_LITE_OPEN_TIMEOUT.
-_OPEN_TIMEOUT = float(os.getenv("PYGHIDRA_LITE_OPEN_TIMEOUT", "300"))
+_OPEN_TIMEOUT = _env_float("PYGHIDRA_LITE_OPEN_TIMEOUT", 300.0)
 
 # Hard ceiling on an import-worker subprocess. Analysis is legitimately slow, so this is
 # large; it only stops a genuinely wedged worker from holding a job (and a semaphore
 # slot) forever. Override with PYGHIDRA_LITE_WORKER_TIMEOUT.
-_WORKER_TIMEOUT = float(os.getenv("PYGHIDRA_LITE_WORKER_TIMEOUT", "1800"))
+_WORKER_TIMEOUT = _env_float("PYGHIDRA_LITE_WORKER_TIMEOUT", 1800.0)
 
 # Async job tracking for analyze_binary
 _active_jobs: dict[str, dict] = {}  # unit_id -> job dict
