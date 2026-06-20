@@ -66,11 +66,7 @@ def _compile_sample(dst_dir: Path) -> Path:
         int sub(int a, int b) { return a - b; }
         int mul(int a, int b) { return a * b; }
         int dbl(int a) { return a + a; }
-        int square(int a) { return a * a; }
-        int main(void) {
-            printf("%d\\n", add(2, 3) - sub(5, 1) + mul(2, 2) + dbl(1) + square(3));
-            return 0;
-        }
+        int main(void) { printf("%d\\n", add(2, 3) - sub(5, 1) + mul(2, 2) + dbl(1)); return 0; }
     """))
     out = dst_dir / "sample.elf"
     # -O0 -fno-inline keeps each function as its own symbol in the symbol table.
@@ -118,7 +114,7 @@ def _annotate(name, ctx=None, **kw):
 def test_sample_has_named_functions(loaded):
     names = {f.getName() for f in loaded.program.getFunctionManager().getFunctions(True)}
     # Unstripped build -> Ghidra recovers the source names we annotate below.
-    assert {"add", "sub", "mul", "dbl", "square", "main"} <= names
+    assert {"add", "sub", "mul", "dbl", "main"} <= names
 
 
 def test_rename_round_trips(loaded):
@@ -165,22 +161,6 @@ def test_disabled_when_allow_write_false(loaded):
         assert _func(loaded, "main").getName() == "main"
     finally:
         server._server_config = saved
-
-
-def test_audit_journal_records_writes(loaded):
-    """A committed write lands in the append-only audit journal (old -> new)."""
-    import json
-
-    res = _annotate(loaded.name, target="square", action="rename", name="squared")
-    assert res["applied"] is True
-
-    path = server._audit_log_path()
-    assert path.exists()
-    entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    mine = [e for e in entries if e.get("new") == "squared" and e.get("outcome") == "applied"]
-    assert mine, "expected an applied audit entry for the square -> squared rename"
-    assert mine[0]["old"] == "square"
-    assert mine[0]["action"] == "rename"
 
 
 def test_rename_persists_across_save(loaded):

@@ -75,6 +75,3 @@ server.pid
 firebase-debug.log
 hs_err_pid*.log
 .ghidra-test/
-
-# Local Ghidra projects (dot-free dir for the dev MCP server)
-ghidra-projects/

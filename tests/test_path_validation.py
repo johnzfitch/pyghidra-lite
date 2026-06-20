@@ -10,12 +10,9 @@ from pathlib import Path
 
 import pytest
 
+from pyghidra_lite.backend import parse_analysis_id
 from pyghidra_lite import server
-from pyghidra_lite.backend import (
-    _assert_ghidra_safe_project_dir,
-    _read_ghidra_major_version,
-    parse_analysis_id,
-)
+
 
 # ---------------------------------------------------------------------------
 # parse_analysis_id -- allowlist: {16 lowercase hex}-{fast|default|deep}
@@ -181,69 +178,3 @@ class TestPathHelperValidation:
         server._write_job_result("abcdef0123456789", {"result": "data"})
         result_file = self.project_dir / "abcdef0123456789" / "result.json"
         assert result_file.exists()
-
-
-# ---------------------------------------------------------------------------
-# _read_ghidra_major_version -- pre-JVM parse of application.properties
-# ---------------------------------------------------------------------------
-class TestReadGhidraMajorVersion:
-    def _make_install(self, tmp_path, version_line):
-        props = tmp_path / "Ghidra" / "application.properties"
-        props.parent.mkdir(parents=True, exist_ok=True)
-        props.write_text(version_line)
-        return tmp_path
-
-    def test_reads_major_from_full_version(self, tmp_path):
-        install = self._make_install(tmp_path, "application.version=12.1.2\n")
-        assert _read_ghidra_major_version(install) == 12
-
-    def test_reads_major_for_ghidra_11(self, tmp_path):
-        install = self._make_install(tmp_path, "application.version=11.3.1\n")
-        assert _read_ghidra_major_version(install) == 11
-
-    def test_ignores_surrounding_properties(self, tmp_path):
-        body = "application.name=Ghidra\napplication.version = 12.0\nfoo=bar\n"
-        install = self._make_install(tmp_path, body)
-        assert _read_ghidra_major_version(install) == 12
-
-    def test_none_install_dir_returns_none(self):
-        assert _read_ghidra_major_version(None) is None
-
-    def test_missing_file_returns_none(self, tmp_path):
-        assert _read_ghidra_major_version(tmp_path) is None
-
-    def test_unparseable_version_returns_none(self, tmp_path):
-        install = self._make_install(tmp_path, "application.version=dev\n")
-        assert _read_ghidra_major_version(install) is None
-
-
-# ---------------------------------------------------------------------------
-# _assert_ghidra_safe_project_dir -- gated to Ghidra 12+
-# ---------------------------------------------------------------------------
-class TestAssertGhidraSafeProjectDir:
-    DOTTED = Path.home() / ".local" / "share" / "pyghidra-lite" / "projects"
-    CLEAN = Path.home() / "pyghidra-lite" / "projects"
-
-    # --- Ghidra 12+: dot-leading components are rejected ---
-    def test_rejects_dotted_dir_on_ghidra_12(self):
-        with pytest.raises(ValueError, match=r"starting with '\.'"):
-            _assert_ghidra_safe_project_dir(self.DOTTED, 12)
-
-    def test_rejects_dotted_dir_on_ghidra_13(self):
-        with pytest.raises(ValueError):
-            _assert_ghidra_safe_project_dir(self.DOTTED, 13)
-
-    def test_error_names_the_offending_component(self):
-        with pytest.raises(ValueError, match=r"\.local"):
-            _assert_ghidra_safe_project_dir(self.DOTTED, 12)
-
-    def test_allows_clean_dir_on_ghidra_12(self):
-        _assert_ghidra_safe_project_dir(self.CLEAN, 12)  # no raise
-
-    # --- Ghidra 11.x and earlier: the restriction does not exist ---
-    def test_allows_dotted_dir_on_ghidra_11(self):
-        _assert_ghidra_safe_project_dir(self.DOTTED, 11)  # no raise
-
-    # --- Unknown version: skip rather than risk a false positive ---
-    def test_skips_check_when_version_unknown(self):
-        _assert_ghidra_safe_project_dir(self.DOTTED, None)  # no raise

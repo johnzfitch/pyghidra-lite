@@ -7,17 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **Write audit journal**: every `annotate` write — and every declined/failed
-  attempt — is recorded in `annotate_audit.jsonl` beside the on-disk projects,
-  capturing `old -> new` (so it doubles as an undo log). Since MCP elicitation
-  trusts the client (an auto-approving client can self-confirm), this keeps
-  writes accountable and reversible even under automation. A per-session
-  counter also nudges via `ctx.warning` as write volume climbs. The journal is
-  fail-closed (a write is journaled before it's applied; if it can't be
-  recorded, it isn't committed) and hardened (`0o600`, `O_NOFOLLOW` to refuse a
-  symlinked path, and size-based rotation to bound disk use).
-
 ## [0.8.0] - 2026-06-03
 
 ### Added

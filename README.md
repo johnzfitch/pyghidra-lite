@@ -282,17 +282,6 @@ doesn't support elicitation, the tool returns a preview with `applied: false`
 and writes nothing (fail closed). Confirmed changes are written in a single
 Ghidra transaction and saved to the on-disk project.
 
-**Audit journal.** Because MCP elicitation ultimately trusts the client (an
-autonomous "auto-approve" client *can* self-confirm), every write is recorded in
-`annotate_audit.jsonl` next to the projects — and every declined or failed
-attempt is logged too. Each line records `old -> new`, so the journal is both an
-accountability trail and an undo log; a flood of entries is your signal that an
-auto-agent is churning, and the server also nudges (`ctx.warning`) as write
-volume climbs. The journal is **fail-closed and hardened**: a write is recorded
-*before* it's applied (if it can't be journaled, it isn't committed), the file
-is created `0o600` and opened with `O_NOFOLLOW` (a symlinked journal is
-refused), and it rotates by size so it can't grow without bound.
-
 ## Analysis Profiles
 
 | Profile | Use Case |

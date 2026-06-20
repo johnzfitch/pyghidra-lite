@@ -27,58 +27,6 @@ logger = logging.getLogger(__name__)
 # Standard project location
 DEFAULT_PROJECT_DIR = Path.home() / ".local" / "share" / "pyghidra-lite" / "projects"
 
-
-def _read_ghidra_major_version(install_dir: Path | str | None) -> int | None:
-    """Read the Ghidra major version from <install_dir>/Ghidra/application.properties.
-
-    Pre-JVM and dependency-free (the properties file is what find_ghidra_install()
-    already uses to validate an install). Returns None if the version can't be
-    determined (no install dir, unreadable file, or unparseable version line).
-    """
-    if install_dir is None:
-        return None
-    props = Path(install_dir) / "Ghidra" / "application.properties"
-    try:
-        text = props.read_text()
-    except OSError:
-        return None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("application.version"):
-            _, _, value = line.partition("=")
-            major = value.strip().split(".", 1)[0]
-            if major.isdigit():
-                return int(major)
-    return None
-
-
-def _assert_ghidra_safe_project_dir(project_dir: Path, ghidra_major: int | None) -> None:
-    """Fail fast if the project dir has a dot-leading path component (Ghidra 12+ only).
-
-    Ghidra 12's ProjectLocator validates the whole absolute project path via
-    GhidraURL.checkValidProjectPath -> NamingUtilities.checkName, which rejects any
-    element starting with '.' ("Path element starting with '.' is not permitted").
-    DEFAULT_PROJECT_DIR lives under ~/.local/..., so on Ghidra 12 every import there
-    dies with that cryptic Java error deep inside an async worker (phase=import).
-    Surface it here, at startup, with actionable guidance instead.
-
-    Ghidra 11.x and earlier do NOT impose this restriction, so the default ~/.local
-    dir is perfectly valid there. The check is therefore gated to major version >= 12
-    to avoid breaking working installs. If the version can't be determined
-    (ghidra_major is None) we skip the check rather than risk a false positive.
-    """
-    if ghidra_major is None or ghidra_major < 12:
-        return
-    abs_dir = Path(project_dir).expanduser().absolute()
-    dotted = [p for p in abs_dir.parts if p not in ("/", "") and p.startswith(".")]
-    if dotted:
-        raise ValueError(
-            "Project directory has path component(s) starting with '.': "
-            f"{', '.join(dotted)} (in {abs_dir}). Ghidra {ghidra_major} rejects these, so "
-            "analysis would fail at import. Set PYGHIDRA_LITE_PROJECT_DIR (or --project-dir) "
-            "to a path with no dot-leading components, e.g. ~/pyghidra-lite/projects."
-        )
-
 # Common Ghidra install locations to search (in priority order)
 _GHIDRA_SEARCH_PATHS = [
     "/opt/ghidra",
@@ -278,13 +226,6 @@ class GhidraBackend:
                 "  3. Install Ghidra to /opt/ghidra or ~/ghidra"
             )
 
-        # Now that we know which Ghidra we're using, reject dot-leading project dirs
-        # on Ghidra 12+ (still pre-JVM, before pyghidra.start()). Gated by version so
-        # the default ~/.local dir keeps working on Ghidra 11.x.
-        _assert_ghidra_safe_project_dir(
-            self.project_dir, _read_ghidra_major_version(install_dir)
-        )
-
         logger.info("Starting PyGhidra (install_dir=%s)...", install_dir)
         pyghidra.start(verbose=False, install_dir=install_dir)
         self._started = True
@@ -335,9 +276,7 @@ class GhidraBackend:
         try:
             if locator.exists():
                 logger.debug(f"Opening existing project: {project_key}")
-                # doRestore=False: we never restore a saved session, only read/write
-                # program data, so skip Ghidra's restore() path.
-                return GhidraProject.openProject(project_str, project_key, False)
+                return GhidraProject.openProject(project_str, project_key, True)
             else:
                 logger.info(f"Creating new project: {project_key}")
                 return GhidraProject.createProject(project_str, project_key, False)
@@ -348,7 +287,7 @@ class GhidraBackend:
                 lock_file.unlink(missing_ok=True)
                 try:
                     if locator.exists():
-                        return GhidraProject.openProject(project_str, project_key, False)
+                        return GhidraProject.openProject(project_str, project_key, True)
                     else:
                         return GhidraProject.createProject(project_str, project_key, False)
                 except Exception as retry_e:
