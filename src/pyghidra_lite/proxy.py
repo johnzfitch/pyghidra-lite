@@ -275,7 +275,6 @@ def _autostart_backend(host: str, port: int) -> None:
             "--transport", "streamable-http",
             "--port", str(port),
             "--host", host,
-            "--idle-timeout", "30",
         ]
         logger.info("Auto-starting backend on port %d", port)
 

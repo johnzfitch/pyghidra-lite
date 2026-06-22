@@ -156,9 +156,6 @@ _ANNOTATE_ACTIONS = ("rename", "comment", "prototype")
 _MAX_BATCH_XREF_TARGETS = 20
 _MAX_BATCH_SEARCH_QUERIES = 20
 _MAX_QUEUED_JOBS = 32
-# Grace period after signaling idle shutdown before we hard-exit the process. The
-# embedded JVM's non-daemon threads can otherwise hang interpreter exit forever.
-IDLE_SHUTDOWN_GRACE_SECONDS = 10
 
 def _validate_project_id(project_id: str) -> None:
     """Raise ValueError if project_id doesn't match expected formats.
@@ -4137,48 +4134,23 @@ class _BearerAuthMiddleware:
         return await self.app(scope, receive, send)
 
 
-class _IdleTracker:
-    """ASGI middleware that records the time of the last HTTP request."""
-
-    def __init__(self, app):
-        self.app = app
-        self.last_request = time.time()
-        self._lock = threading.Lock()
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") == "http":
-            with self._lock:
-                self.last_request = time.time()
-        return await self.app(scope, receive, send)
-
-    def idle_seconds(self) -> float:
-        with self._lock:
-            return time.time() - self.last_request
-
-
 def _serve_http(
     mcp_server,
     *,
     transport: str,
     auth_token: str | None = None,
-    idle_minutes: int | None = None,
 ) -> None:
-    """Serve an HTTP/SSE MCP app via uvicorn with optional auth + idle exit.
+    """Serve an HTTP/SSE MCP app via uvicorn with optional bearer auth.
 
     Replaces the bare mcp.run() for the HTTP family so a single path applies the
-    bearer-auth and idle-timeout middleware (DNS-rebinding protection is wired
-    in earlier via mcp.settings.transport_security).
+    bearer-auth middleware (DNS-rebinding protection is wired in earlier via
+    mcp.settings.transport_security).
     """
     import uvicorn
 
     app = mcp_server.sse_app() if transport == "sse" else mcp_server.streamable_http_app()
     if auth_token:
         app = _BearerAuthMiddleware(app, auth_token)
-
-    idle = None
-    if idle_minutes and idle_minutes > 0:
-        idle = _IdleTracker(app)
-        app = idle
 
     config = uvicorn.Config(
         app,
@@ -4191,29 +4163,6 @@ def _serve_http(
         h11_max_incomplete_event_size=1024 * 1024,
     )
     server = uvicorn.Server(config)
-
-    if idle is not None:
-        def watchdog(srv: uvicorn.Server, tracker: _IdleTracker):
-            timeout_sec = idle_minutes * 60
-            while not srv.started:
-                time.sleep(0.1)
-            while srv.started:
-                time.sleep(30)
-                if tracker.idle_seconds() >= timeout_sec:
-                    logger.info("Idle for %d minutes, shutting down.", idle_minutes)
-                    srv.should_exit = True
-                    # The embedded JVM has non-daemon Ghidra threads that can hang
-                    # graceful interpreter shutdown, leaving a process that closed its
-                    # listener but never exits -- a 0%-CPU zombie holding no port. The
-                    # next tool call then hits a dead port and the proxy autostarts a
-                    # replacement, stacking backends. Give uvicorn a brief grace period
-                    # to drain, then hard-exit so the process truly dies and frees the
-                    # port. Safe here: we only reach this after `timeout_sec` idle.
-                    time.sleep(IDLE_SHUTDOWN_GRACE_SECONDS)
-                    logger.info("Forcing exit after idle shutdown (JVM threads linger).")
-                    os._exit(0)
-
-        threading.Thread(target=watchdog, args=(server, idle), daemon=True).start()
 
     # anyio.run is used by FastMCP internally; replicate here
     import anyio
@@ -4300,11 +4249,6 @@ def cli():
          "user via MCP elicitation; clients that can't confirm get a preview only.",
 )
 @click.option(
-    "--idle-timeout", type=int, default=None,
-    help="Auto-exit after this many minutes with no HTTP requests (shared mode only). "
-         "Set by proxy auto-start; 0 or None disables.",
-)
-@click.option(
     "--auth-token", type=str, default=None, envvar="PYGHIDRA_LITE_AUTH_TOKEN",
     help="Require this bearer token on every HTTP/SSE request (shared mode). "
          "Required for non-loopback binds. Reads PYGHIDRA_LITE_AUTH_TOKEN.",
@@ -4332,7 +4276,6 @@ def serve_cmd(
     evict_after: int | None,
     min_loaded: int | None,
     allow_write: bool,
-    idle_timeout: int | None,
     auth_token: str | None,
     allowed_hosts: tuple[str, ...],
     binaries: tuple[Path, ...],
@@ -4456,7 +4399,6 @@ def serve_cmd(
                 mcp,
                 transport=transport,
                 auth_token=auth_token,
-                idle_minutes=idle_timeout,
             )
     finally:
         if transport in ("streamable-http", "sse"):
