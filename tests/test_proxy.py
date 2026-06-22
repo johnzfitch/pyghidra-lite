@@ -108,6 +108,63 @@ class TestBackendAlive:
         assert _is_backend_alive("127.0.0.1", 19199) is False
 
 
+class TestPortIsFree:
+    """Port-availability check that gates autostart (see _autostart_backend)."""
+
+    def test_free_when_nothing_listening(self):
+        from pyghidra_lite.proxy import _port_is_free
+
+        assert _port_is_free("127.0.0.1", 19199) is True
+
+    def test_occupied_when_socket_bound(self):
+        import socket
+
+        from pyghidra_lite.proxy import _port_is_free
+
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        try:
+            assert _port_is_free("127.0.0.1", port) is False
+        finally:
+            srv.close()
+        # Freed once the listener is closed.
+        assert _port_is_free("127.0.0.1", port) is True
+
+
+class TestAutostartNoDuplicate:
+    """Regression: a busy-but-bound backend must NOT trigger a duplicate spawn.
+
+    Reproduces the incident where a backend saturated by analysis failed the HTTP
+    health check while still holding its port, so the proxy autostarted a second
+    serve that raced for a port it could never bind -- leaving orphaned zombies.
+    """
+
+    def test_does_not_spawn_when_port_occupied(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        import pyghidra_lite.proxy as proxy
+
+        monkeypatch.setattr(proxy, "_lock_path", lambda port: tmp_path / f"{port}.lock")
+        # Port is occupied (busy backend) and health is initially failing, then the
+        # backend answers on the next poll -- autostart should wait, never spawn.
+        monkeypatch.setattr(proxy, "_port_is_free", lambda *a: False)
+        alive = iter([False, True])  # re-check fails; wait-loop then succeeds
+        monkeypatch.setattr(proxy, "_is_backend_alive", lambda *a: next(alive))
+        monkeypatch.setattr(proxy, "AUTOSTART_POLL_INTERVAL", 0.0)
+
+        spawned = []
+        monkeypatch.setattr(
+            proxy.subprocess, "Popen",
+            lambda *a, **k: spawned.append(a) or pytest.fail("spawned a duplicate backend"),
+        )
+
+        proxy._autostart_backend("127.0.0.1", 19111)
+        assert spawned == []
+
+
 class TestStreamableConcurrencyPatch:
     """Regression: concurrent tool calls must not crash the proxy.
 

@@ -201,6 +201,31 @@ def _is_backend_alive(host: str, port: int) -> bool:
         return False
 
 
+def _port_is_free(host: str, port: int) -> bool:
+    """True only if nothing is listening on host:port (connection refused).
+
+    Distinct from _is_backend_alive: a backend busy with a heavy analysis can fail
+    the HTTP health check (its event loop is starved, so the GET times out) while
+    still holding the listening socket. That false "dead" reading is what made the
+    proxy autostart a *second* backend which then raced for a port it could never
+    bind. Gating autostart on actual port availability avoids stacking backends:
+    only a genuinely free port (connection refused) means there is nothing there.
+    """
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(HEALTH_TIMEOUT)
+    try:
+        sock.connect((host, port))
+        return False  # something accepted the connection -> port occupied
+    except ConnectionRefusedError:
+        return True  # nothing listening -> free
+    except OSError:
+        return False  # uncertain (e.g. timeout) -> assume occupied, don't double-spawn
+    finally:
+        sock.close()
+
+
 def _autostart_backend(host: str, port: int) -> None:
     """Spawn the backend as a detached process and wait for it to be ready.
 
@@ -223,6 +248,23 @@ def _autostart_backend(host: str, port: int) -> None:
 
         # Re-check after acquiring lock (another process may have started it)
         if _is_backend_alive(host, port):
+            return
+
+        # A backend may already be bound but BUSY (health check starved by a heavy
+        # analysis) -- its listener still owns the port. Spawning now would race for a
+        # port we can never bind, leaving an orphaned serve. Only start when the port
+        # is genuinely free; otherwise wait for the existing backend to answer.
+        if not _port_is_free(host, port):
+            logger.info("Port %d occupied (backend busy/starting); waiting for it", port)
+            deadline = time.monotonic() + AUTOSTART_POLL_TIMEOUT
+            while time.monotonic() < deadline:
+                if _is_backend_alive(host, port):
+                    return
+                time.sleep(AUTOSTART_POLL_INTERVAL)
+            logger.warning(
+                "Backend on port %d occupied but not healthy after %.0fs; "
+                "using it without spawning a duplicate", port, AUTOSTART_POLL_TIMEOUT,
+            )
             return
 
         _read_pid(port)  # clean stale PID entries
