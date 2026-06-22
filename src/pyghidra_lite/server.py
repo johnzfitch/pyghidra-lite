@@ -156,6 +156,9 @@ _ANNOTATE_ACTIONS = ("rename", "comment", "prototype")
 _MAX_BATCH_XREF_TARGETS = 20
 _MAX_BATCH_SEARCH_QUERIES = 20
 _MAX_QUEUED_JOBS = 32
+# Grace period after signaling idle shutdown before we hard-exit the process. The
+# embedded JVM's non-daemon threads can otherwise hang interpreter exit forever.
+IDLE_SHUTDOWN_GRACE_SECONDS = 10
 
 def _validate_project_id(project_id: str) -> None:
     """Raise ValueError if project_id doesn't match expected formats.
@@ -4199,7 +4202,16 @@ def _serve_http(
                 if tracker.idle_seconds() >= timeout_sec:
                     logger.info("Idle for %d minutes, shutting down.", idle_minutes)
                     srv.should_exit = True
-                    return
+                    # The embedded JVM has non-daemon Ghidra threads that can hang
+                    # graceful interpreter shutdown, leaving a process that closed its
+                    # listener but never exits -- a 0%-CPU zombie holding no port. The
+                    # next tool call then hits a dead port and the proxy autostarts a
+                    # replacement, stacking backends. Give uvicorn a brief grace period
+                    # to drain, then hard-exit so the process truly dies and frees the
+                    # port. Safe here: we only reach this after `timeout_sec` idle.
+                    time.sleep(IDLE_SHUTDOWN_GRACE_SECONDS)
+                    logger.info("Forcing exit after idle shutdown (JVM threads linger).")
+                    os._exit(0)
 
         threading.Thread(target=watchdog, args=(server, idle), daemon=True).start()
 
