@@ -24,6 +24,99 @@ from mcp.server.stdio import stdio_server
 
 logger = logging.getLogger("pyghidra-lite-proxy")
 
+
+def _patch_streamable_http_concurrency() -> None:
+    """Fix an upstream MCP-SDK bug that crashes the proxy on concurrent tool calls.
+
+    ``StreamableHTTPTransport.post_writer`` spawns one task per in-flight request
+    via ``tg.start_soon(handle_request_async)``, but ``handle_request_async`` closes
+    over the loop variables ``ctx`` and ``is_resumption`` *by reference*. Because
+    ``start_soon`` defers execution, every queued task ends up reading the LAST
+    iteration's ``ctx`` once a burst of requests is buffered: earlier requests are
+    never POSTed (their callers hang) and the latest request is POSTed N times. The
+    resulting duplicate-id / missing-response traffic tears down the SSE stream,
+    which closes the proxy's bridge streams and kills the whole proxy process --
+    Claude Code then loses ALL pyghidra-lite tools until a manual /mcp reconnect.
+
+    Confirmed present in mcp 1.26.0 through 1.28.0 (latest); no released fix. We
+    replace the method with an identical copy whose inner coroutine binds ``ctx``
+    and ``is_resumption`` as default arguments (per-iteration capture). The patch is
+    self-deactivating: if a future SDK no longer ships the buggy pattern we leave it
+    untouched, and it is idempotent across repeated imports.
+    """
+    import inspect
+
+    from mcp.client.streamable_http import (
+        ClientMessageMetadata,
+        JSONRPCRequest,
+        RequestContext,
+        StreamableHTTPTransport,
+    )
+
+    if getattr(StreamableHTTPTransport.post_writer, "_pyghidra_lite_patched", False):
+        return
+    try:
+        src = inspect.getsource(StreamableHTTPTransport.post_writer)
+    except (OSError, TypeError):
+        src = ""
+    # Only patch the known-buggy shape; a fixed upstream method is left alone.
+    if "tg.start_soon(handle_request_async)" not in src or "ctx=ctx" in src:
+        return
+
+    async def post_writer(
+        self,
+        client,
+        write_stream_reader,
+        read_stream_writer,
+        write_stream,
+        start_get_stream,
+        tg,
+    ):
+        try:
+            async with write_stream_reader:
+                async for session_message in write_stream_reader:
+                    message = session_message.message
+                    metadata = (
+                        session_message.metadata
+                        if isinstance(session_message.metadata, ClientMessageMetadata)
+                        else None
+                    )
+                    is_resumption = bool(metadata and metadata.resumption_token)
+                    if self._is_initialized_notification(message):
+                        start_get_stream()
+                    ctx = RequestContext(
+                        client=client,
+                        session_id=self.session_id,
+                        session_message=session_message,
+                        metadata=metadata,
+                        read_stream_writer=read_stream_writer,
+                    )
+
+                    # FIX: bind ctx + is_resumption as defaults so each deferred
+                    # task captures ITS OWN request, not the final loop values.
+                    async def handle_request_async(ctx=ctx, is_resumption=is_resumption):
+                        if is_resumption:
+                            await self._handle_resumption_request(ctx)
+                        else:
+                            await self._handle_post_request(ctx)
+
+                    if isinstance(message.root, JSONRPCRequest):
+                        tg.start_soon(handle_request_async)
+                    else:
+                        await handle_request_async()
+        except Exception:
+            logger.exception("Error in patched post_writer")
+        finally:
+            await read_stream_writer.aclose()
+            await write_stream.aclose()
+
+    post_writer._pyghidra_lite_patched = True
+    StreamableHTTPTransport.post_writer = post_writer
+    logger.info("Applied streamable-http concurrency fix (upstream closure bug).")
+
+
+_patch_streamable_http_concurrency()
+
 DEFAULT_PORT = 19101
 DEFAULT_HOST = "127.0.0.1"
 HEALTH_TIMEOUT = 2.0

@@ -106,3 +106,77 @@ class TestBackendAlive:
     def test_returns_false_when_unreachable(self):
         # Nothing listening on this port
         assert _is_backend_alive("127.0.0.1", 19199) is False
+
+
+class TestStreamableConcurrencyPatch:
+    """Regression: concurrent tool calls must not crash the proxy.
+
+    The MCP SDK's StreamableHTTPTransport.post_writer spawned deferred tasks that
+    all closed over the LAST loop iteration's request context, so a burst of
+    parallel tool calls crossed contexts -- earlier requests were dropped and the
+    last was sent repeatedly, tearing down the bridge and disconnecting every
+    pyghidra-lite tool. proxy.py monkeypatches the fix at import time.
+    """
+
+    def test_patch_applied_and_idempotent(self):
+        from mcp.client.streamable_http import StreamableHTTPTransport
+
+        # Importing pyghidra_lite.proxy (done above) applies the patch.
+        assert getattr(
+            StreamableHTTPTransport.post_writer, "_pyghidra_lite_patched", False
+        ) is True
+        # Re-running the patcher must not stack or error.
+        from pyghidra_lite.proxy import _patch_streamable_http_concurrency
+
+        _patch_streamable_http_concurrency()
+        assert getattr(
+            StreamableHTTPTransport.post_writer, "_pyghidra_lite_patched", False
+        ) is True
+
+    def test_concurrent_requests_keep_their_own_context(self):
+        import anyio
+        from mcp.client.streamable_http import StreamableHTTPTransport
+        from mcp.shared.message import SessionMessage
+        from mcp.types import JSONRPCMessage, JSONRPCRequest
+
+        handled: list[str] = []
+
+        class FakeTransport:
+            session_id = "s"
+
+            def _is_initialized_notification(self, _m):
+                return False
+
+            async def _handle_post_request(self, ctx):
+                # Yield first so every spawned task is scheduled before any
+                # records -- this is what exposes the closure-capture bug.
+                await anyio.sleep(0)
+                handled.append(ctx.session_message.message.root.id)
+
+            async def _handle_resumption_request(self, ctx):  # pragma: no cover
+                await anyio.sleep(0)
+
+        async def drive():
+            send, recv = anyio.create_memory_object_stream(10)
+            rsw, _rsw_r = anyio.create_memory_object_stream(10)
+            wsend, _w = anyio.create_memory_object_stream(10)
+            for rid in ("A", "B", "C"):
+                msg = JSONRPCMessage(
+                    JSONRPCRequest(jsonrpc="2.0", id=rid, method="tools/call")
+                )
+                await send.send(SessionMessage(msg))
+            await send.aclose()
+            async with anyio.create_task_group() as tg:
+                await StreamableHTTPTransport.post_writer(
+                    FakeTransport(),
+                    client=None,
+                    write_stream_reader=recv,
+                    read_stream_writer=rsw,
+                    write_stream=wsend,
+                    start_get_stream=lambda: None,
+                    tg=tg,
+                )
+
+        anyio.run(drive)
+        # Every request handled exactly once, none crossed/dropped/duplicated.
+        assert sorted(handled) == ["A", "B", "C"]
