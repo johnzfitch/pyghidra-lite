@@ -1677,6 +1677,78 @@ async def _run_worker(path: Path, analysis_id: str, profile: str, job: dict):
         asyncio.get_running_loop().call_later(300, _active_jobs.pop, analysis_id, None)
 
 
+async def _run_import_inprocess(path: Path, analysis_id: str, profile: str, job: dict):
+    """Run a large-binary analysis IN-PROCESS as a background task.
+
+    Replaces the subprocess worker (_run_worker). The serve's OWN JVM does the
+    import+analyze via _do_import_blocking, so:
+      - the analyzed program ends up live in backend.programs -- no cross-process
+        project handoff, so later tools never have to openProject a dir written by
+        another process (that handoff is what wedges under Ghidra 12), and
+      - there is no throwaway JVM to hang on shutdown, so no zombie worker / held
+        project / forced kill.
+    The model still gets an immediate "queued" result from load(); progress and the
+    terminal result are published to the same .analysis_status file the subprocess
+    used (via AnalysisProgressListener), so binaries(jobs=True) is unchanged.
+
+    Heap/JVM are the serve's own (not per-binary tuned); the analyzeAll runs off
+    _backend_lock (see _do_import_blocking) so other tool calls aren't frozen for the
+    whole analysis, matching the existing small-binary in-process path.
+    """
+    global _worker_semaphore
+    if _worker_semaphore is None:
+        _worker_semaphore = asyncio.Semaphore(4)
+
+    async with _worker_semaphore:
+        job["status"] = "analyzing"
+        profile_enum = AnalysisProfile(profile)
+        project_id = job.get("project_id", analysis_id)
+        status_path = _safe_project_path(
+            Path(get_config().project_dir or DEFAULT_PROJECT_DIR), project_id
+        ) / ".analysis_status"
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        listener = AnalysisProgressListener(
+            status_path, job["binary_name"], profile, path.stat().st_size,
+            unit_id=job.get("unit_id"), analysis_id=analysis_id, binary_path=str(path),
+        )
+        tracker = ProgressTracker(message="importing")
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(
+            _import_executor,
+            lambda: _do_import_blocking(
+                path, profile_enum, True, tracker,
+                fresh=False,
+                bootstrap=job.get("bootstrap_source"),
+                bootstrap_mode=job.get("bootstrap_mode", "named"),
+            ),
+        )
+        try:
+            # Mirror in-thread progress into the status file while analysis runs.
+            while not fut.done():
+                progress, _total, message = tracker.get()
+                listener.set_phase(message or "analyzing", round(progress / 100.0, 3))
+                await asyncio.sleep(2)
+            handle, caps, bootstrap_stats = await fut
+            func_count = handle.program.getFunctionManager().getFunctionCount()
+            cap_list = _format_capabilities(caps)
+            bootstrap_meta = (
+                _bootstrap_meta(
+                    job.get("bootstrap_source"), bootstrap_stats,
+                    mode=job.get("bootstrap_mode", "named"),
+                )
+                if bootstrap_stats else None
+            )
+            listener.complete(func_count, cap_list, bootstrap=bootstrap_meta)
+            (job.update({"status": "complete", "functions": func_count}))
+        except Exception as e:
+            logger.exception("in-process analysis failed for %s", analysis_id)
+            listener.error(str(e), "analyzing")
+            (job.update({"status": "error", "error": str(e)[:500]}))
+
+        # Deferred pop: keep terminal status available for 5 min so callers can poll.
+        asyncio.get_running_loop().call_later(300, _active_jobs.pop, analysis_id, None)
+
+
 async def _run_scan_task(job_id: str, job: dict, fn):
     """Run a blocking scan function in the thread pool; write result.json on completion.
 
@@ -2345,7 +2417,8 @@ async def load(
                     "Wait for current jobs to complete or cancel with delete()."
                 )
 
-            # Spawn async worker subprocess.
+            # Spawn in-process background analysis (no subprocess -> no zombie /
+            # cross-process openProject wedge; see _run_import_inprocess).
             estimated = _estimate_analysis_time(p.stat().st_size, profile)
             job: dict = {
                 "analysis_id": analysis_id,
@@ -2361,7 +2434,7 @@ async def load(
             }
             with _jobs_mutex:
                 _active_jobs[analysis_id] = job
-            asyncio.create_task(_run_worker(p, analysis_id, profile, job))
+            asyncio.create_task(_run_import_inprocess(p, analysis_id, profile, job))
             result = {
                 "unit_id": unit_id,
                 "analysis_id": analysis_id,

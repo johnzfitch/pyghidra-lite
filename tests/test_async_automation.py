@@ -728,3 +728,61 @@ class TestBinariesLiveStatus:
         assert job_entries[0]["result_available"] is True
         assert job_entries[0]["result"]["results"]["foo"] == 3
         assert "binaries(jobs=True)" in job_entries[0]["hint"]
+
+
+class TestInProcessImport:
+    """_run_import_inprocess replaces the subprocess worker: it runs the analysis
+    in the serve's own JVM (mocked here) and publishes the same .analysis_status
+    file the subprocess used, so binaries(jobs=True) is unchanged."""
+
+    def _job(self, uid):
+        analysis_id = f"{uid}-fast"
+        return analysis_id, {
+            "status": "queued", "unit_id": uid, "analysis_id": analysis_id,
+            "project_id": analysis_id, "binary_name": "Sample",
+        }
+
+    def test_completes_and_writes_status(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=tmp_path))
+        monkeypatch.setattr(server, "_worker_semaphore", None)
+        handle = MagicMock()
+        handle.program.getFunctionManager.return_value.getFunctionCount.return_value = 4242
+        caps = server.BinaryCapabilities(name="Sample", is_macho=True)
+        monkeypatch.setattr(server, "_do_import_blocking", lambda *a, **k: (handle, caps, None))
+
+        binpath = tmp_path / "Sample"
+        binpath.write_bytes(b"\xfe\xed\xfa\xcf" + b"\x00" * 32)
+        uid = "c" * 16
+        analysis_id, job = self._job(uid)
+
+        asyncio.run(server._run_import_inprocess(binpath, analysis_id, "fast", job))
+
+        assert job["status"] == "complete"
+        assert job["functions"] == 4242
+        status = json.loads((tmp_path / analysis_id / ".analysis_status").read_text())
+        assert status["status"] == "complete"
+        assert status["functions"] == 4242
+        assert "macho" in status["capabilities"]
+        # No PID recorded -> the stale-job monitor (which reaps dead PIDs) leaves it alone.
+        assert job.get("pid") is None
+
+    def test_error_path_marks_job_and_status(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=tmp_path))
+        monkeypatch.setattr(server, "_worker_semaphore", None)
+
+        def boom(*a, **k):
+            raise RuntimeError("analyze exploded")
+        monkeypatch.setattr(server, "_do_import_blocking", boom)
+
+        binpath = tmp_path / "Sample"
+        binpath.write_bytes(b"\x00" * 16)
+        uid = "d" * 16
+        analysis_id, job = self._job(uid)
+
+        asyncio.run(server._run_import_inprocess(binpath, analysis_id, "fast", job))
+
+        assert job["status"] == "error"
+        assert "analyze exploded" in job["error"]
+        status = json.loads((tmp_path / analysis_id / ".analysis_status").read_text())
+        assert status["status"] == "error"
+        assert "analyze exploded" in status["error"]

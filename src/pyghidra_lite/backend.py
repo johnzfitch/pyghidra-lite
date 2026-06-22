@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import uuid
 from collections.abc import Callable
@@ -172,6 +173,32 @@ class ProgramHandle:
         )
 
 
+def _ensure_headless_awt() -> None:
+    """Force AWT headless BEFORE the JVM starts -- the fix for the project-op deadlock.
+
+    Ghidra's project layer (GhidraProject.createProject/openProject/importProgram)
+    touches AWT, which on macOS demands the process *main* thread. pyghidra's
+    "headless" launcher does NOT set ``java.awt.headless``, so any Ghidra project op
+    run from a background thread -- i.e. every server analysis, which runs off the
+    asyncio main thread -- deadlocks at 0% CPU waiting on the main thread (the JVM
+    won't even answer jstack). Setting headless makes AWT stop requiring the main
+    thread, so project ops work from any thread.
+
+    Verified: with -Djava.awt.headless=true a background-thread import completes;
+    without it (default) it deadlocks. Harmless on Linux (already effectively
+    headless); apple.awt.UIElement is macOS-only and ignored elsewhere. Applied via
+    _JAVA_OPTIONS because pyghidra.start() exposes no vmargs hook.
+    """
+    opts = os.environ.get("_JAVA_OPTIONS", "")
+    additions = []
+    if "java.awt.headless" not in opts:
+        additions.append("-Djava.awt.headless=true")
+    if sys.platform == "darwin" and "apple.awt.UIElement" not in opts:
+        additions.append("-Dapple.awt.UIElement=true")
+    if additions:
+        os.environ["_JAVA_OPTIONS"] = (opts + " " + " ".join(additions)).strip()
+
+
 class GhidraBackend:
     """Manages Ghidra project and program analysis.
 
@@ -227,6 +254,7 @@ class GhidraBackend:
             )
 
         logger.info("Starting PyGhidra (install_dir=%s)...", install_dir)
+        _ensure_headless_awt()  # must precede JVM start; see helper for the why
         pyghidra.start(verbose=False, install_dir=install_dir)
         self._started = True
 
