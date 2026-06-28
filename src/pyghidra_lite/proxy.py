@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import time
 from pathlib import Path
 
@@ -305,27 +306,35 @@ def _autostart_backend(host: str, port: int) -> None:
         sys.exit(1)
 
 
-def _serve_executable_in(prefix: str, *, windows: bool) -> str | None:
-    """Return the console-script path under ``prefix`` if it exists, else None.
+def _console_script(scripts_dir: str | None, *, windows: bool) -> str | None:
+    """Return the pyghidra-lite console-script path in ``scripts_dir``, or None.
 
-    Console scripts land in ``bin/`` on POSIX but ``Scripts\\`` on Windows, where
-    they also carry a ``.exe`` suffix -- so both the directory and the filename
-    vary by platform. Kept pure (platform passed in) so both branches are
-    testable on any host.
+    ``scripts_dir`` is expected to come from ``sysconfig.get_path("scripts")``,
+    which already resolves the right directory for the platform and install
+    scheme. The only platform-dependent piece left is the Windows ``.exe``
+    suffix, passed in explicitly so both branches stay testable on any host.
     """
-    scripts_dir = "Scripts" if windows else "bin"
-    exe = "pyghidra-lite.exe" if windows else "pyghidra-lite"
-    candidate = os.path.join(prefix, scripts_dir, exe)
+    if not scripts_dir:
+        return None
+    name = "pyghidra-lite.exe" if windows else "pyghidra-lite"
+    candidate = os.path.join(scripts_dir, name)
     return candidate if os.path.isfile(candidate) else None
 
 
 def _find_serve_executable() -> str:
-    """Find the pyghidra-lite executable for auto-start."""
-    # sys.prefix points to the venv root when installed.
-    candidate = _serve_executable_in(sys.prefix, windows=os.name == "nt")
-    if candidate:
-        return candidate
-    return shutil.which("pyghidra-lite") or "pyghidra-lite"
+    """Find the pyghidra-lite executable for auto-start.
+
+    Resolve via ``sysconfig.get_path("scripts")`` -- the directory pip installs
+    console scripts into for the *current* interpreter's scheme. It is correct
+    across venvs, conda, and framework builds on every OS (``bin/`` on POSIX,
+    ``Scripts\\`` on Windows, with a ``.exe`` suffix). The earlier
+    ``sys.prefix + "bin"`` guess only happened to hold for a plain POSIX venv;
+    that hardcoded layout was the root cause of the Windows auto-start miss.
+    Layouts the default scheme doesn't cover (e.g. ``--user`` installs) fall
+    through to the PATH lookup, then a bare name.
+    """
+    candidate = _console_script(sysconfig.get_path("scripts"), windows=os.name == "nt")
+    return candidate or shutil.which("pyghidra-lite") or "pyghidra-lite"
 
 
 async def run_proxy(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
