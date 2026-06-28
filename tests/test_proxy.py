@@ -84,9 +84,13 @@ class TestPaths:
 class TestFindExecutable:
 
     def test_finds_venv_binary(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        exe = bin_dir / "pyghidra-lite"
+        # Lay out the console script the way the *current* platform installs it
+        # (bin/ on POSIX, Scripts\...exe on Windows) so this integration test of
+        # _find_serve_executable() passes on both POSIX and Windows runners.
+        windows = os.name == "nt"
+        scripts_dir = tmp_path / ("Scripts" if windows else "bin")
+        scripts_dir.mkdir()
+        exe = scripts_dir / ("pyghidra-lite.exe" if windows else "pyghidra-lite")
         exe.write_text("#!/bin/sh")
         monkeypatch.setattr("sys.prefix", str(tmp_path))
         assert _find_serve_executable() == str(exe)
