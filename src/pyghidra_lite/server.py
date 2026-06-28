@@ -1098,17 +1098,73 @@ def _with_handle(action: str, binary: str, op):
         return _guarded_tool_call(action, lambda: op(_get_handle(binary)))
 
 
+_DEFAULT_TOOL_TIMEOUT = 300.0
+
+
+def _tool_timeout() -> float:
+    """Per-tool-call wall-clock budget in seconds; <= 0 disables it.
+
+    Override with PYGHIDRA_LITE_TOOL_TIMEOUT. A single blocking Ghidra/JVM call
+    -- a full re-analysis, info(detail="full") on a large image, or delete
+    contending with a running analysis -- can otherwise grind for tens of
+    minutes. An MCP client awaiting that response has no way to time out, so it
+    just stalls silently. Bounding the call server-side turns that freeze into a
+    prompt, actionable error.
+    """
+    raw = os.environ.get("PYGHIDRA_LITE_TOOL_TIMEOUT")
+    if raw is None:
+        return _DEFAULT_TOOL_TIMEOUT
+    try:
+        return float(raw)
+    except ValueError:
+        return _DEFAULT_TOOL_TIMEOUT
+
+
+async def _run_bounded(action: str, fn):
+    """Run blocking tool work in a worker thread under a wall-clock budget.
+
+    Solves the two failure modes behind "the server just hangs forever":
+
+      1. Event-loop starvation: taking _backend_lock or doing JVM work directly
+         in an async tool body runs it ON the loop thread, so one slow call
+         freezes every client and all progress notifications. Offloading to a
+         thread keeps the loop responsive.
+      2. Unbounded client wait: the client has no way to abort a slow call, so a
+         wedged or pathologically expensive op stalls it indefinitely. wait_for
+         bounds it and raises a clear error instead.
+
+    The abandoned worker thread keeps running (Python cannot cancel a thread) and
+    holds _backend_lock until its JVM call returns; while it does, other calls
+    time out too rather than hang, and normal service resumes once it finishes.
+    """
+    timeout = _tool_timeout()
+    coro = asyncio.to_thread(fn)
+    if timeout <= 0:
+        return await coro
+    try:
+        return await asyncio.wait_for(coro, timeout)
+    except TimeoutError:
+        raise RuntimeError(
+            f"{action} exceeded its {timeout:g}s budget and was abandoned to keep "
+            f"the server responsive. The backend may still be busy (e.g. a full "
+            f're-analysis, or info(detail="full") on a large binary). Try a narrower '
+            f"call -- functions(query=...), code(<target>) -- or raise the "
+            f"PYGHIDRA_LITE_TOOL_TIMEOUT environment variable."
+        ) from None
+
+
 async def _with_handle_async(action: str, binary: str, op):
-    """Run a blocking handle operation off the event loop.
+    """Run a blocking handle operation off the event loop, under a timeout.
 
     Ghidra/JVM work (decompilation, reference walking, section iteration) is
-    synchronous and can take seconds. Executing it directly in an async tool
-    body would block the whole server -- under the shared HTTP transport a
-    single decompile would freeze progress notifications and every other
-    client's request. Offloading to a worker thread keeps the loop responsive;
-    `_backend_lock` still serializes JVM access across threads.
+    synchronous and can take seconds -- or, pathologically, many minutes
+    (info(detail="full") ranking every function by xref count on a large image).
+    Running it in the async body would block the whole server; an unbounded await
+    would also let one slow call stall the client forever. _run_bounded offloads
+    to a worker thread (loop stays responsive) and bounds it (client always gets
+    a response). `_backend_lock` still serializes JVM access across threads.
     """
-    return await asyncio.to_thread(_with_handle, action, binary, op)
+    return await _run_bounded(action, lambda: _with_handle(action, binary, op))
 
 
 def _tools_for(handle) -> GhidraTools:
@@ -2639,8 +2695,11 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
             "analysis_id": disk_match["analysis_id"],
         }
 
-    with _backend_lock:
-        return _guarded_tool_call("delete", op)
+    def _run():
+        with _backend_lock:
+            return _guarded_tool_call("delete", op)
+
+    return await _run_bounded("delete", _run)
 
 
 @mcp.tool(annotations=_read_only("List Binaries"))
@@ -2762,8 +2821,11 @@ async def binaries(
 
         return results
 
-    with _backend_lock:
-        return _guarded_tool_call("binaries", op)
+    def _run():
+        with _backend_lock:
+            return _guarded_tool_call("binaries", op)
+
+    return await _run_bounded("binaries", _run)
 
 
 @mcp.tool(annotations=_read_only("Binary Info"))
@@ -3398,7 +3460,7 @@ async def xrefs(
         with _backend_lock:
             return _guarded_tool_call("xrefs", op)
 
-    return await asyncio.to_thread(_run)
+    return await _run_bounded("xrefs", _run)
 
 
 @mcp.tool(annotations=_read_only("Search Binary"))
