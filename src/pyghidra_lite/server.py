@@ -67,6 +67,13 @@ from pyghidra_lite.tools import GhidraTools
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# O_NOFOLLOW refuses a symlinked path on POSIX; it does not exist on Windows,
+# where symlink creation is privileged anyway. Fall back to 0 so the bitwise
+# OR is a no-op there. (Resolving this at attribute-access time -- not as a bare
+# `os.O_NOFOLLOW` inside each os.open call -- is what keeps Windows from raising
+# AttributeError before the surrounding `except OSError` can run.)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
 # Thread pool for running blocking Ghidra operations
 _import_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ghidra-import")
 
@@ -447,24 +454,47 @@ def _validate_minimum(name: str, value: int, minimum: int) -> int:
     return value
 
 
+_JAVA_INSTALL_HINT = (
+    "Install JDK 21 and either add it to PATH or set JAVA_HOME. "
+    "brew install openjdk@21 (macOS) / apt install openjdk-21-jdk (Ubuntu) / "
+    "winget install Microsoft.OpenJDK.21 (Windows)"
+)
+
+
+def _resolve_java_executable() -> str | None:
+    """Resolve the ``java`` launcher, preferring JAVA_HOME over PATH.
+
+    Ghidra/pyghidra honor JAVA_HOME, so a JDK that satisfies the runtime can be
+    invisible to a bare ``shutil.which("java")`` when it is not also on PATH --
+    a common Windows setup with a portable JDK. Resolve in the same priority the
+    JVM launcher uses: ``$JAVA_HOME/bin/java[.exe]`` first, then PATH. Returns
+    the resolved executable path, or None if neither yields one.
+    """
+    java_home = os.environ.get("JAVA_HOME", "").strip()
+    if java_home:
+        exe = "java.exe" if os.name == "nt" else "java"
+        candidate = Path(java_home) / "bin" / exe
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("java")
+
+
 def _check_prerequisites(ghidra_dir: str | None) -> None:
     """Verify Java 21+ and Ghidra are available before starting the backend."""
-    # Check Java is on PATH
-    java_path = shutil.which("java")
+    # Resolve the java launcher (JAVA_HOME first, then PATH) and use that exact
+    # path for both the existence check and the version probe below.
+    java_path = _resolve_java_executable()
     if not java_path:
-        raise click.ClickException(
-            "Java not found. Ghidra requires JDK 21+. "
-            "Install: brew install openjdk@21 (macOS) / apt install openjdk-21-jdk (Ubuntu)"
-        )
+        raise click.ClickException(f"Java not found. Ghidra requires JDK 21+. {_JAVA_INSTALL_HINT}")
 
     # Parse java version from stderr
     try:
         result = subprocess.run(
-            ["java", "-version"], capture_output=True, text=True, timeout=10
+            [java_path, "-version"], capture_output=True, text=True, timeout=10
         )
         version_output = result.stderr + result.stdout
     except Exception as exc:
-        raise click.ClickException(f"Failed to run 'java -version': {exc}")
+        raise click.ClickException(f"Failed to run '{java_path} -version': {exc}")
 
     import re
     match = re.search(r'"(\d+)', version_output)
@@ -475,8 +505,7 @@ def _check_prerequisites(ghidra_dir: str | None) -> None:
     major = int(match.group(1))
     if major < 21:
         raise click.ClickException(
-            f"Java {major} found, but Ghidra requires JDK 21+. "
-            "Install: brew install openjdk@21 (macOS) / apt install openjdk-21-jdk (Ubuntu)"
+            f"Java {major} found, but Ghidra requires JDK 21+. {_JAVA_INSTALL_HINT}"
         )
 
     # Check Ghidra installation
@@ -592,7 +621,7 @@ def _iter_disk_status():
             continue
         status_file = entry / ".analysis_status"
         try:
-            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(str(status_file), os.O_RDONLY | _O_NOFOLLOW)
         except OSError:
             continue
         try:
@@ -1419,7 +1448,7 @@ def _read_status_file(project_id: str) -> dict:
         return {}
     status_file = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
     try:
-        fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(str(status_file), os.O_RDONLY | _O_NOFOLLOW)
     except OSError:
         return {}
     try:
@@ -1469,7 +1498,7 @@ def _get_job_result(job_id: str) -> dict:
                     "Poll binaries(jobs=True) until complete.",
         ))
     try:
-        fd = os.open(str(result_file), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(str(result_file), os.O_RDONLY | _O_NOFOLLOW)
     except OSError as e:
         raise McpError(ErrorData(code=INTERNAL_ERROR,
                                  message=f"Failed to read result for {job_id!r}: {e}")) from e
@@ -1856,7 +1885,7 @@ class ProjectWatcher:
 
     def _check_and_load(self, status_path: Path):
         try:
-            fd = os.open(str(status_path), os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(str(status_path), os.O_RDONLY | _O_NOFOLLOW)
         except OSError:
             return
         try:
@@ -1993,7 +2022,7 @@ async def _recover_in_progress_jobs():
                 continue  # Already loaded by eager_load
 
         try:
-            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(str(status_file), os.O_RDONLY | _O_NOFOLLOW)
         except OSError:
             continue
         try:
@@ -4565,7 +4594,7 @@ def list_cmd(project_dir, as_json):
 
         status_data = {}
         try:
-            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(str(status_file), os.O_RDONLY | _O_NOFOLLOW)
         except OSError:
             pass
         else:

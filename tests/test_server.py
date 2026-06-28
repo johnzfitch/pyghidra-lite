@@ -932,3 +932,123 @@ def test_delete_ambiguous_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValueError, match="Ambiguous"):
         # "claude" is a substring of both handle names
         asyncio.run(server.delete("claude", None))
+
+
+# ---------------------------------------------------------------------------
+# Windows portability: Java preflight honors JAVA_HOME (not just PATH)
+# ---------------------------------------------------------------------------
+
+def _make_fake_java(tmp_path: Path) -> Path:
+    """Create a fake $JAVA_HOME/bin/java[.exe] and return the JAVA_HOME dir."""
+    java_home = tmp_path / "jdk21"
+    bin_dir = java_home / "bin"
+    bin_dir.mkdir(parents=True)
+    exe = bin_dir / ("java.exe" if os.name == "nt" else "java")
+    exe.write_text("#!/bin/sh\n")
+    return java_home
+
+
+def test_resolve_java_prefers_java_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    java_home = _make_fake_java(tmp_path)
+    monkeypatch.setenv("JAVA_HOME", str(java_home))
+    # Even if PATH has a java, JAVA_HOME wins.
+    monkeypatch.setattr(server.shutil, "which", lambda _name: "/usr/bin/java")
+
+    exe = "java.exe" if os.name == "nt" else "java"
+    assert server._resolve_java_executable() == str(java_home / "bin" / exe)
+
+
+def test_resolve_java_falls_back_to_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # JAVA_HOME set but no java under it -> fall back to PATH.
+    monkeypatch.setenv("JAVA_HOME", str(tmp_path / "empty"))
+    monkeypatch.setattr(server.shutil, "which", lambda _name: "/usr/bin/java")
+    assert server._resolve_java_executable() == "/usr/bin/java"
+
+
+def test_resolve_java_unset_java_home_uses_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    monkeypatch.setattr(server.shutil, "which", lambda _name: "/opt/java")
+    assert server._resolve_java_executable() == "/opt/java"
+
+
+def test_resolve_java_none_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    monkeypatch.setattr(server.shutil, "which", lambda _name: None)
+    assert server._resolve_java_executable() is None
+
+
+def test_check_prerequisites_invokes_resolved_java(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The version probe must run the JAVA_HOME-resolved binary, not bare 'java'."""
+    java_home = _make_fake_java(tmp_path)
+    monkeypatch.setenv("JAVA_HOME", str(java_home))
+    # No java on PATH at all -- the old code (which() + ["java", ...]) would fail.
+    monkeypatch.setattr(server.shutil, "which", lambda _name: None)
+
+    captured = {}
+
+    class _Result:
+        stdout = ""
+        stderr = 'openjdk version "21.0.1" 2023-10-17\n'
+
+    def fake_run(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _Result()
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setattr(server, "find_ghidra_install", lambda _d: tmp_path / "ghidra")
+
+    server._check_prerequisites(None)
+
+    exe = "java.exe" if os.name == "nt" else "java"
+    assert captured["cmd"][0] == str(java_home / "bin" / exe)
+    assert captured["cmd"][1] == "-version"
+
+
+def test_check_prerequisites_missing_java_hint_mentions_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    monkeypatch.setattr(server.shutil, "which", lambda _name: None)
+
+    import click
+
+    with pytest.raises(click.ClickException) as exc:
+        server._check_prerequisites(None)
+    msg = str(exc.value)
+    assert "JAVA_HOME" in msg
+    assert "Windows" in msg
+
+
+# ---------------------------------------------------------------------------
+# Windows portability: O_NOFOLLOW does not exist on Windows (BUG #3)
+# ---------------------------------------------------------------------------
+
+def test_o_nofollow_constant_matches_platform() -> None:
+    assert getattr(os, "O_NOFOLLOW", 0) == server._O_NOFOLLOW
+
+
+def test_read_status_file_without_o_nofollow_attr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulate Windows (no os.O_NOFOLLOW): status reads must not raise.
+
+    The pre-fix call sites used `os.O_RDONLY | os.O_NOFOLLOW`, raising
+    AttributeError at attribute-access time -- which the surrounding
+    `except OSError` could not catch -- so the whole tool crashed.
+    """
+    project_id = "0123456789abcdef"
+    project_dir = tmp_path / "projects"
+    (project_dir / project_id).mkdir(parents=True)
+    (project_dir / project_id / ".analysis_status").write_text('{"phase": "done"}')
+
+    config = server.ServerConfig(project_dir=project_dir)
+    monkeypatch.setattr(server, "_server_config", config)
+
+    # Make the platform look like Windows for any code re-reading os.O_NOFOLLOW.
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    # And make the module constant reflect the Windows fallback.
+    monkeypatch.setattr(server, "_O_NOFOLLOW", 0)
+
+    assert server._read_status_file(project_id) == {"phase": "done"}
