@@ -15,9 +15,12 @@ from pyghidra_lite.proxy import (
     _find_serve_executable,
     _is_backend_alive,
     _lock_path,
+    _pid_alive,
     _pid_path,
     _read_pid,
     _remove_pid,
+    _terminate_pid,
+    _try_lock_exclusive,
     _write_pid,
 )
 
@@ -287,3 +290,57 @@ class TestStreamableConcurrencyPatch:
         anyio.run(drive)
         # Every request handled exactly once, none crossed/dropped/duplicated.
         assert sorted(handled) == ["A", "B", "C"]
+
+
+class TestPidAlive:
+    """Cross-platform liveness. Critically NOT os.kill(pid, 0): on Windows that
+    routes to TerminateProcess and would kill the process being probed.
+    """
+
+    def test_alive_for_self(self):
+        assert _pid_alive(os.getpid()) is True
+
+    def test_dead_for_unused_pid(self):
+        assert _pid_alive(2_000_000_000) is False
+
+
+class TestExclusiveLock:
+    """_try_lock_exclusive serializes concurrent proxy starts (fcntl on POSIX,
+    msvcrt on Windows). The lock is released when the file handle closes.
+    """
+
+    def test_contended_then_free_after_close(self, tmp_path: Path):
+        p = tmp_path / "x.lock"
+        with open(p, "w") as f1:
+            assert _try_lock_exclusive(f1) is True
+            with open(p, "w") as f2:
+                # Held by f1 (a separate open-file description) -> contender fails.
+                assert _try_lock_exclusive(f2) is False
+        # Freed once f1 is closed.
+        with open(p, "w") as f3:
+            assert _try_lock_exclusive(f3) is True
+
+
+class TestTerminatePid:
+    """_terminate_pid must stop a real child without referencing signal.SIGKILL
+    at import time (it does not exist on Windows).
+    """
+
+    def test_terminates_child(self):
+        import subprocess
+        import sys
+        import time
+
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            assert _pid_alive(proc.pid) is True
+            _terminate_pid(proc.pid, force=False)
+            for _ in range(60):
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            assert proc.poll() is not None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
