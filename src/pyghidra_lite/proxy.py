@@ -6,23 +6,106 @@ so each Claude Code session uses ~10MB instead of ~500MB for its own JVM.
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import sysconfig
 import time
 from pathlib import Path
 
 import anyio
 import httpx
-
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.stdio import stdio_server
 
 logger = logging.getLogger("pyghidra-lite-proxy")
+
+# fcntl is POSIX-only. The proxy must still import -- and run -- on Windows,
+# where a bare `pyghidra-lite` invocation routes here (DefaultGroup -> proxy);
+# a top-level `import fcntl` would crash startup with ModuleNotFoundError. Pick
+# the platform's file-lock backend once (msvcrt is the Windows equivalent).
+_IS_WINDOWS = os.name == "nt"
+if _IS_WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this PID currently exists.
+
+    os.kill(pid, 0) is the POSIX idiom but is unsafe on Windows: os.kill there
+    routes any signal other than CTRL_C/CTRL_BREAK to TerminateProcess, so
+    signal 0 would *kill* the process being probed. Use the Win32 API instead.
+    """
+    if _IS_WINDOWS:
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Declare signatures so the HANDLE return isn't truncated to a 32-bit int
+        # on 64-bit Windows (which would corrupt the value and the CloseHandle).
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_pid(pid: int, *, force: bool) -> None:
+    """Stop a process. force=True escalates to a hard kill on POSIX.
+
+    Windows has no SIGTERM/SIGKILL distinction and signal.SIGKILL does not exist
+    there; os.kill maps any signal to TerminateProcess, so both paths terminate.
+    """
+    if _IS_WINDOWS:
+        os.kill(pid, signal.SIGTERM)  # -> TerminateProcess
+        return
+    os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
+def _try_lock_exclusive(fh) -> bool:
+    """Take a non-blocking exclusive lock on an open file; True if acquired.
+
+    The lock releases automatically when the file is closed. Used to serialize
+    concurrent proxy starts; the port-availability gate is the backstop when the
+    lock cannot be taken.
+    """
+    try:
+        if _IS_WINDOWS:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
 
 
 def _patch_streamable_http_concurrency() -> None:
@@ -151,11 +234,13 @@ def _read_pid(port: int) -> int | None:
         return None
     try:
         pid = int(path.read_text().strip())
-        os.kill(pid, 0)  # check if process is alive
-        return pid
-    except (ValueError, ProcessLookupError, OSError):
+    except (ValueError, OSError):
         path.unlink(missing_ok=True)
         return None
+    if not _pid_alive(pid):  # NB: a Windows-safe liveness check, not os.kill(pid, 0)
+        path.unlink(missing_ok=True)
+        return None
+    return pid
 
 
 def _remove_pid(port: int) -> None:
@@ -168,15 +253,13 @@ def stop_backend(port: int = DEFAULT_PORT) -> bool:
     if pid is None:
         return False
     try:
-        os.kill(pid, signal.SIGTERM)
+        _terminate_pid(pid, force=False)
         for _ in range(20):
             time.sleep(0.25)
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if not _pid_alive(pid):
                 _remove_pid(port)
                 return True
-        os.kill(pid, signal.SIGKILL)
+        _terminate_pid(pid, force=True)
         _remove_pid(port)
         return True
     except OSError:
@@ -236,17 +319,21 @@ def _autostart_backend(host: str, port: int) -> None:
     lock_file_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(lock_file_path, "w") as lock_file:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            # Another proxy is already starting the backend -- wait for it
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            # By the time we get the lock, backend should be up
-            if _is_backend_alive(host, port):
-                return
-            # Other starter failed -- fall through and try ourselves
+        if not _try_lock_exclusive(lock_file):
+            # Another proxy holds the start lock -- wait for it to bring the
+            # backend up instead of racing. (POSIX previously took a blocking
+            # flock here; polling for readiness is equivalent and avoids needing
+            # a cross-platform blocking lock -- msvcrt's blocking mode only
+            # retries ~10x then fails. The port gate below is the real backstop.)
+            deadline = time.monotonic() + AUTOSTART_POLL_TIMEOUT
+            while time.monotonic() < deadline:
+                if _is_backend_alive(host, port):
+                    return
+                time.sleep(AUTOSTART_POLL_INTERVAL)
+            # Other starter didn't finish in time -- fall through and try
+            # ourselves; the port-availability gate below prevents a duplicate.
 
-        # Re-check after acquiring lock (another process may have started it)
+        # Re-check after the lock decision (another process may have started it)
         if _is_backend_alive(host, port):
             return
 
@@ -278,13 +365,22 @@ def _autostart_backend(host: str, port: int) -> None:
         ]
         logger.info("Auto-starting backend on port %d", port)
 
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        # Detach so the backend outlives this proxy. POSIX: a new session
+        # (setsid). Windows: start_new_session is rejected, so use creation flags
+        # for a new process group with no inherited console window.
+        popen_kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if _IS_WINDOWS:
+            popen_kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         _write_pid(port, proc.pid)
 
         deadline = time.monotonic() + AUTOSTART_POLL_TIMEOUT
@@ -305,13 +401,35 @@ def _autostart_backend(host: str, port: int) -> None:
         sys.exit(1)
 
 
+def _console_script(scripts_dir: str | None, *, windows: bool) -> str | None:
+    """Return the pyghidra-lite console-script path in ``scripts_dir``, or None.
+
+    ``scripts_dir`` is expected to come from ``sysconfig.get_path("scripts")``,
+    which already resolves the right directory for the platform and install
+    scheme. The only platform-dependent piece left is the Windows ``.exe``
+    suffix, passed in explicitly so both branches stay testable on any host.
+    """
+    if not scripts_dir:
+        return None
+    name = "pyghidra-lite.exe" if windows else "pyghidra-lite"
+    candidate = os.path.join(scripts_dir, name)
+    return candidate if os.path.isfile(candidate) else None
+
+
 def _find_serve_executable() -> str:
-    """Find the pyghidra-lite executable for auto-start."""
-    # sys.prefix points to the venv root when installed
-    candidate = os.path.join(sys.prefix, "bin", "pyghidra-lite")
-    if os.path.isfile(candidate):
-        return candidate
-    return shutil.which("pyghidra-lite") or "pyghidra-lite"
+    """Find the pyghidra-lite executable for auto-start.
+
+    Resolve via ``sysconfig.get_path("scripts")`` -- the directory pip installs
+    console scripts into for the *current* interpreter's scheme. It is correct
+    across venvs, conda, and framework builds on every OS (``bin/`` on POSIX,
+    ``Scripts\\`` on Windows, with a ``.exe`` suffix). The earlier
+    ``sys.prefix + "bin"`` guess only happened to hold for a plain POSIX venv;
+    that hardcoded layout was the root cause of the Windows auto-start miss.
+    Layouts the default scheme doesn't cover (e.g. ``--user`` installs) fall
+    through to the PATH lookup, then a bare name.
+    """
+    candidate = _console_script(sysconfig.get_path("scripts"), windows=os.name == "nt")
+    return candidate or shutil.which("pyghidra-lite") or "pyghidra-lite"
 
 
 async def run_proxy(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:

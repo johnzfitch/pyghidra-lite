@@ -932,3 +932,241 @@ def test_delete_ambiguous_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValueError, match="Ambiguous"):
         # "claude" is a substring of both handle names
         asyncio.run(server.delete("claude", None))
+
+
+# ---------------------------------------------------------------------------
+# Windows portability: Java preflight honors JAVA_HOME (not just PATH)
+# ---------------------------------------------------------------------------
+
+def _make_fake_java(tmp_path: Path) -> Path:
+    """Create a fake $JAVA_HOME/bin/java[.exe] and return the JAVA_HOME dir."""
+    java_home = tmp_path / "jdk21"
+    bin_dir = java_home / "bin"
+    bin_dir.mkdir(parents=True)
+    exe = bin_dir / ("java.exe" if os.name == "nt" else "java")
+    exe.write_text("#!/bin/sh\n")
+    return java_home
+
+
+def test_resolve_java_prefers_java_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    java_home = _make_fake_java(tmp_path)
+    monkeypatch.setenv("JAVA_HOME", str(java_home))
+    # Even if PATH has a java, JAVA_HOME wins.
+    monkeypatch.setattr(server.shutil, "which", lambda _name: "/usr/bin/java")
+
+    exe = "java.exe" if os.name == "nt" else "java"
+    assert server._resolve_java_executable() == str(java_home / "bin" / exe)
+
+
+def test_resolve_java_falls_back_to_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # JAVA_HOME set but no java under it -> fall back to PATH.
+    monkeypatch.setenv("JAVA_HOME", str(tmp_path / "empty"))
+    monkeypatch.setattr(server.shutil, "which", lambda _name: "/usr/bin/java")
+    assert server._resolve_java_executable() == "/usr/bin/java"
+
+
+def test_resolve_java_unset_java_home_uses_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    monkeypatch.setattr(server.shutil, "which", lambda _name: "/opt/java")
+    assert server._resolve_java_executable() == "/opt/java"
+
+
+def test_resolve_java_none_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    monkeypatch.setattr(server.shutil, "which", lambda _name: None)
+    assert server._resolve_java_executable() is None
+
+
+def test_check_prerequisites_invokes_resolved_java(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The version probe must run the JAVA_HOME-resolved binary, not bare 'java'."""
+    java_home = _make_fake_java(tmp_path)
+    monkeypatch.setenv("JAVA_HOME", str(java_home))
+    # No java on PATH at all -- the old code (which() + ["java", ...]) would fail.
+    monkeypatch.setattr(server.shutil, "which", lambda _name: None)
+
+    captured = {}
+
+    class _Result:
+        stdout = ""
+        stderr = 'openjdk version "21.0.1" 2023-10-17\n'
+
+    def fake_run(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return _Result()
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setattr(server, "find_ghidra_install", lambda _d: tmp_path / "ghidra")
+
+    server._check_prerequisites(None)
+
+    exe = "java.exe" if os.name == "nt" else "java"
+    assert captured["cmd"][0] == str(java_home / "bin" / exe)
+    assert captured["cmd"][1] == "-version"
+
+
+def test_check_prerequisites_missing_java_hint_mentions_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    monkeypatch.setattr(server.shutil, "which", lambda _name: None)
+
+    import click
+
+    with pytest.raises(click.ClickException) as exc:
+        server._check_prerequisites(None)
+    msg = str(exc.value)
+    assert "JAVA_HOME" in msg
+    assert "Windows" in msg
+
+
+# ---------------------------------------------------------------------------
+# Windows portability: O_NOFOLLOW does not exist on Windows (BUG #3)
+# ---------------------------------------------------------------------------
+
+def test_o_nofollow_constant_matches_platform() -> None:
+    assert getattr(os, "O_NOFOLLOW", 0) == server._O_NOFOLLOW
+
+
+def test_read_status_file_without_o_nofollow_attr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulate Windows (no os.O_NOFOLLOW): status reads must not raise.
+
+    The pre-fix call sites used `os.O_RDONLY | os.O_NOFOLLOW`, raising
+    AttributeError at attribute-access time -- which the surrounding
+    `except OSError` could not catch -- so the whole tool crashed.
+    """
+    project_id = "0123456789abcdef"
+    project_dir = tmp_path / "projects"
+    (project_dir / project_id).mkdir(parents=True)
+    (project_dir / project_id / ".analysis_status").write_text('{"phase": "done"}')
+
+    config = server.ServerConfig(project_dir=project_dir)
+    monkeypatch.setattr(server, "_server_config", config)
+
+    # Make the platform look like Windows for any code re-reading os.O_NOFOLLOW.
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    # And make the module constant reflect the Windows fallback.
+    monkeypatch.setattr(server, "_O_NOFOLLOW", 0)
+
+    assert server._read_status_file(project_id) == {"phase": "done"}
+
+
+# ---------------------------------------------------------------------------
+# Tool-call timeouts: a slow/wedged Ghidra call must not hang the client forever
+# (info(detail="full") on a large image, delete during a running analysis, etc.)
+# ---------------------------------------------------------------------------
+
+def test_tool_timeout_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PYGHIDRA_LITE_TOOL_TIMEOUT", raising=False)
+    assert server._tool_timeout() == server._DEFAULT_TOOL_TIMEOUT
+
+
+def test_tool_timeout_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "42")
+    assert server._tool_timeout() == 42.0
+
+
+def test_tool_timeout_invalid_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "not-a-number")
+    assert server._tool_timeout() == server._DEFAULT_TOOL_TIMEOUT
+
+
+def test_tool_timeout_zero_disables(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "0")
+    assert server._tool_timeout() == 0.0
+
+
+def test_run_bounded_returns_result() -> None:
+    assert asyncio.run(server._run_bounded("x", lambda: 7)) == 7
+
+
+def test_run_bounded_propagates_exception() -> None:
+    # delete()/binaries() rely on ValueError/RuntimeError propagating unchanged
+    # (e.g. "ambiguous match") -- the timeout wrapper must not swallow them.
+    def boom():
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError, match="nope"):
+        asyncio.run(server._run_bounded("x", boom))
+
+
+def test_run_bounded_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "0.05")
+
+    def slow():
+        time.sleep(1.0)
+        return "done"
+
+    with pytest.raises(RuntimeError, match="exceeded its .* budget"):
+        asyncio.run(server._run_bounded("slowtool", slow))
+
+
+def test_run_bounded_disabled_runs_to_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "0")
+
+    def slow():
+        time.sleep(0.1)
+        return "done"
+
+    assert asyncio.run(server._run_bounded("x", slow)) == "done"
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform: JVM option splitting must not mangle Windows backslash paths,
+# and _pid_alive must not use os.kill(pid, 0) (which kills the process on Windows)
+# ---------------------------------------------------------------------------
+
+def test_split_jvm_options_posix_eats_backslashes() -> None:
+    # Documents *why* Windows needs posix=False: the POSIX splitter treats each
+    # backslash as an escape, corrupting a Windows path.
+    assert server._split_jvm_options(r"-Duser.home=C:\Users\foo", posix=True) == [
+        "-Duser.home=C:Usersfoo"
+    ]
+
+
+def test_split_jvm_options_windows_preserves_backslashes() -> None:
+    assert server._split_jvm_options(
+        r"-Duser.home=C:\Users\foo -Xmx4g", posix=False
+    ) == [r"-Duser.home=C:\Users\foo", "-Xmx4g"]
+
+
+def test_split_jvm_options_default_follows_platform() -> None:
+    # Plain flags split identically in either mode; just assert it works.
+    assert server._split_jvm_options("-Xmx4g -Xms4g") == ["-Xmx4g", "-Xms4g"]
+
+
+def test_split_jvm_options_empty() -> None:
+    assert server._split_jvm_options("   ") == []
+
+
+def test_pid_alive_true_for_self() -> None:
+    assert server._pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_false_for_unused_pid() -> None:
+    assert server._pid_alive(2_000_000_000) is False
+
+
+def test_sanitize_redacts_backslash_escaped_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows path redaction: a KeyError-style repr doubles backslashes
+    (C:\\\\x), so the plain needle would miss it. The doubled form must redact
+    too. Exercised on any host via a dir component containing a literal backslash.
+    """
+    weird = tmp_path / "a\\b"  # literal backslash in the name (a Windows-ish path)
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=weird))
+    resolved = str(weird.resolve())
+    assert "\\" in resolved  # precondition: form contains a backslash
+    doubled = resolved.replace("\\", "\\\\")
+
+    out = server._sanitize_error_text(f"boom at {doubled}\\secret.gpr")
+    assert doubled not in out
+    assert "<project-dir>" in out

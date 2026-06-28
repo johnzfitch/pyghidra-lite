@@ -67,6 +67,15 @@ from pyghidra_lite.tools import GhidraTools
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# O_NOFOLLOW makes os.open refuse a symlinked path on POSIX, hardening these
+# status-file reads against a symlink swapped in to redirect them. It does not
+# exist on the Windows `os` module, so there we fall back to 0 (a no-op in the
+# bitwise OR): the read still proceeds, but without that anti-symlink check.
+# Resolving this once at import -- not as a bare `os.O_NOFOLLOW` inside each
+# os.open call -- is what keeps Windows from raising AttributeError before the
+# surrounding `except OSError` can run.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
 # Thread pool for running blocking Ghidra operations
 _import_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ghidra-import")
 
@@ -278,13 +287,22 @@ def _rmtree_warn(func, path, exc_info):
     logger.warning("rmtree failed on %s: %s", path, exc_info[1])
 
 
-def _split_jvm_options(value: str) -> list[str]:
-    """Best-effort split for JVM option environment variables."""
+def _split_jvm_options(value: str, *, posix: bool | None = None) -> list[str]:
+    """Best-effort split for JVM option environment variables.
+
+    On Windows (posix=False, auto-selected) backslashes are kept literal so a
+    path-bearing option like ``-Duser.home=C:\\runtime`` survives the round-trip.
+    The POSIX splitter treats each backslash as an escape and would mangle it to
+    ``C:runtime`` -- corrupting Ghidra's runtime home when _upsert_jvm_option
+    rewrites the env var. ``posix`` is exposed only so both modes are testable.
+    """
+    if posix is None:
+        posix = os.name != "nt"
     raw = value.strip()
     if not raw:
         return []
     try:
-        return shlex.split(raw)
+        return shlex.split(raw, posix=posix)
     except ValueError:
         return raw.split()
 
@@ -447,24 +465,47 @@ def _validate_minimum(name: str, value: int, minimum: int) -> int:
     return value
 
 
+_JAVA_INSTALL_HINT = (
+    "Install JDK 21 and either add it to PATH or set JAVA_HOME. "
+    "brew install openjdk@21 (macOS) / apt install openjdk-21-jdk (Ubuntu) / "
+    "winget install Microsoft.OpenJDK.21 (Windows)"
+)
+
+
+def _resolve_java_executable() -> str | None:
+    """Resolve the ``java`` launcher, preferring JAVA_HOME over PATH.
+
+    Ghidra/pyghidra honor JAVA_HOME, so a JDK that satisfies the runtime can be
+    invisible to a bare ``shutil.which("java")`` when it is not also on PATH --
+    a common Windows setup with a portable JDK. Resolve in the same priority the
+    JVM launcher uses: ``$JAVA_HOME/bin/java[.exe]`` first, then PATH. Returns
+    the resolved executable path, or None if neither yields one.
+    """
+    java_home = os.environ.get("JAVA_HOME", "").strip()
+    if java_home:
+        exe = "java.exe" if os.name == "nt" else "java"
+        candidate = Path(java_home) / "bin" / exe
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("java")
+
+
 def _check_prerequisites(ghidra_dir: str | None) -> None:
     """Verify Java 21+ and Ghidra are available before starting the backend."""
-    # Check Java is on PATH
-    java_path = shutil.which("java")
+    # Resolve the java launcher (JAVA_HOME first, then PATH) and use that exact
+    # path for both the existence check and the version probe below.
+    java_path = _resolve_java_executable()
     if not java_path:
-        raise click.ClickException(
-            "Java not found. Ghidra requires JDK 21+. "
-            "Install: brew install openjdk@21 (macOS) / apt install openjdk-21-jdk (Ubuntu)"
-        )
+        raise click.ClickException(f"Java not found. Ghidra requires JDK 21+. {_JAVA_INSTALL_HINT}")
 
     # Parse java version from stderr
     try:
         result = subprocess.run(
-            ["java", "-version"], capture_output=True, text=True, timeout=10
+            [java_path, "-version"], capture_output=True, text=True, timeout=10
         )
         version_output = result.stderr + result.stdout
     except Exception as exc:
-        raise click.ClickException(f"Failed to run 'java -version': {exc}")
+        raise click.ClickException(f"Failed to run '{java_path} -version': {exc}")
 
     import re
     match = re.search(r'"(\d+)', version_output)
@@ -475,8 +516,7 @@ def _check_prerequisites(ghidra_dir: str | None) -> None:
     major = int(match.group(1))
     if major < 21:
         raise click.ClickException(
-            f"Java {major} found, but Ghidra requires JDK 21+. "
-            "Install: brew install openjdk@21 (macOS) / apt install openjdk-21-jdk (Ubuntu)"
+            f"Java {major} found, but Ghidra requires JDK 21+. {_JAVA_INSTALL_HINT}"
         )
 
     # Check Ghidra installation
@@ -592,7 +632,7 @@ def _iter_disk_status():
             continue
         status_file = entry / ".analysis_status"
         try:
-            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(str(status_file), os.O_RDONLY | _O_NOFOLLOW)
         except OSError:
             continue
         try:
@@ -1040,6 +1080,12 @@ def _sanitize_error_text(text: str) -> str:
             forms.add(str(raw.expanduser().resolve()))
         for form in forms:
             redactions.append((form, repl))
+            # Exceptions whose str() is a repr (e.g. KeyError) escape backslashes,
+            # so a Windows path shows up doubled (C:\\x\\y) and the plain needle
+            # would miss it -- leaking the path. Redact that form too. No-op on
+            # POSIX (forward-slash paths contain no backslashes).
+            if "\\" in form:
+                redactions.append((form.replace("\\", "\\\\"), repl))
 
     add_root(cfg.project_dir or DEFAULT_PROJECT_DIR, "<project-dir>")
     add_root(cfg.runtime_home, "<runtime-home>")
@@ -1067,17 +1113,73 @@ def _with_handle(action: str, binary: str, op):
         return _guarded_tool_call(action, lambda: op(_get_handle(binary)))
 
 
+_DEFAULT_TOOL_TIMEOUT = 300.0
+
+
+def _tool_timeout() -> float:
+    """Per-tool-call wall-clock budget in seconds; <= 0 disables it.
+
+    Override with PYGHIDRA_LITE_TOOL_TIMEOUT. A single blocking Ghidra/JVM call
+    -- a full re-analysis, info(detail="full") on a large image, or delete
+    contending with a running analysis -- can otherwise grind for tens of
+    minutes. An MCP client awaiting that response has no way to time out, so it
+    just stalls silently. Bounding the call server-side turns that freeze into a
+    prompt, actionable error.
+    """
+    raw = os.environ.get("PYGHIDRA_LITE_TOOL_TIMEOUT")
+    if raw is None:
+        return _DEFAULT_TOOL_TIMEOUT
+    try:
+        return float(raw)
+    except ValueError:
+        return _DEFAULT_TOOL_TIMEOUT
+
+
+async def _run_bounded(action: str, fn):
+    """Run blocking tool work in a worker thread under a wall-clock budget.
+
+    Solves the two failure modes behind "the server just hangs forever":
+
+      1. Event-loop starvation: taking _backend_lock or doing JVM work directly
+         in an async tool body runs it ON the loop thread, so one slow call
+         freezes every client and all progress notifications. Offloading to a
+         thread keeps the loop responsive.
+      2. Unbounded client wait: the client has no way to abort a slow call, so a
+         wedged or pathologically expensive op stalls it indefinitely. wait_for
+         bounds it and raises a clear error instead.
+
+    The abandoned worker thread keeps running (Python cannot cancel a thread) and
+    holds _backend_lock until its JVM call returns; while it does, other calls
+    time out too rather than hang, and normal service resumes once it finishes.
+    """
+    timeout = _tool_timeout()
+    coro = asyncio.to_thread(fn)
+    if timeout <= 0:
+        return await coro
+    try:
+        return await asyncio.wait_for(coro, timeout)
+    except TimeoutError:
+        raise RuntimeError(
+            f"{action} exceeded its {timeout:g}s budget and was abandoned to keep "
+            f"the server responsive. The backend may still be busy (e.g. a full "
+            f're-analysis, or info(detail="full") on a large binary). Try a narrower '
+            f"call -- functions(query=...), code(<target>) -- or raise the "
+            f"PYGHIDRA_LITE_TOOL_TIMEOUT environment variable."
+        ) from None
+
+
 async def _with_handle_async(action: str, binary: str, op):
-    """Run a blocking handle operation off the event loop.
+    """Run a blocking handle operation off the event loop, under a timeout.
 
     Ghidra/JVM work (decompilation, reference walking, section iteration) is
-    synchronous and can take seconds. Executing it directly in an async tool
-    body would block the whole server -- under the shared HTTP transport a
-    single decompile would freeze progress notifications and every other
-    client's request. Offloading to a worker thread keeps the loop responsive;
-    `_backend_lock` still serializes JVM access across threads.
+    synchronous and can take seconds -- or, pathologically, many minutes
+    (info(detail="full") ranking every function by xref count on a large image).
+    Running it in the async body would block the whole server; an unbounded await
+    would also let one slow call stall the client forever. _run_bounded offloads
+    to a worker thread (loop stays responsive) and bounds it (client always gets
+    a response). `_backend_lock` still serializes JVM access across threads.
     """
-    return await asyncio.to_thread(_with_handle, action, binary, op)
+    return await _run_bounded(action, lambda: _with_handle(action, binary, op))
 
 
 def _tools_for(handle) -> GhidraTools:
@@ -1419,7 +1521,7 @@ def _read_status_file(project_id: str) -> dict:
         return {}
     status_file = Path(get_config().project_dir or DEFAULT_PROJECT_DIR) / project_id / ".analysis_status"
     try:
-        fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(str(status_file), os.O_RDONLY | _O_NOFOLLOW)
     except OSError:
         return {}
     try:
@@ -1469,7 +1571,7 @@ def _get_job_result(job_id: str) -> dict:
                     "Poll binaries(jobs=True) until complete.",
         ))
     try:
-        fd = os.open(str(result_file), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(str(result_file), os.O_RDONLY | _O_NOFOLLOW)
     except OSError as e:
         raise McpError(ErrorData(code=INTERNAL_ERROR,
                                  message=f"Failed to read result for {job_id!r}: {e}")) from e
@@ -1623,11 +1725,43 @@ def _estimate_analysis_time(binary_size_bytes: int, profile: str) -> int:
 
 
 def _pid_alive(pid: int) -> bool:
-    """Check if a process is still running.
+    """Check if a process is still running. Cross-platform.
 
-    Returns False only if the process is confirmed dead (ProcessLookupError).
-    PermissionError means the process exists but is owned by another user - treat as alive.
+    os.kill(pid, 0) is the POSIX idiom but is UNSAFE on Windows: os.kill there
+    routes any signal other than CTRL_C/CTRL_BREAK to TerminateProcess, so signal
+    0 would *kill* the process being probed. Use the Win32 API on Windows.
+    (Parallels proxy._pid_alive; kept independent so the backend doesn't import
+    the client-bridge module.)
+
+    POSIX: returns False only if confirmed dead; PermissionError means the
+    process exists but is owned by another user -- treated as alive.
     """
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Declare signatures so the HANDLE return isn't truncated to 32 bits on
+        # 64-bit Windows (which would corrupt the value and the CloseHandle).
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -1637,6 +1771,8 @@ def _pid_alive(pid: int) -> bool:
         # Process exists but we lack permission - assume it's alive
         logger.debug(f"Cannot verify pid {pid} (permission denied), assuming alive")
         return True
+    except OSError:
+        return False
 
 
 async def _run_worker(path: Path, analysis_id: str, profile: str, job: dict):
@@ -1856,7 +1992,7 @@ class ProjectWatcher:
 
     def _check_and_load(self, status_path: Path):
         try:
-            fd = os.open(str(status_path), os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(str(status_path), os.O_RDONLY | _O_NOFOLLOW)
         except OSError:
             return
         try:
@@ -1993,7 +2129,7 @@ async def _recover_in_progress_jobs():
                 continue  # Already loaded by eager_load
 
         try:
-            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(str(status_file), os.O_RDONLY | _O_NOFOLLOW)
         except OSError:
             continue
         try:
@@ -2608,8 +2744,11 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
             "analysis_id": disk_match["analysis_id"],
         }
 
-    with _backend_lock:
-        return _guarded_tool_call("delete", op)
+    def _run():
+        with _backend_lock:
+            return _guarded_tool_call("delete", op)
+
+    return await _run_bounded("delete", _run)
 
 
 @mcp.tool(annotations=_read_only("List Binaries"))
@@ -2731,8 +2870,11 @@ async def binaries(
 
         return results
 
-    with _backend_lock:
-        return _guarded_tool_call("binaries", op)
+    def _run():
+        with _backend_lock:
+            return _guarded_tool_call("binaries", op)
+
+    return await _run_bounded("binaries", _run)
 
 
 @mcp.tool(annotations=_read_only("Binary Info"))
@@ -3367,7 +3509,7 @@ async def xrefs(
         with _backend_lock:
             return _guarded_tool_call("xrefs", op)
 
-    return await asyncio.to_thread(_run)
+    return await _run_bounded("xrefs", _run)
 
 
 @mcp.tool(annotations=_read_only("Search Binary"))
@@ -3973,8 +4115,11 @@ def _kill_job(analysis_id: str) -> None:
         pid = job.get("pid")
         if pid:
             try:
+                # SIGTERM maps to TerminateProcess on Windows -- terminates the
+                # worker, which is the intent. A dead PID raises a non-
+                # ProcessLookupError OSError there, so catch OSError broadly.
                 os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
+            except OSError:
                 pass
 
 
@@ -4565,7 +4710,7 @@ def list_cmd(project_dir, as_json):
 
         status_data = {}
         try:
-            fd = os.open(str(status_file), os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(str(status_file), os.O_RDONLY | _O_NOFOLLOW)
         except OSError:
             pass
         else:
