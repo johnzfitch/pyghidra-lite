@@ -1116,3 +1116,57 @@ def test_run_bounded_disabled_runs_to_completion(monkeypatch: pytest.MonkeyPatch
         return "done"
 
     assert asyncio.run(server._run_bounded("x", slow)) == "done"
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform: JVM option splitting must not mangle Windows backslash paths,
+# and _pid_alive must not use os.kill(pid, 0) (which kills the process on Windows)
+# ---------------------------------------------------------------------------
+
+def test_split_jvm_options_posix_eats_backslashes() -> None:
+    # Documents *why* Windows needs posix=False: the POSIX splitter treats each
+    # backslash as an escape, corrupting a Windows path.
+    assert server._split_jvm_options(r"-Duser.home=C:\Users\foo", posix=True) == [
+        "-Duser.home=C:Usersfoo"
+    ]
+
+
+def test_split_jvm_options_windows_preserves_backslashes() -> None:
+    assert server._split_jvm_options(
+        r"-Duser.home=C:\Users\foo -Xmx4g", posix=False
+    ) == [r"-Duser.home=C:\Users\foo", "-Xmx4g"]
+
+
+def test_split_jvm_options_default_follows_platform() -> None:
+    # Plain flags split identically in either mode; just assert it works.
+    assert server._split_jvm_options("-Xmx4g -Xms4g") == ["-Xmx4g", "-Xms4g"]
+
+
+def test_split_jvm_options_empty() -> None:
+    assert server._split_jvm_options("   ") == []
+
+
+def test_pid_alive_true_for_self() -> None:
+    assert server._pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_false_for_unused_pid() -> None:
+    assert server._pid_alive(2_000_000_000) is False
+
+
+def test_sanitize_redacts_backslash_escaped_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows path redaction: a KeyError-style repr doubles backslashes
+    (C:\\\\x), so the plain needle would miss it. The doubled form must redact
+    too. Exercised on any host via a dir component containing a literal backslash.
+    """
+    weird = tmp_path / "a\\b"  # literal backslash in the name (a Windows-ish path)
+    monkeypatch.setattr(server, "_server_config", server.ServerConfig(project_dir=weird))
+    resolved = str(weird.resolve())
+    assert "\\" in resolved  # precondition: form contains a backslash
+    doubled = resolved.replace("\\", "\\\\")
+
+    out = server._sanitize_error_text(f"boom at {doubled}\\secret.gpr")
+    assert doubled not in out
+    assert "<project-dir>" in out

@@ -287,13 +287,22 @@ def _rmtree_warn(func, path, exc_info):
     logger.warning("rmtree failed on %s: %s", path, exc_info[1])
 
 
-def _split_jvm_options(value: str) -> list[str]:
-    """Best-effort split for JVM option environment variables."""
+def _split_jvm_options(value: str, *, posix: bool | None = None) -> list[str]:
+    """Best-effort split for JVM option environment variables.
+
+    On Windows (posix=False, auto-selected) backslashes are kept literal so a
+    path-bearing option like ``-Duser.home=C:\\runtime`` survives the round-trip.
+    The POSIX splitter treats each backslash as an escape and would mangle it to
+    ``C:runtime`` -- corrupting Ghidra's runtime home when _upsert_jvm_option
+    rewrites the env var. ``posix`` is exposed only so both modes are testable.
+    """
+    if posix is None:
+        posix = os.name != "nt"
     raw = value.strip()
     if not raw:
         return []
     try:
-        return shlex.split(raw)
+        return shlex.split(raw, posix=posix)
     except ValueError:
         return raw.split()
 
@@ -1071,6 +1080,12 @@ def _sanitize_error_text(text: str) -> str:
             forms.add(str(raw.expanduser().resolve()))
         for form in forms:
             redactions.append((form, repl))
+            # Exceptions whose str() is a repr (e.g. KeyError) escape backslashes,
+            # so a Windows path shows up doubled (C:\\x\\y) and the plain needle
+            # would miss it -- leaking the path. Redact that form too. No-op on
+            # POSIX (forward-slash paths contain no backslashes).
+            if "\\" in form:
+                redactions.append((form.replace("\\", "\\\\"), repl))
 
     add_root(cfg.project_dir or DEFAULT_PROJECT_DIR, "<project-dir>")
     add_root(cfg.runtime_home, "<runtime-home>")
@@ -1710,11 +1725,43 @@ def _estimate_analysis_time(binary_size_bytes: int, profile: str) -> int:
 
 
 def _pid_alive(pid: int) -> bool:
-    """Check if a process is still running.
+    """Check if a process is still running. Cross-platform.
 
-    Returns False only if the process is confirmed dead (ProcessLookupError).
-    PermissionError means the process exists but is owned by another user - treat as alive.
+    os.kill(pid, 0) is the POSIX idiom but is UNSAFE on Windows: os.kill there
+    routes any signal other than CTRL_C/CTRL_BREAK to TerminateProcess, so signal
+    0 would *kill* the process being probed. Use the Win32 API on Windows.
+    (Parallels proxy._pid_alive; kept independent so the backend doesn't import
+    the client-bridge module.)
+
+    POSIX: returns False only if confirmed dead; PermissionError means the
+    process exists but is owned by another user -- treated as alive.
     """
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Declare signatures so the HANDLE return isn't truncated to 32 bits on
+        # 64-bit Windows (which would corrupt the value and the CloseHandle).
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -1724,6 +1771,8 @@ def _pid_alive(pid: int) -> bool:
         # Process exists but we lack permission - assume it's alive
         logger.debug(f"Cannot verify pid {pid} (permission denied), assuming alive")
         return True
+    except OSError:
+        return False
 
 
 async def _run_worker(path: Path, analysis_id: str, profile: str, job: dict):
@@ -4066,8 +4115,11 @@ def _kill_job(analysis_id: str) -> None:
         pid = job.get("pid")
         if pid:
             try:
+                # SIGTERM maps to TerminateProcess on Windows -- terminates the
+                # worker, which is the intent. A dead PID raises a non-
+                # ProcessLookupError OSError there, so catch OSError broadly.
                 os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
+            except OSError:
                 pass
 
 
