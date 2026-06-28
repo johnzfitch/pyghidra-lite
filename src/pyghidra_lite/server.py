@@ -67,11 +67,13 @@ from pyghidra_lite.tools import GhidraTools
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# O_NOFOLLOW refuses a symlinked path on POSIX; it does not exist on Windows,
-# where symlink creation is privileged anyway. Fall back to 0 so the bitwise
-# OR is a no-op there. (Resolving this at attribute-access time -- not as a bare
-# `os.O_NOFOLLOW` inside each os.open call -- is what keeps Windows from raising
-# AttributeError before the surrounding `except OSError` can run.)
+# O_NOFOLLOW makes os.open refuse a symlinked path on POSIX, hardening these
+# status-file reads against a symlink swapped in to redirect them. It does not
+# exist on the Windows `os` module, so there we fall back to 0 (a no-op in the
+# bitwise OR): the read still proceeds, but without that anti-symlink check.
+# Resolving this once at import -- not as a bare `os.O_NOFOLLOW` inside each
+# os.open call -- is what keeps Windows from raising AttributeError before the
+# surrounding `except OSError` can run.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 # Thread pool for running blocking Ghidra operations
