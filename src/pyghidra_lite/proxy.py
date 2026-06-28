@@ -305,11 +305,25 @@ def _autostart_backend(host: str, port: int) -> None:
         sys.exit(1)
 
 
+def _serve_executable_in(prefix: str, *, windows: bool) -> str | None:
+    """Return the console-script path under ``prefix`` if it exists, else None.
+
+    Console scripts land in ``bin/`` on POSIX but ``Scripts\\`` on Windows, where
+    they also carry a ``.exe`` suffix -- so both the directory and the filename
+    vary by platform. Kept pure (platform passed in) so both branches are
+    testable on any host.
+    """
+    scripts_dir = "Scripts" if windows else "bin"
+    exe = "pyghidra-lite.exe" if windows else "pyghidra-lite"
+    candidate = os.path.join(prefix, scripts_dir, exe)
+    return candidate if os.path.isfile(candidate) else None
+
+
 def _find_serve_executable() -> str:
     """Find the pyghidra-lite executable for auto-start."""
-    # sys.prefix points to the venv root when installed
-    candidate = os.path.join(sys.prefix, "bin", "pyghidra-lite")
-    if os.path.isfile(candidate):
+    # sys.prefix points to the venv root when installed.
+    candidate = _serve_executable_in(sys.prefix, windows=os.name == "nt")
+    if candidate:
         return candidate
     return shutil.which("pyghidra-lite") or "pyghidra-lite"
 

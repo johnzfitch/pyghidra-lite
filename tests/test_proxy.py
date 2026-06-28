@@ -16,6 +16,7 @@ from pyghidra_lite.proxy import (
     _pid_path,
     _read_pid,
     _remove_pid,
+    _serve_executable_in,
     _write_pid,
 )
 
@@ -99,6 +100,46 @@ class TestFindExecutable:
         monkeypatch.setattr("sys.prefix", str(tmp_path))
         with patch("shutil.which", return_value=None):
             assert _find_serve_executable() == "pyghidra-lite"
+
+
+class TestServeExecutableIn:
+    """Platform-parameterized resolution -- tested directly so both the POSIX
+    bin/ and Windows Scripts\\ branches are exercised on any host. Patching the
+    global os.name instead would corrupt pathlib's flavour and crash tmp_path
+    cleanup, so the platform is passed in explicitly.
+    """
+
+    def test_windows_finds_scripts_exe(self, tmp_path: Path):
+        scripts = tmp_path / "Scripts"
+        scripts.mkdir()
+        exe = scripts / "pyghidra-lite.exe"
+        exe.write_text("MZ")
+        expected = os.path.join(str(tmp_path), "Scripts", "pyghidra-lite.exe")
+        assert _serve_executable_in(str(tmp_path), windows=True) == expected
+
+    def test_windows_ignores_posix_bin(self, tmp_path: Path):
+        # A POSIX-style bin/pyghidra-lite must NOT satisfy the Windows lookup.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "pyghidra-lite").write_text("#!/bin/sh")
+        assert _serve_executable_in(str(tmp_path), windows=True) is None
+
+    def test_posix_finds_bin(self, tmp_path: Path):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "pyghidra-lite").write_text("#!/bin/sh")
+        expected = os.path.join(str(tmp_path), "bin", "pyghidra-lite")
+        assert _serve_executable_in(str(tmp_path), windows=False) == expected
+
+    def test_posix_ignores_windows_exe(self, tmp_path: Path):
+        scripts = tmp_path / "Scripts"
+        scripts.mkdir()
+        (scripts / "pyghidra-lite.exe").write_text("MZ")
+        assert _serve_executable_in(str(tmp_path), windows=False) is None
+
+    def test_missing_returns_none(self, tmp_path: Path):
+        assert _serve_executable_in(str(tmp_path), windows=True) is None
+        assert _serve_executable_in(str(tmp_path), windows=False) is None
 
 
 class TestBackendAlive:
