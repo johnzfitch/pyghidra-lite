@@ -1052,3 +1052,67 @@ def test_read_status_file_without_o_nofollow_attr(
     monkeypatch.setattr(server, "_O_NOFOLLOW", 0)
 
     assert server._read_status_file(project_id) == {"phase": "done"}
+
+
+# ---------------------------------------------------------------------------
+# Tool-call timeouts: a slow/wedged Ghidra call must not hang the client forever
+# (info(detail="full") on a large image, delete during a running analysis, etc.)
+# ---------------------------------------------------------------------------
+
+def test_tool_timeout_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PYGHIDRA_LITE_TOOL_TIMEOUT", raising=False)
+    assert server._tool_timeout() == server._DEFAULT_TOOL_TIMEOUT
+
+
+def test_tool_timeout_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "42")
+    assert server._tool_timeout() == 42.0
+
+
+def test_tool_timeout_invalid_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "not-a-number")
+    assert server._tool_timeout() == server._DEFAULT_TOOL_TIMEOUT
+
+
+def test_tool_timeout_zero_disables(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "0")
+    assert server._tool_timeout() == 0.0
+
+
+def test_run_bounded_returns_result() -> None:
+    assert asyncio.run(server._run_bounded("x", lambda: 7)) == 7
+
+
+def test_run_bounded_propagates_exception() -> None:
+    # delete()/binaries() rely on ValueError/RuntimeError propagating unchanged
+    # (e.g. "ambiguous match") -- the timeout wrapper must not swallow them.
+    def boom():
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError, match="nope"):
+        asyncio.run(server._run_bounded("x", boom))
+
+
+def test_run_bounded_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "0.05")
+
+    def slow():
+        time.sleep(1.0)
+        return "done"
+
+    with pytest.raises(RuntimeError, match="exceeded its .* budget"):
+        asyncio.run(server._run_bounded("slowtool", slow))
+
+
+def test_run_bounded_disabled_runs_to_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    monkeypatch.setenv("PYGHIDRA_LITE_TOOL_TIMEOUT", "0")
+
+    def slow():
+        time.sleep(0.1)
+        return "done"
+
+    assert asyncio.run(server._run_bounded("x", slow)) == "done"
