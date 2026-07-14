@@ -1936,6 +1936,7 @@ def start_project_watcher(
     """
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
+    from watchdog.observers.polling import PollingObserver
 
     handler = ProjectWatcher(backend, projects_dir, loop)
 
@@ -1946,7 +1947,9 @@ def start_project_watcher(
         def on_modified(self, event):
             handler.on_modified(event)
 
-    observer = Observer()
+    # FSEvents cannot start in some sandboxed macOS MCP hosts. Its failure
+    # happens in a background thread, so it cannot be caught around start().
+    observer = PollingObserver() if sys.platform == "darwin" else Observer()
     observer.schedule(_Handler(), str(projects_dir), recursive=True)
     observer.daemon = True
     observer.start()
