@@ -445,6 +445,16 @@ class TestProjectWatcher:
         observer.stop()
         observer.join(timeout=2)
 
+    def test_start_project_watcher_uses_polling_on_macos(self, tmp_path, monkeypatch):
+        """macOS uses polling because FSEvents may be blocked by MCP sandboxes."""
+        from watchdog.observers.polling import PollingObserver
+
+        monkeypatch.setattr(server.sys, "platform", "darwin")
+        observer = server.start_project_watcher(MagicMock(), tmp_path, MagicMock())
+        assert isinstance(observer, PollingObserver)
+        observer.stop()
+        observer.join(timeout=2)
+
 
 # =============================================================================
 # Phase 4/5: Crash Recovery
