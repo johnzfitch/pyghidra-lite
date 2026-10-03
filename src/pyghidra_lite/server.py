@@ -48,7 +48,13 @@ from pyghidra_lite.backend import (
     compute_unit_id_streaming,
     find_ghidra_install,
     make_analysis_id,
+    open_project_read_only,
     parse_analysis_id,
+)
+from pyghidra_lite.project_locks import (
+    ProjectLockedError,
+    is_project_lock_held,
+    sweep_stale_locks,
 )
 from pyghidra_lite.models import (
     AnalysisProfile,
@@ -938,7 +944,30 @@ def _load_project_into_backend(
             logger.warning("Ghidra project missing for analysis_id=%s at %s", analysis_id, project_dir)
             return None
 
-        project = GhidraProject.openProject(project_str, project_id, True)
+        # A completed analysis only needs reading unless write tools are on, so
+        # open it as a lock-free view: an idle server must not hold the
+        # exclusive project lock and block other servers or headless scripts.
+        # With --allow-write, take the lock, but fall back to a view when a
+        # live process already owns it (annotate then reports why it can't save).
+        project = None
+        if get_config().allow_write:
+            if is_project_lock_held(project_dir, project_id):
+                logger.info(
+                    "Project %s is locked by another process; opening read-only", project_id
+                )
+            else:
+                try:
+                    project = GhidraProject.openProject(project_str, project_id, True)
+                except Exception as exc:
+                    if not is_project_lock_held(project_dir, project_id):
+                        raise
+                    logger.info(
+                        "Project %s was locked by another process (%s); opening read-only",
+                        project_id, exc,
+                    )
+        if project is None:
+            project = open_project_read_only(project_dir, project_id)
+        read_only = getattr(project, "read_only", False)
         backend._projects[analysis_id] = project
 
         root_folder = project.getRootFolder()
@@ -946,7 +975,7 @@ def _load_project_into_backend(
             if str(domain_file.getContentType()) != "Program":
                 continue
             prog_name = domain_file.getName()
-            program = project.openProgram("/", prog_name, False)
+            program = project.openProgram("/", prog_name, read_only)
             handle = backend._init_program_handle(program, prog_name, profile=profile, unit_id=unit_id)
             handle.analyzed = True
             backend.programs[prog_name] = handle
@@ -955,7 +984,10 @@ def _load_project_into_backend(
             if append_history:
                 binary_name = status.get("binary_name", prog_name)
                 _append_history(analysis_id, binary_name)
-            logger.info("Loaded %s from project cache (analysis_id=%s)", prog_name, analysis_id)
+            logger.info(
+                "Loaded %s from project cache (analysis_id=%s%s)",
+                prog_name, analysis_id, ", read-only" if read_only else "",
+            )
             return handle
 
         logger.warning("No Program entries found in project %s", analysis_id)
@@ -1406,11 +1438,12 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
     except Exception as e:
         logger.warning(f"Failed to start filesystem watcher: {e}")
 
-    # Clean stale Ghidra lock files from previous sessions
-    for lock in projects_dir.glob("*/*.lock"):
-        lock.unlink(missing_ok=True)
-    for lock in projects_dir.glob("*/*.lock~"):
-        lock.unlink(missing_ok=True)
+    # Clean stale Ghidra lock files from previous sessions. Other servers and
+    # headless Ghidra scripts may share this directory, so only locks that no
+    # live process holds are removed; a live one is left alone (unlinking it
+    # raised WinError 32 on Windows and killed startup, and on POSIX silently
+    # broke the owner's exclusive access).
+    await asyncio.to_thread(sweep_stale_locks, projects_dir)
 
     # Recover any in-progress jobs from previous server run
     await _recover_in_progress_jobs()
@@ -2201,7 +2234,11 @@ async def _autopurge_stale_projects() -> None:
                     active_ids = set(get_backend()._projects.keys()) if _backend else set()
                 if analysis_id in active_ids:
                     continue  # in-use -- skip purge
-                shutil.rmtree(_safe_project_path(project_base, project_id))
+                project_path = _safe_project_path(project_base, project_id)
+                if is_project_lock_held(project_path, project_id):
+                    logger.info("Skipping autopurge of %s: locked by another process", analysis_id)
+                    continue
+                shutil.rmtree(project_path)
                 purged.append((analysis_id, data.get("binary_name", analysis_id)))
                 logger.info("Autopurged %s (%s), last opened %s", data.get("binary_name", analysis_id), analysis_id, last_open)
             except OSError as e:
@@ -2458,6 +2495,8 @@ async def load(
                     disk_match["project_id"],
                 )
                 if proj_path.exists():
+                    if is_project_lock_held(proj_path, disk_match["project_id"]):
+                        raise ProjectLockedError(proj_path, disk_match["project_id"])
                     shutil.rmtree(proj_path, onerror=_rmtree_warn)
             async with (_active_jobs_lock or nullcontext()):
                 _kill_job(analysis_id)
@@ -2717,13 +2756,20 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
         if handle is not None:
             unit_id = handle.unit_id
             analysis_id = handle.analysis_id
+            project_id = analysis_id if (project_base / analysis_id).exists() else unit_id
+            project_path = _safe_project_path(project_base, project_id)
+            # A read-only view holds no lock, so a live lock here is another
+            # process's; never delete a project out from under it.
+            if getattr(backend._projects.get(analysis_id), "read_only", False) and (
+                is_project_lock_held(project_path, project_id)
+            ):
+                raise ProjectLockedError(project_path, project_id)
             _capabilities.pop(unit_id, None)
             deleted = backend.delete_program(handle.name)
             if not deleted:
                 raise RuntimeError(f"Failed to delete {handle.name!r} from Ghidra project")
             _kill_job(analysis_id)
-            project_id = analysis_id if (project_base / analysis_id).exists() else unit_id
-            shutil.rmtree(_safe_project_path(project_base, project_id), onerror=_rmtree_warn)
+            shutil.rmtree(project_path, onerror=_rmtree_warn)
             return {"deleted": handle.name, "unit_id": unit_id, "analysis_id": analysis_id}
 
         # Disk-only (errored, incomplete, never loaded)
@@ -2735,6 +2781,8 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
         if not project_dir.exists():
             raise ValueError(f"Project not found: {disk_match['project_id']!r}")
 
+        if is_project_lock_held(project_dir, disk_match["project_id"]):
+            raise ProjectLockedError(project_dir, disk_match["project_id"])
         binary_name = _read_status_file(disk_match["project_id"]).get("binary_name", disk_match["analysis_id"])
         _kill_job(disk_match["analysis_id"])
         shutil.rmtree(project_dir, onerror=_rmtree_warn)
