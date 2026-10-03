@@ -16,6 +16,13 @@ from typing import TYPE_CHECKING
 import pyghidra
 
 from pyghidra_lite.models import AnalysisProfile, Provenance
+from pyghidra_lite.project_locks import (
+    ProjectLockedError,
+    clear_stale_lock,
+    is_project_lock_held,
+    lock_files,
+    read_lock_info,
+)
 
 if TYPE_CHECKING:
     from ghidra.app.decompiler import DecompInterface
@@ -251,6 +258,98 @@ def _ensure_headless_awt() -> None:
         os.environ["_JAVA_OPTIONS"] = (opts + " " + " ".join(additions)).strip()
 
 
+class ReadOnlyProjectView:
+    """Lock-free, read-only view of an on-disk Ghidra project.
+
+    Ghidra lets any number of processes open a project as a *view*
+    (DefaultProjectData with isInWritableProject=False): no ``.lock`` file is
+    created and no channel lock is taken, so a view never blocks the process
+    that owns the project, nor another pyghidra-lite instance. Programs come
+    from DomainFile.getReadOnlyDomainObject and reflect the project's last
+    save. Decompile, xrefs, search and listing work; persisting changes does
+    not (save() raises).
+
+    Exposes the subset of GhidraProject that GhidraBackend uses
+    (getRootFolder / openProgram / close / save), so it can live in
+    GhidraBackend._projects alongside writable projects.
+    """
+
+    read_only = True
+
+    def __init__(self, project_dir: Path, project_key: str):
+        """project_dir is the directory holding <project_key>.gpr / .rep / .lock."""
+        from ghidra.framework.data import DefaultProjectData
+        from ghidra.framework.model import ProjectLocator
+        from java.lang import Object as JObject
+
+        self.project_dir = Path(project_dir)
+        self.project_key = project_key
+        locator = ProjectLocator(str(self.project_dir.absolute()), project_key)
+        self._data = DefaultProjectData(locator, False, False)
+        self._consumer = JObject()
+        self._open: list = []
+
+    def getRootFolder(self):
+        return self._data.getRootFolder()
+
+    def openProgram(self, folder: str, name: str, read_only: bool = True):
+        from ghidra.framework.model import DomainFile
+        from ghidra.util.task import TaskMonitor
+
+        domain_folder = self._data.getFolder(folder) if folder not in ("", "/") else self._data.getRootFolder()
+        domain_file = domain_folder.getFile(name) if domain_folder is not None else None
+        if domain_file is None:
+            raise FileNotFoundError(f"{name!r} not found in project {self.project_key!r}")
+        program = domain_file.getReadOnlyDomainObject(
+            self._consumer, DomainFile.DEFAULT_VERSION, TaskMonitor.DUMMY
+        )
+        self._open.append(program)
+        return program
+
+    def save(self, program) -> None:
+        if is_project_lock_held(self.project_dir, self.project_key):
+            raise ProjectLockedError(
+                self.project_dir,
+                self.project_key,
+                read_lock_info(lock_files(self.project_dir, self.project_key)[0]),
+            )
+        raise RuntimeError(
+            f"Project {self.project_key!r} is open read-only (lock-free view); changes "
+            "cannot be saved. Evict it and reload with --allow-write to open it writable."
+        )
+
+    def close(self, program=None) -> None:
+        if program is not None:
+            with _suppress_java_errors():
+                program.release(self._consumer)
+            if program in self._open:
+                self._open.remove(program)
+            return
+        for p in self._open:
+            with _suppress_java_errors():
+                p.release(self._consumer)
+        self._open.clear()
+        with _suppress_java_errors():
+            self._data.close()
+
+
+class _suppress_java_errors:
+    """Context manager: log and swallow exceptions from Java cleanup calls."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc is not None:
+            logger.debug("ignored error during read-only view cleanup: %s", exc)
+        return True
+
+
+def open_project_read_only(project_dir: Path, project_key: str) -> ReadOnlyProjectView:
+    """Open the project at <project_dir>/<project_key> as a lock-free view."""
+    return ReadOnlyProjectView(project_dir, project_key)
+
+
 class GhidraBackend:
     """Manages Ghidra project and program analysis.
 
@@ -369,9 +468,15 @@ class GhidraBackend:
                 return GhidraProject.createProject(project_str, project_key, False)
         except Exception as e:
             if "LockException" in str(type(e).__name__) or "Unable to lock" in str(e):
-                lock_file = project_path / f"{project_key}.lock"
+                lock_file, _ = lock_files(project_path, project_key)
+                # Only a lock no live process holds may be removed; deleting a
+                # live owner's lock lets two JVMs write the same project.
+                if is_project_lock_held(project_path, project_key):
+                    raise ProjectLockedError(
+                        project_path, project_key, read_lock_info(lock_file)
+                    ) from e
                 logger.warning(f"Stale lock detected for {project_key}, removing: {lock_file}")
-                lock_file.unlink(missing_ok=True)
+                clear_stale_lock(project_path, project_key)
                 try:
                     if locator.exists():
                         return GhidraProject.openProject(project_str, project_key, True)
@@ -410,7 +515,11 @@ class GhidraBackend:
                 continue
 
             try:
-                project = self._get_or_create_project_for_key(project_key)
+                try:
+                    project = self._get_or_create_project_for_key(project_key)
+                except ProjectLockedError as locked:
+                    logger.info("%s; opening it read-only", locked)
+                    project = open_project_read_only(project_path, project_key)
                 self._projects[analysis_id] = project
 
                 # Load programs from this project
@@ -555,6 +664,13 @@ class GhidraBackend:
                     project_key = legacy_key
         project_path = self.project_dir / project_key
         if project_path.exists():
+            # Our own handles were closed above, so a live lock now belongs to
+            # another process; deleting under it would corrupt that session.
+            if is_project_lock_held(project_path, project_key):
+                raise ProjectLockedError(
+                    project_path, project_key,
+                    read_lock_info(lock_files(project_path, project_key)[0]),
+                )
             def _rmtree_warn(func, path, exc_info):
                 logger.warning("rmtree failed on %s: %s", path, exc_info[1])
             shutil.rmtree(project_path, onerror=_rmtree_warn)
@@ -1020,7 +1136,10 @@ class GhidraBackend:
             try:
                 df = handle.program.getDomainFile()
                 project.close(handle.program)
-                df.delete()
+                # A read-only view can't delete domain files; the caller
+                # removes the whole project directory instead.
+                if not getattr(project, "read_only", False):
+                    df.delete()
                 del self.programs[name]
                 logger.info(f"Deleted: {name}")
 
