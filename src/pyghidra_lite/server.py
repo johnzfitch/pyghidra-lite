@@ -4502,7 +4502,7 @@ def cli():
 )
 @click.option("-p", "--port", type=int, default=8000)
 @click.option("--host", type=str, default="127.0.0.1")
-@click.option("--profile", type=click.Choice(["fast", "default", "deep"]), default="fast",
+@click.option("--profile", type=click.Choice(["fast", "default", "deep"]), default="fast", envvar="PYGHIDRA_LITE_DEFAULT_PROFILE",
               help="Default analysis profile (fast recommended for MCP timeout limits)")
 @click.option("--project-name", type=str, default="pyghidra_lite",
               help="Ghidra project name")
