@@ -317,13 +317,13 @@ def test_tool_schemas_publish_enum_and_bounds() -> None:
     assert functions_schema["properties"]["type"]["enum"] == [
         "all", "swift", "objc", "imports", "exports", "types", "got", "dylibs"
     ]
-    assert code_schema["properties"]["what"]["enum"] == ["decompile", "asm", "bytes", "string"]
+    assert code_schema["properties"]["what"]["enum"] == ["decompile", "asm", "bytes", "string", "pcode"]
     assert xrefs_schema["properties"]["direction"]["enum"] == ["to", "from"]
     assert xrefs_schema["properties"]["depth"]["maximum"] == 5
     assert xrefs_schema["properties"]["target"]["anyOf"][1]["maxItems"] == 20
     assert search_schema["required"] == ["binary", "query"]
     assert search_schema["properties"]["type"]["enum"] == [
-        "strings", "symbols", "bytes", "all", "blob", "extract"
+        "strings", "symbols", "bytes", "all", "blob", "extract", "types"
     ]
     assert search_schema["properties"]["mode"]["enum"] == ["indexed", "deep"]
 

@@ -8,6 +8,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`pyghidra-lite doctor`**: read-only environment diagnosis (Python deps,
+  mcp<2, Ghidra install/version, JDK major vs the install's declared range and
+  JDK-vs-JRE, native decompiler for this host, project dir incl. Ghidra 12's
+  dot-component rule, live/stale project locks, shared backend). `--json`;
+  exits 1 when analysis would fail.
+- **`code(what="pcode")`**: decompiler SSA high p-code grouped by basic block
+  (`B0 -> B1,B2:` headers). Every value prints as `name.id` and is defined
+  once, so the def-use / value-flow graph is readable directly.
+- **`search(type="types")`**: recovered/imported data types by name, with
+  struct/union members as `offset type name`, enum values, typedef bases and
+  function-definition prototypes.
+- **`code(what="bytes")`** now also returns `file_offset` and `block`.
+
+### Changed
+- **Token usage**: tool results are compact JSON in a single text block
+  (FastMCP pretty-printed them and split lists into one block per item);
+  `binaries`, `functions` and `code` no longer also send a duplicate
+  `structuredContent` copy; false/empty fields are omitted; call-graph edges
+  are `"caller -> callee"` strings, de-duplicated. Measured over 28 calls on a
+  sample binary: 49,840 -> 33,428 characters (-33%); deep call graphs -64%.
+- `code(what="asm")` returns `"addr: instruction"` lines, up to 400, and says
+  when it truncated (it silently stopped at 100 before).
+- Default project dir is `~/pyghidra-lite/projects` (Windows:
+  `%LOCALAPPDATA%\pyghidra-lite\projects`); an existing
+  `~/.local/share/pyghidra-lite/projects` is still used.
+- Capability tags match name tokens instead of substrings.
+- `mcp` dependency capped at `<2`.
+
+### Fixed
+- Names that are valid hex (`add`, `dead`, `face`, ...) resolved to that
+  address instead of the symbol in `xrefs`, `code` callers and `bytes`.
+- `code` (decompile) always returned an empty `callers` list (it compared
+  ref types to `"call"`; Ghidra's are `UNCONDITIONAL_CALL` etc.).
+- Call graphs merged distinct functions that share a name.
+- Capability-tag false positives: `GetCPInfo` -> network, `TlsGetValue` ->
+  crypto, `CreateThread` -> file, `destroy_*` -> crypto.
+- Fresh installs with Ghidra 12 failed at startup (default project dir had a
+  dot-leading `.local` component).
+- `pyghidra-lite import` (and real-JVM test runs) never exited after
+  finishing: a non-daemon Ghidra JVM thread blocked interpreter shutdown.
+- Windows: the stdio proxy failed to import (`fcntl`) and its port probe
+  read a free port as busy, so the backend was never autostarted; error
+  redaction missed backslash-escaped paths; status-file writes raced with
+  scanners; `_pid_alive` crashed on stale PIDs.
+- Decompiled code carried CRLF line endings on Windows.
 - **Write audit journal**: every `annotate` write — and every declined/failed
   attempt — is recorded in `annotate_audit.jsonl` beside the on-disk projects,
   capturing `old -> new` (so it doubles as an undo log). Since MCP elicitation

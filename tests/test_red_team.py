@@ -23,9 +23,9 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import symlink_or_skip
 from mcp.server.transport_security import TransportSecurityMiddleware
 
-from conftest import symlink_or_skip
 from pyghidra_lite import server
 from pyghidra_lite.backend import parse_analysis_id
 
