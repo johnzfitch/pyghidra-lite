@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (not into callees). On ws2_32.dll `WSAStartup`, `param_2` is 1.9K chars vs
   ~22K for the full listing, which hits the 400-line cap on real functions.
 
+### Fixed
+- `PYGHIDRA_LITE_DEFAULT_PROFILE` was ignored under `serve`: its `--profile`
+  default (`fast`) always overwrote the env value.
+
+### Docs
+- README: plugin-first Quick Start, a Configuration reference (every env var
+  and flag), Windows Ghidra setup, and a corrected Architecture section (the
+  backend no longer idle-exits; run `pyghidra-lite stop` after upgrading).
+
 ## [0.8.0] - 2026-10-10
 
 First published to PyPI on 2026-10-10 (built from master at `04ac7ea`); the

@@ -1171,3 +1171,14 @@ def test_sanitize_redacts_backslash_escaped_paths(
     out = server._sanitize_error_text(f"boom at {doubled}\\secret.gpr")
     assert doubled not in out
     assert "<project-dir>" in out
+
+
+def test_serve_profile_honors_env(monkeypatch):
+    """PYGHIDRA_LITE_DEFAULT_PROFILE used to be overwritten by serve's --profile default."""
+    from pyghidra_lite.server import serve_cmd
+
+    monkeypatch.setenv("PYGHIDRA_LITE_DEFAULT_PROFILE", "deep")
+    ctx = serve_cmd.make_context("serve", [])
+    assert ctx.params["profile"] == "deep"
+    monkeypatch.delenv("PYGHIDRA_LITE_DEFAULT_PROFILE")
+    assert serve_cmd.make_context("serve", []).params["profile"] == "fast"
