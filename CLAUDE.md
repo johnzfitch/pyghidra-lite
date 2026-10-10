@@ -74,5 +74,7 @@ shields.io caches PyPI badges for 12 h and GitHub's image proxy (camo) honors th
 the README's version badge can show the previous release. Purge the proxy's copies:
 
 ```bash
-gh api repos/johnzfitch/pyghidra-lite/readme -H "Accept: application/vnd.github.html"   | grep -o 'https://camo.githubusercontent.com/[^"]*' | sort -u   | xargs -n1 curl -s -o /dev/null -X PURGE
+gh api repos/johnzfitch/pyghidra-lite/readme -H "Accept: application/vnd.github.html" \
+  | grep -o 'https://camo.githubusercontent.com/[^"]*' | sort -u \
+  | xargs -n1 curl -s -o /dev/null -X PURGE
 ```
