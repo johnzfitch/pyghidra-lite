@@ -1564,6 +1564,31 @@ def _read_status_file(project_id: str) -> dict:
         return {}
 
 
+def _atomic_replace(tmp: Path, dst: Path, attempts: int = 12, delay: float = 0.05) -> None:
+    """os.replace(tmp, dst) with retry — robust against transient Windows
+    sharing violations.
+
+    On Windows a freshly written temp file is frequently held open for a few
+    ms by Defender real-time scanning (or our own ProjectWatcher reading the
+    status file), so os.replace can fail with PermissionError (WinError 5) or
+    WinError 32. POSIX never hits this; the retry loop is a no-op there.
+    """
+    for i in range(attempts):
+        try:
+            tmp.replace(dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay * (i + 1))
+        except OSError as e:
+            # WinError 32 (ERROR_SHARING_VIOLATION) surfaces as OSError, not
+            # PermissionError; retry it too. Re-raise anything else.
+            if getattr(e, "winerror", None) != 32 or i == attempts - 1:
+                raise
+            time.sleep(delay * (i + 1))
+
+
 def _write_status_file(project_id: str, data: dict):
     """Atomic write of .analysis_status for a project directory."""
     project_dir = _safe_project_path(
@@ -1573,7 +1598,11 @@ def _write_status_file(project_id: str, data: dict):
     status_file = project_dir / ".analysis_status"
     tmp = status_file.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=None))
-    tmp.rename(status_file)
+    # Path.replace() (os.replace) overwrites an existing target atomically on
+    # both POSIX and Windows; Path.rename() raises WinError 183 on Windows when
+    # the destination already exists. _atomic_replace retries the Windows
+    # sharing-violation race (Defender/watcher holding the temp open).
+    _atomic_replace(tmp, status_file)
 
 
 def _write_job_result(job_id: str, data: dict):
@@ -1584,7 +1613,7 @@ def _write_job_result(job_id: str, data: dict):
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / "result.json.tmp"
     tmp.write_text(json.dumps(data))
-    tmp.rename(d / "result.json")
+    _atomic_replace(tmp, d / "result.json")  # retry-safe os.replace (Windows race)
 
 
 def _get_job_result(job_id: str) -> dict:
@@ -1762,18 +1791,23 @@ def _pid_alive(pid: int) -> bool:
 
     os.kill(pid, 0) is the POSIX idiom but is UNSAFE on Windows: os.kill there
     routes any signal other than CTRL_C/CTRL_BREAK to TerminateProcess, so signal
-    0 would *kill* the process being probed. Use the Win32 API on Windows.
-    (Parallels proxy._pid_alive; kept independent so the backend doesn't import
-    the client-bridge module.)
+    0 would *kill* the process being probed, and a stale pid raises
+    OSError(WinError 87) rather than ProcessLookupError. Use the Win32 API on
+    Windows. (Parallels proxy._pid_alive; kept independent so the backend
+    doesn't import the client-bridge module.)
 
-    POSIX: returns False only if confirmed dead; PermissionError means the
-    process exists but is owned by another user -- treated as alive.
+    Returns False only if the process is confirmed dead; a process that exists
+    but can't be queried (owned by another user) is treated as alive.
     """
+    if not pid or pid <= 0:
+        return False
+
     if os.name == "nt":
         import ctypes
         from ctypes import wintypes
 
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ERROR_ACCESS_DENIED = 5
         STILL_ACTIVE = 259
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         # Declare signatures so the HANDLE return isn't truncated to 32 bits on
@@ -1787,7 +1821,8 @@ def _pid_alive(pid: int) -> bool:
 
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not handle:
-            return False
+            # Can't open: dead pid, or alive but access-denied (treat as alive).
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
         try:
             code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
@@ -1795,6 +1830,7 @@ def _pid_alive(pid: int) -> bool:
             return code.value == STILL_ACTIVE
         finally:
             kernel32.CloseHandle(handle)
+
     try:
         os.kill(pid, 0)
         return True
@@ -1805,6 +1841,7 @@ def _pid_alive(pid: int) -> bool:
         logger.debug(f"Cannot verify pid {pid} (permission denied), assuming alive")
         return True
     except OSError:
+        # Unexpected errno -- don't crash callers; treat as not-alive.
         return False
 
 
@@ -4910,7 +4947,7 @@ class AnalysisProgressListener:
             data["binary_path"] = self.binary_path
         tmp = self.status_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=None))
-        tmp.rename(self.status_path)
+        _atomic_replace(tmp, self.status_path)  # retry-safe os.replace (Windows race)
 
 
 def main():
