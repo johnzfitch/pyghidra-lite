@@ -48,3 +48,11 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-to-mcp-registry:
+    name: Publish to MCP Registry
+    needs: publish-to-pypi
+    permissions:
+      id-token: write  # GitHub OIDC login to the registry
+      contents: read
+    uses: ./.github/workflows/mcp-registry.yml
