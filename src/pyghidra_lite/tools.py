@@ -782,7 +782,8 @@ class GhidraTools:
             items.append(entry)
         return {"query": query, "total": total, "types": items, "truncated": total > len(items)}
 
-    def get_pcode(self, name_or_addr: str, limit: int = 400, timeout: int = 30) -> dict:
+    def get_pcode(self, name_or_addr: str, limit: int = 400, timeout: int = 30,
+                  slice_var: str | None = None) -> dict:
         """Decompiler high p-code for a function, in SSA form, one op per line.
 
         Ops are grouped by basic block; each block opens with a line
@@ -794,6 +795,12 @@ class GhidraTools:
         this is the function's def-use graph. Constants print as 0x..; CALL
         targets print as the callee name; LOAD/STORE spaces by name. limit
         caps printed lines (block headers included).
+
+        slice_var: return only the forward data-flow slice of that variable --
+        every op that (transitively) consumes it, including sinks such as
+        CALL/STORE/RETURN/CBRANCH. "param_2" seeds every SSA version named
+        param_2; "param_2.226" seeds just that one. Propagation runs to a fixed
+        point, so values carried around loops through MULTIEQUAL are followed.
         """
         from ghidra.util.task import ConsoleTaskMonitor
 
@@ -849,32 +856,75 @@ class GhidraTools:
         # Walk basic blocks so ops print in execution order within each block
         # (hf.getPcodeOps() can list a use before its def at the same address).
         # Each block opens with "B<i> -> B<j>,B<k>:" giving the control flow.
-        lines = []
-        total = shown = 0
+        blocks = []  # (header, [(line, out_token | None, [in_tokens])])
+        total = 0
         for block in hf.getBasicBlocks():
             succ = ",".join(f"B{block.getOut(i).getIndex()}" for i in range(block.getOutSize()))
             header = f"B{block.getIndex()}" + (f" -> {succ}" if succ else "") + ":"
-            if len(lines) < limit:
-                lines.append(header)
+            ops = []
             it = block.getIterator()
             while it.hasNext():
                 op = it.next()
                 total += 1
-                if len(lines) >= limit:
-                    continue
                 mnem = str(op.getMnemonic())
                 ins = [operand(op, mnem, i) for i in range(op.getNumInputs())]
                 out = op.getOutput()
-                lhs = f"{vn(out)} = " if out is not None else ""
-                lines.append(f"{op.getSeqnum().getTarget()}: {lhs}{mnem} {', '.join(ins)}".rstrip())
+                out_tok = vn(out) if out is not None else None
+                lhs = f"{out_tok} = " if out_tok else ""
+                line = f"{op.getSeqnum().getTarget()}: {lhs}{mnem} {', '.join(ins)}".rstrip()
+                ops.append((line, out_tok, ins))
+            blocks.append((header, ops))
+
+        result = {"function": str(func.getName()), "address": str(func.getEntryPoint())}
+        keep = None
+        if slice_var:
+            keep, seeds = self._forward_slice(blocks, slice_var)
+            if not seeds:
+                raise ValueError(
+                    f"No value named '{slice_var}' in {func.getName()}'s p-code; "
+                    "use code(what='pcode') without a variable to see names."
+                )
+            result["slice"] = slice_var
+            result["seeds"] = sorted(seeds)
+            total = len(keep)
+
+        lines = []
+        shown = 0
+        for header, ops in blocks:
+            selected = [o for o in ops if keep is None or o[0] in keep]
+            if not selected or len(lines) >= limit:
+                continue
+            lines.append(header)
+            for line, _, _ in selected:
+                if len(lines) >= limit:
+                    break
+                lines.append(line)
                 shown += 1
-        return {
-            "function": str(func.getName()),
-            "address": str(func.getEntryPoint()),
-            "ops": lines,
-            "total_ops": total,
-            "truncated": total > shown,
-        }
+        result.update({"ops": lines, "total_ops": total, "truncated": total > shown})
+        return result
+
+    @staticmethod
+    def _forward_slice(blocks, var: str) -> tuple[set[str], set[str]]:
+        """Lines (and seed tokens) of every op transitively consuming var."""
+        def is_seed(tok: str) -> bool:
+            return tok == var or ("." not in var and tok.rsplit(".", 1)[0] == var)
+
+        all_ops = [o for _, ops in blocks for o in ops]
+        seeds = {t for line, out, ins in all_ops for t in [out, *ins] if t and is_seed(t)}
+        tracked = set(seeds)
+        keep: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for line, out, ins in all_ops:
+                if line in keep:
+                    continue
+                if (out and out in seeds) or any(t in tracked for t in ins):
+                    keep.add(line)
+                    changed = True
+                    if out and out not in tracked:
+                        tracked.add(out)
+        return keep, seeds
 
     def batch_decompile(
         self,

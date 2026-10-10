@@ -245,6 +245,8 @@ xrefs("mybinary", "malloc", depth=2)
 
 # Value flow: SSA p-code, grouped by basic block; each value is defined once
 code("mybinary", "parse_header", what="pcode")
+# ...or just where one argument's value goes (forward slice; ~10x smaller on real code)
+code("mybinary", "parse_header,param_2", what="pcode")
 
 # Raw bytes plus where they live in the file (for patching)
 code("mybinary", "0x4011a0,64", what="bytes")   # -> hex, ascii, file_offset, block

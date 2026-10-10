@@ -96,6 +96,19 @@ def test_pcode_is_block_ordered_ssa(loaded):
     assert len(defs) == len(set(defs))
 
 
+def test_pcode_forward_slice(loaded):
+    handle, _ = loaded
+    full = _call("code", binary=handle.name, target="clamp", what="pcode")
+    res = _call("code", binary=handle.name, target="clamp,param_1", what="pcode")
+    assert res["slice"] == "param_1" and res["seeds"]
+    body = [line for line in res["ops"] if not line.startswith("B")]
+    assert body and len(body) <= full["total_ops"]
+    assert all(line in full["ops"] for line in res["ops"])  # a subset, same text
+    assert any("param_1" in line for line in body)
+    with pytest.raises(ValueError, match="No value named"):
+        _call("code", binary=handle.name, target="clamp,no_such_var", what="pcode")
+
+
 def test_bytes_file_offset_matches_file(loaded):
     handle, binary = loaded
     res = _call("code", binary=handle.name, target="main,16", what="bytes")
