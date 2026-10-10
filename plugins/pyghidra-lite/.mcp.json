@@ -3,7 +3,7 @@
     "pyghidra-lite": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "pyghidra-lite==0.9.0", "pyghidra-lite", "serve"],
+      "args": ["--from", "pyghidra-lite==0.9.1", "pyghidra-lite", "serve"],
       "env": {
         "GHIDRA_INSTALL_DIR": "${user_config.ghidra_install_dir}",
         "PYGHIDRA_LITE_PROJECT_DIR": "${user_config.project_dir}",

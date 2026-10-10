@@ -1,7 +1,7 @@
 {
   "name": "pyghidra-lite",
   "displayName": "pyghidra-lite",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Ghidra-based reverse engineering: decompile, disassemble, xrefs and call graphs, p-code value-flow slices, data types and raw bytes for ELF, Mach-O and PE binaries, with Swift/ObjC/Hermes support. Read-only by default.",
   "author": {
     "name": "Zack Fitch",
