@@ -10,6 +10,8 @@ Token-efficient MCP server for Ghidra-based reverse engineering.
 - `src/pyghidra_lite/formats.py` - ELF + Mach-O format tools
 - `src/pyghidra_lite/lang.py` - Swift + ObjC language tools
 - `src/pyghidra_lite/hermes.py` - React Native/Hermes tools
+- `src/pyghidra_lite/doctor.py` - `pyghidra-lite doctor` environment checks
+- `plugins/pyghidra-lite/` - Claude Code plugin (MCP config + reverse-engineering skill); marketplace in `.claude-plugin/marketplace.json`
 
 ## Development
 
@@ -23,10 +25,15 @@ uv run pyghidra-lite serve # Start MCP server
 
 ### 1. Bump version
 
-Update version in **three** places, keeping them in sync:
+Update version in **five** places, keeping them in sync (`tests/test_plugin.py` fails otherwise):
 - `pyproject.toml` (`version`)
 - `server.json` (top-level `version` **and** the `packages[].version`)
 - `src/pyghidra_lite/__init__.py` (`__version__`, exposed by `pyghidra-lite --version`)
+- `plugins/pyghidra-lite/.claude-plugin/plugin.json` (`version`)
+- `plugins/pyghidra-lite/.mcp.json` (the `pyghidra-lite==<version>` pin in `args`)
+
+Publish to PyPI before merging a plugin version bump: the plugin's `uvx` pin fails to
+install until that version exists.
 
 ### 2. PyPI
 

@@ -1,0 +1,40 @@
+{
+  "name": "pyghidra-lite",
+  "displayName": "pyghidra-lite",
+  "version": "0.9.0",
+  "description": "Ghidra-based reverse engineering: decompile, disassemble, xrefs and call graphs, p-code value-flow slices, data types and raw bytes for ELF, Mach-O and PE binaries, with Swift/ObjC/Hermes support. Read-only by default.",
+  "author": {
+    "name": "Zack Fitch",
+    "url": "https://github.com/johnzfitch"
+  },
+  "homepage": "https://github.com/johnzfitch/pyghidra-lite",
+  "repository": "https://github.com/johnzfitch/pyghidra-lite",
+  "license": "MIT",
+  "keywords": ["ghidra", "reverse-engineering", "decompiler", "binary-analysis", "mcp"],
+  "userConfig": {
+    "ghidra_install_dir": {
+      "type": "directory",
+      "title": "Ghidra install directory",
+      "description": "The extracted ghidra_<version>_PUBLIC folder (Ghidra 11.x or 12.x; needs a 64-bit JDK 21+). Leave empty to auto-detect Homebrew, /opt/ghidra or ~/ghidra.",
+      "default": ""
+    },
+    "project_dir": {
+      "type": "directory",
+      "title": "Analysis cache directory",
+      "description": "Where Ghidra projects are cached between sessions. Ghidra 12 rejects paths with a folder starting with '.'. Leave empty for ~/pyghidra-lite/projects (%LOCALAPPDATA% on Windows).",
+      "default": ""
+    },
+    "restrict_paths": {
+      "type": "string",
+      "title": "Restrict loads to these paths",
+      "description": "Optional. Only binaries under these directories can be loaded (separate several with your OS path separator: ':' on macOS/Linux, ';' on Windows). Leave empty to allow any path.",
+      "default": ""
+    },
+    "allow_write": {
+      "type": "boolean",
+      "title": "Allow annotate (rename/comment/prototype)",
+      "description": "Enables the annotate write tool. Every write still asks you to confirm it and is logged to annotate_audit.jsonl. Off = read-only.",
+      "default": false
+    }
+  }
+}

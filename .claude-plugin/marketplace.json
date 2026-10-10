@@ -1,0 +1,17 @@
+{
+  "name": "pyghidra-lite",
+  "owner": {
+    "name": "Zack Fitch",
+    "url": "https://github.com/johnzfitch"
+  },
+  "description": "Ghidra-based reverse engineering for Claude Code: a token-efficient MCP server plus a workflow skill.",
+  "plugins": [
+    {
+      "name": "pyghidra-lite",
+      "source": "./plugins/pyghidra-lite",
+      "description": "Reverse engineer ELF, Mach-O and PE binaries with Ghidra: decompile, xrefs, p-code value flow, data types, Swift/ObjC/Hermes.",
+      "category": "reverse-engineering",
+      "tags": ["ghidra", "reverse-engineering", "decompiler", "binary-analysis", "mcp"]
+    }
+  ]
+}

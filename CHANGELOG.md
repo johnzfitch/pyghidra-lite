@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Claude Code plugin** (`plugins/pyghidra-lite`, marketplace at the repo root):
+  installs the MCP server via `uvx` pinned to the package version, prompts for
+  Ghidra dir / cache dir / path restriction / write access, and bundles a
+  `reverse-engineering` skill covering load, triage, finding code from an
+  anchor, decompile/asm/call trees, p-code slices, types/bytes, build diffs and
+  annotate. `tests/test_plugin.py` keeps its version in lockstep.
 - **`pyghidra-lite doctor`**: read-only environment diagnosis (Python deps,
   mcp<2, Ghidra install/version, JDK major vs the install's declared range and
   JDK-vs-JRE, native decompiler for this host, project dir incl. Ghidra 12's
