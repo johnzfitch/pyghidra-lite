@@ -5,7 +5,7 @@ All notable changes to pyghidra-lite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] - 0.9.0
 
 ### Added
 - **Claude Code plugin** (`plugins/pyghidra-lite`, marketplace at the repo root):
@@ -14,6 +14,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reverse-engineering` skill covering load, triage, finding code from an
   anchor, decompile/asm/call trees, p-code slices, types/bytes, build diffs and
   annotate. `tests/test_plugin.py` keeps its version in lockstep.
+- **p-code forward slices**: `code(target="func,var", what="pcode")` returns
+  only the ops that `var`'s value flows into, through copies, merges and loops
+  (not into callees). On ws2_32.dll `WSAStartup`, `param_2` is 1.9K chars vs
+  ~22K for the full listing, which hits the 400-line cap on real functions.
+
+## [0.8.0] - 2026-10-10
+
+First published to PyPI on 2026-10-10 (built from master at `04ac7ea`); the
+2026-06-03 entry below was never uploaded, so 0.8.0 on PyPI contains both.
+
+### Added
+- **Write audit journal**: every `annotate` write — and every declined/failed
+  attempt — is recorded in `annotate_audit.jsonl` beside the on-disk projects,
+  capturing `old -> new` (so it doubles as an undo log). Since MCP elicitation
+  trusts the client (an auto-approving client can self-confirm), this keeps
+  writes accountable and reversible even under automation. A per-session
+  counter also nudges via `ctx.warning` as write volume climbs. The journal is
+  fail-closed (a write is journaled before it's applied; if it can't be
+  recorded, it isn't committed) and hardened (`0o600`, `O_NOFOLLOW` to refuse a
+  symlinked path, and size-based rotation to bound disk use).
 - **`pyghidra-lite doctor`**: read-only environment diagnosis (Python deps,
   mcp<2, Ghidra install/version, JDK major vs the install's declared range and
   JDK-vs-JRE, native decompiler for this host, project dir incl. Ghidra 12's
@@ -21,10 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exits 1 when analysis would fail.
 - **`code(what="pcode")`**: decompiler SSA high p-code grouped by basic block
   (`B0 -> B1,B2:` headers). Every value prints as `name.id` and is defined
-  once, so the def-use / value-flow graph is readable directly. Target
-  `"func,var"` returns only the forward slice of `var` (every op its value
-  flows into, through copies, merges and loops): on ws2_32.dll `WSAStartup`,
-  `param_2` is 1.9K chars vs 22K for the full (truncated) listing.
+  once, so the def-use / value-flow graph is readable directly.
 - **`search(type="types")`**: recovered/imported data types by name, with
   struct/union members as `offset type name`, enum values, typedef bases and
   function-definition prototypes.
@@ -62,17 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redaction missed backslash-escaped paths; status-file writes raced with
   scanners; `_pid_alive` crashed on stale PIDs.
 - Decompiled code carried CRLF line endings on Windows.
-- **Write audit journal**: every `annotate` write — and every declined/failed
-  attempt — is recorded in `annotate_audit.jsonl` beside the on-disk projects,
-  capturing `old -> new` (so it doubles as an undo log). Since MCP elicitation
-  trusts the client (an auto-approving client can self-confirm), this keeps
-  writes accountable and reversible even under automation. A per-session
-  counter also nudges via `ctx.warning` as write volume climbs. The journal is
-  fail-closed (a write is journaled before it's applied; if it can't be
-  recorded, it isn't committed) and hardened (`0o600`, `O_NOFOLLOW` to refuse a
-  symlinked path, and size-based rotation to bound disk use).
 
-## [0.8.0] - 2026-06-03
+**Earlier 0.8.0 work** (dated 2026-06-03, first published with the above):
 
 ### Added
 - **`annotate` write tool (opt-in, human-confirmed)**: the first tool that

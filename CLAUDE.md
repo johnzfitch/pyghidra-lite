@@ -32,8 +32,10 @@ Update version in **five** places, keeping them in sync (`tests/test_plugin.py` 
 - `plugins/pyghidra-lite/.claude-plugin/plugin.json` (`version`)
 - `plugins/pyghidra-lite/.mcp.json` (the `pyghidra-lite==<version>` pin in `args`)
 
-Publish to PyPI before merging a plugin version bump: the plugin's `uvx` pin fails to
-install until that version exists.
+The publish workflow builds the release tag's commit (or the dispatched branch), so
+merge the version bump to master first, then create the release right away: until the
+new version is on PyPI, the plugin's `uvx` pin can't install it. PyPI versions are
+immutable -- a version number can be uploaded only once.
 
 ### 2. PyPI
 
