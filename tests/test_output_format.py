@@ -83,3 +83,30 @@ def test_call_graph_keeps_same_named_functions_distinct():
     ]
     # One edge per distinct caller/callee pair.
     assert g["edges"] == ["main -> .text", "main -> .text@2000", "main -> ExitProcess"]
+
+
+def test_forward_slice_follows_copies_merges_and_loops():
+    # (line, out_token, in_tokens) per op, grouped in blocks like get_pcode builds.
+    blocks = [
+        ("B0 -> B1:", [
+            ("a: x.1 = COPY param_1.10", "x.1", ["param_1.10"]),
+            ("b: y.2 = INT_ADD param_2.20, 0x1", "y.2", ["param_2.20", "0x1"]),
+        ]),
+        ("B1 -> B1,B2:", [
+            ("c: x.3 = MULTIEQUAL x.1, x.4", "x.3", ["x.1", "x.4"]),
+            ("d: x.4 = INT_ADD x.3, 0x1", "x.4", ["x.3", "0x1"]),
+            ("e: CBRANCH B1, y.2", None, ["B1", "y.2"]),
+        ]),
+        ("B2:", [
+            ("f: STORE ram, y.2, x.3", None, ["ram", "y.2", "x.3"]),
+            ("g: RETURN 0x0, y.2", None, ["0x0", "y.2"]),
+        ]),
+    ]
+    keep, seeds = GhidraTools._forward_slice(blocks, "param_1")
+    assert seeds == {"param_1.10"}
+    assert keep == {"a: x.1 = COPY param_1.10", "c: x.3 = MULTIEQUAL x.1, x.4",
+                    "d: x.4 = INT_ADD x.3, 0x1", "f: STORE ram, y.2, x.3"}
+    keep2, _ = GhidraTools._forward_slice(blocks, "param_2.20")  # exact SSA token
+    assert keep2 == {"b: y.2 = INT_ADD param_2.20, 0x1", "e: CBRANCH B1, y.2",
+                     "f: STORE ram, y.2, x.3", "g: RETURN 0x0, y.2"}
+    assert GhidraTools._forward_slice(blocks, "nope") == (set(), set())

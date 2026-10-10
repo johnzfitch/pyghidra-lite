@@ -3396,6 +3396,9 @@ async def code(
         is defined exactly once, so searching a token finds its definition and
         every use - the function's def-use / value-flow graph. Use to trace
         where an argument or return value goes, or what feeds a CALL/STORE.
+        Target "func,var" (e.g. "connect,param_2") returns only the forward
+        slice: the ops that var's value flows into, through copies, merges
+        and loops - far smaller than the full listing on real functions.
 
     Args:
         binary: Binary name or unit_id.
@@ -3452,6 +3455,11 @@ async def code(
             return result
 
         if what == "pcode":
+            # "func,var" -> forward data-flow slice of var. Only split when the
+            # tail is an identifier, so C++ names like "f<a,b>" stay intact.
+            func_part, _, var = target.rpartition(",")
+            if func_part and re.fullmatch(r"[A-Za-z_]\w*(\.\d+)?", var.strip()):
+                return tools.get_pcode(func_part.strip(), slice_var=var.strip())
             return tools.get_pcode(target)
 
         if what == "bytes":

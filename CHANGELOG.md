@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exits 1 when analysis would fail.
 - **`code(what="pcode")`**: decompiler SSA high p-code grouped by basic block
   (`B0 -> B1,B2:` headers). Every value prints as `name.id` and is defined
-  once, so the def-use / value-flow graph is readable directly.
+  once, so the def-use / value-flow graph is readable directly. Target
+  `"func,var"` returns only the forward slice of `var` (every op its value
+  flows into, through copies, merges and loops): on ws2_32.dll `WSAStartup`,
+  `param_2` is 1.9K chars vs 22K for the full (truncated) listing.
 - **`search(type="types")`**: recovered/imported data types by name, with
   struct/union members as `offset type name`, enum values, typedef bases and
   function-definition prototypes.
