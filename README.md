@@ -15,7 +15,7 @@ Token-efficient MCP server for Ghidra-based reverse engineering. Analyze ELF, Ma
 
 **1. Prerequisites**
 
-JDK 21+ and Ghidra 11.x are required.
+A 64-bit JDK 21+ and Ghidra 11.x or 12.x are required (tested with Ghidra 12.1.2 and JDK 21).
 
 ```bash
 # macOS
@@ -37,6 +37,7 @@ Ghidra installed via Homebrew (`brew install ghidra`) or to `/opt/ghidra` or `~/
 
 ```bash
 pip install pyghidra-lite
+pyghidra-lite doctor   # checks Ghidra, JDK, decompiler, project dir; exits 1 on problems
 ```
 
 **3. Add to Claude Code**
@@ -338,6 +339,7 @@ The proxy auto-starts the backend on first use and the backend auto-exits after 
 | `pyghidra-lite serve` | Direct stdio server (1 JVM per session) |
 | `pyghidra-lite serve -t streamable-http` | Start persistent HTTP backend manually |
 | `pyghidra-lite stop` | Stop the shared backend |
+| `pyghidra-lite doctor [--json]` | Diagnose the environment (read-only; exit 1 if analysis would fail) |
 
 Set `PYGHIDRA_LITE_NO_AUTOSTART=1` to disable auto-start (useful with systemd).
 
