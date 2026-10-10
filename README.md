@@ -350,7 +350,11 @@ Each binary gets its own Ghidra project, enabling:
 - Persistent analysis (survives restarts)
 - Content-addressed storage (same binary = same analysis)
 
-Projects stored in `~/.local/share/pyghidra-lite/projects/`.
+Projects are stored in `~/pyghidra-lite/projects/` (Windows: `%LOCALAPPDATA%\pyghidra-lite\projects\`),
+or in the pre-0.9 location `~/.local/share/pyghidra-lite/projects/` if that already exists.
+Override with `--project-dir` or `PYGHIDRA_LITE_PROJECT_DIR`. Ghidra 12+ rejects project paths with a
+component starting with `.`, so a legacy `~/.local` directory only works with Ghidra 11.x —
+`pyghidra-lite doctor` flags this.
 
 ## Links
 
