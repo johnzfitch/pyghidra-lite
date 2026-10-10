@@ -163,9 +163,10 @@ _BOOTSTRAP_MODES = {"named", "all"}
 _BOOTSTRAP_AUTO_PREFIX = "BTFN"
 _INFO_DETAILS = ("summary", "full", "format", "sections", "entropy")
 _FUNCTION_TYPES = ("all", "swift", "objc", "imports", "exports", "types", "got", "dylibs")
-_CODE_WHATS = ("decompile", "asm", "bytes", "string")
+_CODE_WHATS = ("decompile", "asm", "bytes", "string", "pcode")
+_ASM_LIMIT = 400
 _XREF_DIRECTIONS = ("to", "from")
-_SEARCH_TYPES = ("strings", "symbols", "bytes", "all", "blob", "extract")
+_SEARCH_TYPES = ("strings", "symbols", "bytes", "all", "blob", "extract", "types")
 _SEARCH_MODES = ("indexed", "deep")
 _ANNOTATE_ACTIONS = ("rename", "comment", "prototype")
 _MAX_BATCH_XREF_TARGETS = 20
@@ -198,10 +199,10 @@ LoadProfileArg = Literal["fast", "default", "deep"]
 BootstrapModeArg = Literal["named", "all"]
 InfoDetailArg = Literal["summary", "full", "format", "sections", "entropy"]
 FunctionsTypeArg = Literal["all", "swift", "objc", "imports", "exports", "types", "got", "dylibs"]
-CodeWhatArg = Literal["decompile", "asm", "bytes", "string"]
+CodeWhatArg = Literal["decompile", "asm", "bytes", "string", "pcode"]
 XrefsDirectionArg = Literal["to", "from"]
 AnnotateActionArg = Literal["rename", "comment", "prototype"]
-SearchTypeArg = Literal["strings", "symbols", "bytes", "all", "blob", "extract"]
+SearchTypeArg = Literal["strings", "symbols", "bytes", "all", "blob", "extract", "types"]
 SearchModeArg = Literal["indexed", "deep"]
 CodeTargetArg = NonEmptyStr | Annotated[list[NonEmptyStr], Field(min_length=1)]
 XrefsTargetArg = NonEmptyStr | Annotated[list[NonEmptyStr], Field(
@@ -1472,6 +1473,40 @@ async def server_lifespan(server: Server) -> AsyncIterator[None]:
             _last_access.clear()
             _evicted_ids.clear()
 
+
+def _install_compact_tool_text() -> None:
+    """Serialize tool results as compact JSON, one text block per call.
+
+    FastMCP's legacy converter pretty-prints every result (indent=2) and turns
+    a returned list into one text block per item. Measured over all tools on
+    a sample binary, the indentation alone was 24% of output characters (35%+
+    on nested results like info(detail="full") and call graphs) -- pure token
+    overhead for an LLM client. Pinned to mcp<2, where this hook exists.
+    """
+    import pydantic_core
+    from mcp.server.fastmcp.utilities import func_metadata
+    from mcp.types import TextContent
+    from pydantic import BaseModel
+
+    original = func_metadata._convert_to_content
+
+    def compact(result):
+        if isinstance(result, str):
+            return [TextContent(type="text", text=result)]
+        # Lists holding content blocks / FastMCP Image/Audio keep the original
+        # per-item conversion.
+        if isinstance(result, (dict, list, tuple)) and not any(
+            isinstance(x, BaseModel) or hasattr(x, "to_image_content") or hasattr(x, "to_audio_content")
+            for x in (result if isinstance(result, (list, tuple)) else ())
+        ):
+            text = pydantic_core.to_json(result, fallback=str).decode()
+            return [TextContent(type="text", text=text)]
+        return original(result)
+
+    func_metadata._convert_to_content = compact
+
+
+_install_compact_tool_text()
 
 mcp = FastMCP("pyghidra-lite", lifespan=server_lifespan)
 
@@ -2835,7 +2870,7 @@ async def delete(name: NonEmptyStr, ctx: Context) -> dict:
     return await _run_bounded("delete", _run)
 
 
-@mcp.tool(annotations=_read_only("List Binaries"))
+@mcp.tool(annotations=_read_only("List Binaries"), structured_output=False)
 async def binaries(
     ctx: Context,
     jobs: bool = False,
@@ -3043,7 +3078,7 @@ async def info(
                 entropy_data = tools.entropy_map()
                 base["entropy"] = entropy_data
                 base["high_entropy_sections"] = [
-                    s for s in entropy_data if s.get("entropy", 0) > 7.0
+                    s["name"] for s in entropy_data if (s.get("entropy") or 0) > 7.0
                 ]
             except Exception as e:
                 base["entropy_error"] = str(e)
@@ -3119,7 +3154,7 @@ async def info(
         suspicious = [i for i in imports if i.tags]
         normal = [i for i in imports if not i.tags]
         base["top_imports"] = [
-            {"name": i.name, "tags": i.tags or []}
+            {"name": i.name, "tags": i.tags} if i.tags else {"name": i.name}
             for i in (suspicious + normal)[:limit]
         ]
 
@@ -3169,7 +3204,7 @@ async def info(
     return await _with_handle_async("info", binary, op)
 
 
-@mcp.tool(annotations=_read_only("List Functions"))
+@mcp.tool(annotations=_read_only("List Functions"), structured_output=False)
 async def functions(
     binary: NonEmptyStr,
     ctx: Context,
@@ -3271,13 +3306,14 @@ async def functions(
                 from pyghidra_lite.formats import PeTools
                 grouped = PeTools(handle).list_imports_by_dll(pattern=query, limit=limit)
                 return [
-                    {"name": f["name"], "library": g["dll"],
-                     "iat_addr": f.get("iat_addr"), "tags": f.get("tags") or []}
+                    {k: v for k, v in (("name", f["name"]), ("library", g["dll"]),
+                                       ("iat_addr", f.get("iat_addr")), ("tags", f.get("tags")))
+                     if v}
                     for g in grouped for f in g["functions"]
                 ]
             imports = tools.list_imports(pattern=query, limit=limit)
             return [
-                {"name": i.name, "library": i.library, "tags": i.tags or []}
+                {k: v for k, v in (("name", i.name), ("library", i.library), ("tags", i.tags)) if v}
                 for i in imports
             ]
 
@@ -3317,7 +3353,7 @@ async def functions(
     return results
 
 
-@mcp.tool(annotations=_read_only("Read Code"))
+@mcp.tool(annotations=_read_only("Read Code"), structured_output=False)
 async def code(
     binary: NonEmptyStr,
     target: CodeTargetArg,
@@ -3348,10 +3384,18 @@ async def code(
         exact instruction encoding.
 
       - "bytes": raw hex bytes at an address. Target format is "addr,size"
-        (e.g., "0x4011a0,64"). Use to inspect data structures or verify byte patterns.
+        (e.g., "0x4011a0,64"). Also returns file_offset (where those bytes sit
+        in the original file; null for .bss/unbacked memory) and block (section).
+        Use to inspect data structures, verify byte patterns, or patch the file.
 
       - "string": read a null-terminated string at an address. Use when you need
         the full untruncated value of a string found via search.
+
+      - "pcode": the decompiler's SSA high p-code, one op per line
+        ("<addr>: <out> = <OPCODE> <in>, ..."). Each value prints as name.id and
+        is defined exactly once, so searching a token finds its definition and
+        every use - the function's def-use / value-flow graph. Use to trace
+        where an argument or return value goes, or what feeds a CALL/STORE.
 
     Args:
         binary: Binary name or unit_id.
@@ -3361,6 +3405,7 @@ async def code(
             - "asm": assembly instructions
             - "bytes": raw bytes at address (requires address and size in target)
             - "string": null-terminated string at address
+            - "pcode": SSA high p-code (def-use graph), first 400 ops
         cfg: Include control flow graph (blocks and edges).
     """
     what = _validate_choice("what", what, _CODE_WHATS)
@@ -3388,44 +3433,26 @@ async def code(
 
         # Single target
         if what == "asm":
-            fm = handle.program.getFunctionManager()
-            listing = handle.program.getListing()
-
-            func = None
-            if target.startswith("0x"):
-                try:
-                    addr = handle.program.getAddressFactory().getAddress(target.replace("0x", ""))
-                    func = fm.getFunctionAt(addr)
-                except Exception:
-                    pass
-
-            if not func:
-                for f in fm.getFunctions(True):
-                    if f.getName() == target or target.lower() in f.getName().lower():
-                        func = f
-                        break
-
+            func = tools._find_function(target)
             if not func:
                 raise ValueError(f"Function not found: {target}")
 
+            limit = _ASM_LIMIT
             instructions = []
-            body = func.getBody()
-            limit = 100
+            total = 0
+            for instr in handle.program.getListing().getInstructions(func.getBody(), True):
+                total += 1
+                if len(instructions) < limit:
+                    instructions.append(f"{instr.getAddress()}: {instr}")
 
-            for addr in body.getAddresses(True):
-                instr = listing.getInstructionAt(addr)
-                if instr:
-                    operands = [str(instr.getDefaultOperandRepresentation(i))
-                                for i in range(instr.getNumOperands())]
-                    instructions.append({
-                        "addr": str(addr),
-                        "mnemonic": str(instr.getMnemonicString()),
-                        "operands": operands,
-                    })
-                    if len(instructions) >= limit:
-                        break
+            result = {"function": func.getName(), "address": str(func.getEntryPoint()),
+                      "instructions": instructions}
+            if total > limit:
+                result["truncated"] = total - limit
+            return result
 
-            return {"function": func.getName(), "instructions": instructions}
+        if what == "pcode":
+            return tools.get_pcode(target)
 
         if what == "bytes":
             # target format: "addr,size" or just address
@@ -3433,7 +3460,8 @@ async def code(
             addr = parts[0].strip()
             size = int(parts[1].strip()) if len(parts) > 1 else 16
             result = tools.read_bytes(addr, size)
-            return {"address": result.address, "hex": result.hex, "ascii": result.ascii}
+            return {"address": result.address, "hex": result.hex, "ascii": result.ascii,
+                    "file_offset": result.file_offset, "block": result.block}
 
         if what == "string":
             return {"address": target, "value": tools.read_string(target)}
@@ -3448,21 +3476,26 @@ async def code(
             "address": dec.address,
             "signature": dec.signature,
             "code": dec.code,
-            "callees": dec.callees,
-            "strings": dec.strings_used,
         }
+        # Omit empty context rather than sending nulls.
+        if dec.callees:
+            result["callees"] = dec.callees
+        if dec.strings_used:
+            result["strings"] = dec.strings_used
 
         if cfg:
             cfg_data = tools.get_cfg(target)
             result["cfg"] = cfg_data
             result["num_blocks"] = len(cfg_data)
 
-        # Get callers for context
-        callers = tools.get_xrefs(target, limit=10)
+        # Get callers for context. Resolve by the decompiled entry address (the
+        # name lookup may have matched by substring), and match Ghidra's call
+        # ref types (UNCONDITIONAL_CALL, CONDITIONAL_CALL, COMPUTED_CALL, ...).
+        refs = tools.get_xrefs(f"0x{dec.address}", limit=50)
         result["callers"] = [
             {"name": r.from_func, "address": r.from_addr}
-            for r in callers if r.type == "call"
-        ]
+            for r in refs if "CALL" in r.type
+        ][:10]
 
         return result
 
@@ -3497,7 +3530,8 @@ async def xrefs(
       decompiling when you only need the dependency list, not the code.
 
       depth>1: expands into a full call graph (up to depth=5). At depth=1 you
-      get direct references; at depth=2+ you get transitive callers/callees.
+      get direct references; at depth=2+ you get transitive callers/callees as
+      {"nodes": [{name, address, external?, thunk?}], "edges": ["caller -> callee"]}.
       Use this to understand how a function fits into the broader program.
 
       Pass a list of targets (up to 20) for batch xref lookup - more efficient
@@ -3643,6 +3677,11 @@ async def search(
       - "extract": extract embedded BunFS filesystem from Bun binaries. Always
         runs in background; poll with binaries(jobs=True).
 
+      - "types": recovered/imported data types (structs, unions, enums,
+        typedefs, function signatures) whose name contains query; "*" lists
+        all. Structs come with members as "offset type name". Use to learn
+        a struct layout seen in decompiled code (e.g. query="sockaddr").
+
     Args:
         binary: Binary name or unit_id.
         query: Search pattern, or list for batch search.
@@ -3653,6 +3692,7 @@ async def search(
             - "all": functions, symbols, and strings simultaneously
             - "blob": extract strings from raw memory region (query="offset,size")
             - "extract": extract bunfs filesystem (Bun binaries only)
+            - "types": data types by name, with struct members/enum values
         mode: Search mode for strings:
             - "indexed" (default): Ghidra's defined strings (fast)
             - "deep": raw memory scan (finds strings Ghidra missed)
@@ -3739,6 +3779,9 @@ async def search(
         if type == "bytes":
             results = tools.find_bytes(query, limit=limit)
             return {"pattern": query, "matches": results}
+
+        if type == "types":
+            return tools.list_data_types(query, limit=limit)
 
         if type == "symbols":
             results = tools.search_symbols(query, limit=limit)

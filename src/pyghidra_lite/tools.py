@@ -1,6 +1,7 @@
 """Ghidra tool implementations for pyghidra-lite."""
 
 import logging
+import re
 import time
 from typing import TYPE_CHECKING
 
@@ -36,7 +37,7 @@ MAX_GRAPH_EDGES = 1000
 CAPABILITY_TAGS = {
     # Crypto
     "crypto": ["aes", "des", "rsa", "sha", "md5", "encrypt", "decrypt", "cipher", "hash", "hmac",
-               "ssl", "tls", "crypto", "pkcs", "x509", "certificate"],
+               "ssl", "tls", "crypto", "pkcs", "x509", "certificate", "digest"],
     # Network
     "network": ["socket", "connect", "send", "recv", "http", "url", "dns", "inet", "tcp", "udp",
                 "curl", "fetch", "request", "download", "upload", "websocket"],
@@ -66,14 +67,38 @@ _RUNTIME_SIGNATURES: list[dict] = [
 ]
 
 
+_NAME_TOKEN = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+# Keywords of 4+ chars match a token prefix (recv -> recvfrom); these would
+# then over-match (stat -> status, exit -> exiting) so they need the whole token.
+_EXACT_KEYWORDS = {"stat", "free", "exit", "wait", "kill", "path"}
+# Windows thread-local-storage APIs (TlsAlloc, TlsGetValue, ...) are not TLS crypto.
+_WIN_TLS_STORAGE = {"alloc", "free", "get", "set"}
+
+
 def get_capability_tags(name: str) -> list[str]:
-    """Get capability tags for an import/export name."""
-    name_lower = name.lower()
-    tags = []
-    for tag, keywords in CAPABILITY_TAGS.items():
-        if any(kw in name_lower for kw in keywords):
-            tags.append(tag)
-    return tags
+    """Get capability tags for an import/export name.
+
+    Matches keywords against name tokens (split on case changes, "_" and
+    digits) rather than raw substrings, which tagged GetCPInfo as network
+    ("tcp" in "getcpinfo"), CreateThread as file ("read") and
+    destroy_window as crypto ("des").
+    """
+    tokens = [t.lower() for t in _NAME_TOKEN.findall(name)]
+    if not tokens:
+        return []
+    runs = re.findall(r"[a-z0-9]+", name.lower())  # keeps "x509", "md5" whole
+    win_tls = tokens[0] == "tls" and len(tokens) > 1 and tokens[1] in _WIN_TLS_STORAGE
+
+    def hit(kw: str) -> bool:
+        if kw == "tls" and win_tls:
+            return False
+        if any(c.isdigit() for c in kw):
+            return any(r.startswith(kw) for r in runs)
+        if len(kw) <= 3 or kw in _EXACT_KEYWORDS:
+            return kw in tokens
+        return any(t.startswith(kw) for t in tokens)
+
+    return [tag for tag, keywords in CAPABILITY_TAGS.items() if any(hit(kw) for kw in keywords)]
 
 
 class GhidraTools:
@@ -276,7 +301,9 @@ class GhidraTools:
             code = f"// Decompilation error: {result.getErrorMessage()}"
             signature = None
         else:
-            code = result.decompiledFunction.getC()
+            # Ghidra emits CRLF on Windows plus blank padding lines; both
+            # cost tokens and carry nothing.
+            code = str(result.decompiledFunction.getC()).replace("\r\n", "\n").strip("\n")
             signature = result.decompiledFunction.getSignature()
 
         entry = func.getEntryPoint()
@@ -455,25 +482,33 @@ class GhidraTools:
         return [f.getName() for f in func.getCalledFunctions(None)]
 
     def _resolve_address(self, name_or_addr: str):
-        """Resolve a name or address string to an Address."""
+        """Resolve a name or address string to an Address.
+
+        "0x..." is always an address. Anything else is looked up as a symbol
+        first: names like "add", "dead" or "face" are valid hex, and parsing
+        them as addresses first silently pointed at 0xadd etc. Bare hex is
+        only taken as an address when no symbol has that name.
+        """
         af = self.program.getAddressFactory()
 
-        # Try as address
-        try:
-            addr_str = name_or_addr.replace("0x", "")
-            addr = af.getAddress(addr_str)
-            if addr:
-                return addr
-        except Exception:
-            pass
+        def as_address(text: str):
+            try:
+                return af.getAddress(text)
+            except Exception:
+                return None
 
-        # Try as symbol
+        if name_or_addr[:2] in ("0x", "0X"):
+            return as_address(name_or_addr[2:])
+
         st = self.program.getSymbolTable()
+        for sym in st.getSymbols(name_or_addr):
+            return sym.getAddress()
+        lower = name_or_addr.lower()
         for sym in st.getAllSymbols(True):
-            if sym.getName().lower() == name_or_addr.lower():
+            if sym.getName().lower() == lower:
                 return sym.getAddress()
 
-        return None
+        return as_address(name_or_addr)
 
     def list_imports(self, pattern: str = "", limit: int = 50) -> list[ImportInfo]:
         """List imports with capability tags."""
@@ -652,13 +687,194 @@ class GhidraTools:
         # ASCII representation
         ascii_repr = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
 
+        file_offset, block = self.file_location(addr)
         return BytesResult(
             address=str(addr),
             size=len(data),
             hex=data.hex(),
             ascii=ascii_repr,
+            file_offset=file_offset,
+            block=block,
             provenance=self.handle.get_provenance() if include_provenance else None,
         )
+
+    def file_location(self, addr) -> tuple[int | None, str | None]:
+        """(file offset, memory block name) for a resolved Address.
+
+        The offset comes from the loader's file-bytes mapping; it is None for
+        memory with no file backing (.bss, stack, uninitialized or synthetic
+        blocks).
+        """
+        mem = self.program.getMemory()
+        block = mem.getBlock(addr)
+        offset = None
+        info = mem.getAddressSourceInfo(addr)
+        if info is not None:
+            off = int(info.getFileOffset())
+            if off >= 0:
+                offset = off
+        return offset, (str(block.getName()) if block is not None else None)
+
+    def list_data_types(self, query: str, limit: int = 30, max_members: int = 64) -> dict:
+        """Recovered/imported data types whose name contains query (case-insensitive).
+
+        Structures and unions list members as "offset type name"; enums list
+        "NAME=value"; typedefs give their base type; function definitions
+        their prototype. Pointers and arrays are skipped (they are spelled out
+        inside member types). query "*" matches everything.
+        """
+        from ghidra.program.model.data import (
+            Array,
+            Enum,
+            FunctionDefinition,
+            Pointer,
+            Structure,
+            TypeDef,
+            Union,
+        )
+
+        q = query.strip().lower()
+        match_all = q in ("", "*")
+        dtm = self.program.getDataTypeManager()
+        items: list[dict] = []
+        total = 0
+        it = dtm.getAllDataTypes()
+        while it.hasNext():
+            dt = it.next()
+            if isinstance(dt, (Pointer, Array)):
+                continue
+            name = str(dt.getName())
+            if not match_all and q not in name.lower():
+                continue
+            total += 1
+            if len(items) >= limit:
+                continue
+            entry: dict = {"name": name, "path": str(dt.getCategoryPath().getPath())}
+            size = int(dt.getLength())
+            if isinstance(dt, (Structure, Union)):
+                entry["kind"] = "struct" if isinstance(dt, Structure) else "union"
+                entry["size"] = size
+                comps = dt.getDefinedComponents() if isinstance(dt, Structure) else dt.getComponents()
+                members = []
+                for c in comps:
+                    fname = c.getFieldName() or f"field_0x{int(c.getOffset()):x}"
+                    members.append(f"0x{int(c.getOffset()):x} {c.getDataType().getDisplayName()} {fname}")
+                entry["members"] = members[:max_members]
+                if len(members) > max_members:
+                    entry["members_truncated"] = len(members) - max_members
+            elif isinstance(dt, Enum):
+                entry["kind"] = "enum"
+                entry["size"] = size
+                values = [f"{n}={int(dt.getValue(n))}" for n in dt.getNames()]
+                entry["values"] = values[:max_members]
+                if len(values) > max_members:
+                    entry["values_truncated"] = len(values) - max_members
+            elif isinstance(dt, TypeDef):
+                entry["kind"] = "typedef"
+                entry["base"] = str(dt.getBaseDataType().getDisplayName())
+            elif isinstance(dt, FunctionDefinition):
+                entry["kind"] = "function"
+                entry["prototype"] = str(dt.getPrototypeString())
+            else:
+                entry["kind"] = "builtin"
+                if size > 0:
+                    entry["size"] = size
+            items.append(entry)
+        return {"query": query, "total": total, "types": items, "truncated": total > len(items)}
+
+    def get_pcode(self, name_or_addr: str, limit: int = 400, timeout: int = 30) -> dict:
+        """Decompiler high p-code for a function, in SSA form, one op per line.
+
+        Ops are grouped by basic block; each block opens with a line
+        "B<i> -> B<j>,B<k>:" naming its successors. Op format:
+        "<addr>: <out> = <OPCODE> <in>, <in>". Every non-constant value
+        is printed as <name>.<id>, where id is the decompiler's unique varnode
+        id; in SSA each id is defined exactly once, so the line defining a value
+        and every line using it can be found by searching for that token --
+        this is the function's def-use graph. Constants print as 0x..; CALL
+        targets print as the callee name; LOAD/STORE spaces by name. limit
+        caps printed lines (block headers included).
+        """
+        from ghidra.util.task import ConsoleTaskMonitor
+
+        func = self._find_function(name_or_addr)
+        if not func:
+            raise ValueError(f"Function not found: {name_or_addr}")
+        result = self.decompiler.decompileFunction(func, timeout, ConsoleTaskMonitor())
+        hf = result.getHighFunction() if result is not None else None
+        if hf is None:
+            msg = result.getErrorMessage() if result is not None else "no result"
+            raise ValueError(f"Decompilation failed for {func.getName()}: {msg}")
+
+        fm = self.program.getFunctionManager()
+
+        def vn(v, call_target: bool = False) -> str:
+            if v is None:
+                return "?"
+            if v.isConstant():
+                mask = (1 << (8 * max(int(v.getSize()), 1))) - 1
+                return f"0x{int(v.getOffset()) & mask:x}"
+            if call_target and v.isAddress():
+                f = fm.getFunctionAt(v.getAddress())
+                if f is not None:
+                    return str(f.getName())
+                return str(v.getAddress())
+            high = v.getHigh()
+            name = None
+            if high is not None:
+                n = high.getName()
+                if n and str(n) != "UNNAMED":
+                    name = str(n)
+            if name is None:
+                if v.isRegister():
+                    reg = self.program.getRegister(v.getAddress(), int(v.getSize()))
+                    name = str(reg.getName()) if reg is not None else "reg"
+                elif v.isAddress():
+                    name = f"[{v.getAddress()}]"
+                else:
+                    name = "t"
+            return f"{name}.{int(v.getUniqueId())}"
+
+        af = self.program.getAddressFactory()
+
+        def operand(op, mnem: str, i: int) -> str:
+            v = op.getInput(i)
+            if i == 0 and mnem in ("LOAD", "STORE") and v is not None and v.isConstant():
+                space = af.getAddressSpace(int(v.getOffset()))
+                if space is not None:
+                    return str(space.getName())
+            # Branch/call destinations: print the callee name or bare address.
+            return vn(v, call_target=(i == 0 and mnem in ("CALL", "BRANCH", "CBRANCH")))
+
+        # Walk basic blocks so ops print in execution order within each block
+        # (hf.getPcodeOps() can list a use before its def at the same address).
+        # Each block opens with "B<i> -> B<j>,B<k>:" giving the control flow.
+        lines = []
+        total = shown = 0
+        for block in hf.getBasicBlocks():
+            succ = ",".join(f"B{block.getOut(i).getIndex()}" for i in range(block.getOutSize()))
+            header = f"B{block.getIndex()}" + (f" -> {succ}" if succ else "") + ":"
+            if len(lines) < limit:
+                lines.append(header)
+            it = block.getIterator()
+            while it.hasNext():
+                op = it.next()
+                total += 1
+                if len(lines) >= limit:
+                    continue
+                mnem = str(op.getMnemonic())
+                ins = [operand(op, mnem, i) for i in range(op.getNumInputs())]
+                out = op.getOutput()
+                lhs = f"{vn(out)} = " if out is not None else ""
+                lines.append(f"{op.getSeqnum().getTarget()}: {lhs}{mnem} {', '.join(ins)}".rstrip())
+                shown += 1
+        return {
+            "function": str(func.getName()),
+            "address": str(func.getEntryPoint()),
+            "ops": lines,
+            "total_ops": total,
+            "truncated": total > shown,
+        }
 
     def batch_decompile(
         self,
@@ -716,16 +932,28 @@ class GhidraTools:
             direction: "callers", "callees", or "both".
 
         Returns:
-            Dict with nodes (functions) and edges (calls).
+            Dict with nodes (functions) and edges ("caller -> callee" strings,
+            one per distinct pair). Nodes are keyed by entry address, so
+            distinct functions sharing a name stay distinct: the second and
+            later get the label "name@addr". external/thunk appear only when true.
         """
         func = self._find_function(function)
         if not func:
             raise ValueError(f"Function not found: {function}")
 
-        nodes = {}
-        edges = []
+        nodes: dict[str, dict] = {}  # entry address -> node
+        labels: dict[str, str] = {}  # entry address -> label used in edges
+        used_labels: set[str] = set()
+        edges: list[str] = []
+        edge_set: set[str] = set()
         visited = set()
         state = {"truncated": False}
+
+        def add_edge(src: str, dst: str) -> None:
+            e = f"{src} -> {dst}"
+            if e not in edge_set:
+                edge_set.add(e)
+                edges.append(e)
 
         def budget_exhausted() -> bool:
             if len(nodes) >= MAX_GRAPH_NODES or len(edges) >= MAX_GRAPH_EDGES:
@@ -734,15 +962,19 @@ class GhidraTools:
             return False
 
         def add_node(f):
-            name = f.getName()
-            if name not in nodes:
-                nodes[name] = {
-                    "name": name,
-                    "address": str(f.getEntryPoint()),
-                    "is_external": f.isExternal(),
-                    "is_thunk": f.isThunk(),
-                }
-            return name
+            addr = str(f.getEntryPoint())
+            if addr not in nodes:
+                name = str(f.getName())
+                label = name if name not in used_labels else f"{name}@{addr}"
+                used_labels.add(label)
+                labels[addr] = label
+                node = {"name": label, "address": addr}
+                if f.isExternal():
+                    node["external"] = True
+                if f.isThunk():
+                    node["thunk"] = True
+                nodes[addr] = node
+            return labels[addr]
 
         def traverse_callees(f, current_depth):
             if current_depth > depth:
@@ -756,7 +988,7 @@ class GhidraTools:
                 if budget_exhausted():
                     return
                 callee_name = add_node(callee)
-                edges.append({"from": name, "to": callee_name, "type": "calls"})
+                add_edge(name, callee_name)
                 if current_depth < depth:
                     traverse_callees(callee, current_depth + 1)
 
@@ -776,7 +1008,7 @@ class GhidraTools:
                 caller = fm.getFunctionContaining(ref.getFromAddress())
                 if caller:
                     caller_name = add_node(caller)
-                    edges.append({"from": caller_name, "to": name, "type": "calls"})
+                    add_edge(caller_name, name)
                     if current_depth < depth:
                         traverse_callers(caller, current_depth + 1)
 
@@ -985,12 +1217,10 @@ class GhidraTools:
             else:
                 note = ""
 
-            results.append({
-                "name": block.getName(),
-                "size": size,
-                "entropy": entropy,
-                "note": note,
-            })
+            row = {"name": block.getName(), "size": size, "entropy": entropy}
+            if note:
+                row["note"] = note
+            results.append(row)
 
         results.sort(key=lambda r: (r["entropy"] or 0), reverse=True)
         return results

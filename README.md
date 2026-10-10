@@ -209,9 +209,9 @@ auto-detecting format (ELF/Mach-O/PE) and language (Swift/ObjC/Hermes):
 | `binaries` | List binaries + job status | `jobs?`, `rank_sources?` |
 | `info` | Binary overview | `binary`, `detail?` (summary/full/format/sections/entropy) |
 | `functions` | List/search functions | `binary`, `query?`, `type?` (all/swift/objc/imports/exports) |
-| `code` | Decompile or disassemble | `binary`, `target`, `what?` (decompile/asm), `cfg?` |
+| `code` | Decompile, disassemble, p-code, bytes | `binary`, `target`, `what?` (decompile/asm/pcode/bytes/string), `cfg?` |
 | `xrefs` | References and call graphs | `binary`, `target`, `direction?`, `depth?`, `diff?` |
-| `search` | Find strings, bytes, symbols | `binary`, `query`, `type?`, `mode?`, `bg?` |
+| `search` | Find strings, bytes, symbols, data types | `binary`, `query`, `type?` (strings/symbols/bytes/all/blob/extract/types), `mode?`, `bg?` |
 | `annotate` 🔒 | Rename / comment / set prototype | `binary`, `target`, `action`, `name?`/`comment?`/`prototype?` |
 
 🔒 `annotate` is the only tool that writes. It is disabled unless the server is
@@ -242,6 +242,15 @@ search("mybinary", ["password", "api_key"], bg=True)
 
 # Get cross-references
 xrefs("mybinary", "malloc", depth=2)
+
+# Value flow: SSA p-code, grouped by basic block; each value is defined once
+code("mybinary", "parse_header", what="pcode")
+
+# Raw bytes plus where they live in the file (for patching)
+code("mybinary", "0x4011a0,64", what="bytes")   # -> hex, ascii, file_offset, block
+
+# Recovered struct layouts / enums / typedefs
+search("mybinary", "sockaddr", type="types")
 ```
 
 ### Auto-Detection
@@ -316,6 +325,9 @@ load("/path/to/binary", profile="deep", fresh=True)
 
 pyghidra-lite is designed for minimal token usage:
 
+- **Compact JSON** - results are serialized without indentation, one text block per call
+  (measured: 33% fewer characters than pretty-printed output across all tools on a sample binary)
+- **No empty fields** - false flags, empty tag lists and null context are omitted
 - **Compact output by default** - `functions(binary, type="all")` returns minimal `{name, addr}` pairs
 - **Opt-in detail** - use `info(detail="full")`, `code(cfg=True)`, or richer `type`/`what` modes only when needed
 - **Progress reporting** - large imports report progress every 10% or 60s

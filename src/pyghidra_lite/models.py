@@ -169,6 +169,8 @@ class BytesResult(BaseModel):
     size: int
     hex: str
     ascii: str | None = None        # Printable representation
+    file_offset: int | None = None  # Offset in the original file; None if not file-backed
+    block: str | None = None        # Memory block (section) name
     provenance: Provenance | None = None
 
 
