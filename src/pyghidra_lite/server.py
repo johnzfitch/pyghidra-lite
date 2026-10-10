@@ -4412,6 +4412,29 @@ class DefaultGroup(click.Group):
         return super().parse_args(ctx, args)
 
 
+def _exit_after_jvm(code: int) -> None:
+    """Exit now if the JVM was started; otherwise just return.
+
+    After an import/analysis Ghidra leaves a non-daemon JVM thread running, and
+    JPype's interpreter-exit shutdown waits on it forever (seen on Windows with
+    Ghidra 12.1: `pyghidra-lite import` printed its results and never exited).
+    Ghidra's own analyzeHeadless ends with System.exit for the same reason.
+    Callers must have closed the backend (projects saved and released) first.
+    """
+    try:
+        import jpype
+        started = jpype.isJVMStarted()
+    except Exception:
+        started = False
+    if not started:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(Exception):
+            stream.flush()
+    logging.shutdown()
+    os._exit(code)
+
+
 @click.group(cls=DefaultGroup)
 @click.version_option(__version__, "-v", "--version")
 def cli():
@@ -4634,6 +4657,7 @@ def serve_cmd(
             _remove_pid(port)
         if _backend:
             _backend.close()
+    _exit_after_jvm(0)
 
 
 @cli.command("import")
@@ -4763,6 +4787,7 @@ def import_cmd(
             click.echo(f"  {path.name}: ERROR - {e}", err=True)
 
     backend.close()
+    _exit_after_jvm(0)
 
 
 @cli.command("list")

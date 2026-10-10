@@ -111,8 +111,8 @@ def _func(handle, name):
     return server._tools_for(handle)._find_function(name)
 
 
-def _annotate(name, ctx=None, **kw):
-    return asyncio.run(server.annotate(binary=name, ctx=ctx or _AcceptCtx(), **kw))
+def _annotate(binary, ctx=None, **kw):
+    return asyncio.run(server.annotate(binary=binary, ctx=ctx or _AcceptCtx(), **kw))
 
 
 def test_sample_has_named_functions(loaded):
