@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import symlink_or_skip
 from mcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -274,7 +275,7 @@ def test_audit_write_rejects_symlink(tmp_path, monkeypatch):
     target = tmp_path / "target.txt"
     target.write_text("secure data\n")
     audit_path = tmp_path / "annotate_audit.jsonl"
-    audit_path.symlink_to(target)
+    symlink_or_skip(audit_path, target)
 
     # Calling _audit_write should NOT write to the target (or through the symlink)
     server._audit_write(_AUDIT_PREVIEW, "applied")
@@ -347,7 +348,7 @@ def test_audit_refuses_symlinked_journal(tmp_path, monkeypatch):
                         ServerConfig(allow_write=True, project_dir=tmp_path))
     target = tmp_path / "evil_target"
     target.write_text("")
-    (tmp_path / "annotate_audit.jsonl").symlink_to(target)
+    symlink_or_skip(tmp_path / "annotate_audit.jsonl", target)
     with pytest.raises(McpError):
         server._audit_write(_AUDIT_PREVIEW, "applied", required=True)
     assert target.read_text() == ""  # nothing written through the symlink
