@@ -1,5 +1,6 @@
 """Tests for search_strings_deep, batch_search_strings, and extract_strings_from_blob."""
 
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -142,13 +143,19 @@ class TestBatchSearchStrings:
         for q in queries:
             assert q in result
 
-    def test_indexed_mode_with_empty_defined_strings(self):
+    def test_indexed_mode_with_empty_defined_strings(self, monkeypatch):
         """mode='indexed' with no defined strings returns zero for each query."""
+        import types
+
+        # Fake the Ghidra iterator so this runs with or without a live JVM (a
+        # real DefinedStringIterator rejects the MagicMock program).
+        util = types.ModuleType("ghidra.program.util")
+        util.DefinedStringIterator = types.SimpleNamespace(forProgram=lambda program: [])
+        for name, mod in (("ghidra", types.ModuleType("ghidra")),
+                          ("ghidra.program", types.ModuleType("ghidra.program")),
+                          ("ghidra.program.util", util)):
+            monkeypatch.setitem(sys.modules, name, mod)
         gt = _make_stub()
-        try:
-            import ghidra  # noqa: F401
-        except (ImportError, ModuleNotFoundError):
-            pytest.skip("Ghidra JVM not available")
 
         result = gt.batch_search_strings(["foo", "bar"], mode="indexed", compact=True)
         assert result == {"foo": 0, "bar": 0}
