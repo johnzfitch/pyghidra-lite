@@ -1,9 +1,31 @@
 # pyghidra-lite
 
-[![PyPI](https://img.shields.io/pypi/v/pyghidra-lite)](https://pypi.org/project/pyghidra-lite/)
-[![Python](https://img.shields.io/pypi/pyversions/pyghidra-lite)](https://pypi.org/project/pyghidra-lite/)
-[![License](https://img.shields.io/github/license/johnzfitch/pyghidra-lite)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-2025--11--25-blue)](https://modelcontextprotocol.io)
+[![PyPI][pypi-badge]][pypi]
+[![Python][python-badge]][pypi]
+[![Downloads][downloads-badge]][pypi]
+[![License][license-badge]](LICENSE)<br>
+[![CI][ci-badge]][ci]
+[![MCP Registry][registry-badge]][registry]
+[![MCP spec][mcp-badge]][mcp]
+[![Claude Code plugin][plugin-badge]](#claude-code-plugin)
+[![Ghidra][ghidra-badge]][ghidra]
+[![Platforms][platform-badge]](#quick-start)
+
+[pypi]: https://pypi.org/project/pyghidra-lite/
+[pypi-badge]: https://img.shields.io/pypi/v/pyghidra-lite?logo=pypi&logoColor=white
+[python-badge]: https://img.shields.io/pypi/pyversions/pyghidra-lite?logo=python&logoColor=white
+[downloads-badge]: https://img.shields.io/pypi/dm/pyghidra-lite
+[license-badge]: https://img.shields.io/github/license/johnzfitch/pyghidra-lite
+[ci]: https://github.com/johnzfitch/pyghidra-lite/actions/workflows/ci.yml
+[ci-badge]: https://img.shields.io/github/actions/workflow/status/johnzfitch/pyghidra-lite/ci.yml?branch=master&label=CI&logo=githubactions&logoColor=white
+[registry]: https://registry.modelcontextprotocol.io/?q=pyghidra-lite
+[registry-badge]: https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fregistry.modelcontextprotocol.io%2Fv0%2Fservers%2Fio.github.johnzfitch%252Fpyghidra-lite%2Fversions%2Flatest&query=%24.server.version&label=MCP%20Registry&prefix=v&color=blue
+[mcp]: https://modelcontextprotocol.io/specification/2025-11-25
+[mcp-badge]: https://img.shields.io/badge/MCP_spec-2025--11--25-blue
+[plugin-badge]: https://img.shields.io/badge/Claude_Code-plugin-D97757?logo=claude&logoColor=white
+[ghidra]: https://github.com/NationalSecurityAgency/ghidra/releases
+[ghidra-badge]: https://img.shields.io/badge/Ghidra-11.x_%7C_12.x-E21E2B
+[platform-badge]: https://img.shields.io/badge/platform-Linux_%7C_macOS_%7C_Windows-lightgrey
 
 <!-- mcp-name: io.github.johnzfitch/pyghidra-lite -->
 
