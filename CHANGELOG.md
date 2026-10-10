@@ -5,7 +5,20 @@ All notable changes to pyghidra-lite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 0.9.0
+## [Unreleased]
+
+## [0.9.1] - 2026-10-10
+
+### Fixed
+- `PYGHIDRA_LITE_DEFAULT_PROFILE` was ignored under `serve`: its `--profile`
+  default (`fast`) always overwrote the env value.
+
+### Docs
+- README: plugin-first Quick Start, a Configuration reference (every env var
+  and flag), Windows Ghidra setup, and a corrected Architecture section (the
+  backend no longer idle-exits; run `pyghidra-lite stop` after upgrading).
+
+## [0.9.0] - 2026-10-10
 
 ### Added
 - **Claude Code plugin** (`plugins/pyghidra-lite`, marketplace at the repo root):
@@ -18,15 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the ops that `var`'s value flows into, through copies, merges and loops
   (not into callees). On ws2_32.dll `WSAStartup`, `param_2` is 1.9K chars vs
   ~22K for the full listing, which hits the 400-line cap on real functions.
-
-### Fixed
-- `PYGHIDRA_LITE_DEFAULT_PROFILE` was ignored under `serve`: its `--profile`
-  default (`fast`) always overwrote the env value.
-
-### Docs
-- README: plugin-first Quick Start, a Configuration reference (every env var
-  and flag), Windows Ghidra setup, and a corrected Architecture section (the
-  backend no longer idle-exits; run `pyghidra-lite stop` after upgrading).
 
 ## [0.8.0] - 2026-10-10
 

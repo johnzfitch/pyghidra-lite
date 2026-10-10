@@ -1,6 +1,6 @@
 """pyghidra-lite: Lightweight MCP server for reverse engineering."""
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 from pyghidra_lite.analyzer import GhidraAnalyzer
 from pyghidra_lite.backend import GhidraBackend
