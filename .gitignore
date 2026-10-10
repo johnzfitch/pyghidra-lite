@@ -68,6 +68,7 @@ AUDIT-*.md
 
 # Local MCP config (contains personal paths)
 .mcp.json
+!plugins/pyghidra-lite/.mcp.json
 
 # Runtime artifacts
 server.log
