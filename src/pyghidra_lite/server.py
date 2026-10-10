@@ -1112,12 +1112,11 @@ def _sanitize_error_text(text: str) -> str:
             forms.add(str(raw.expanduser().resolve()))
         for form in forms:
             redactions.append((form, repl))
-            # Exceptions whose str() is a repr (e.g. KeyError) escape backslashes,
-            # so a Windows path shows up doubled (C:\\x\\y) and the plain needle
-            # would miss it -- leaking the path. Redact that form too. No-op on
-            # POSIX (forward-slash paths contain no backslashes).
             if "\\" in form:
+                # Windows: repr()-based messages (KeyError, OSError filenames)
+                # double the backslashes, and Java reports forward slashes.
                 redactions.append((form.replace("\\", "\\\\"), repl))
+                redactions.append((form.replace("\\", "/"), repl))
 
     add_root(cfg.project_dir or DEFAULT_PROJECT_DIR, "<project-dir>")
     add_root(cfg.runtime_home, "<runtime-home>")
