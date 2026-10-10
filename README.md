@@ -64,6 +64,23 @@ Claude: [calls load, info, code...]
 
 ## Installation
 
+### Claude Code plugin
+
+Installs the MCP server (run with `uvx`, so [uv](https://docs.astral.sh/uv/) must be on
+`PATH`) together with a reverse-engineering workflow skill, and asks for your Ghidra
+directory, cache directory, optional path restriction and whether to allow `annotate`:
+
+```
+/plugin install pyghidra-lite --marketplace johnzfitch/pyghidra-lite
+```
+
+On Claude Code before 2.1.275, run `/plugin marketplace add johnzfitch/pyghidra-lite`
+first, then `/plugin install pyghidra-lite@pyghidra-lite`. The plugin pins an exact
+package version; after a plugin update, run `/reload-plugins` (or start a new session)
+to switch to it. If you also have a manual `pyghidra-lite` entry in `.mcp.json` or
+`~/.claude.json`, remove it to avoid two copies of every tool.
+
+
 ### PyPI (recommended)
 
 ```bash
