@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **MCP Registry publishing raced PyPI.** `mcp-registry.yml` and the PyPI
+  workflow both fired on the release event; the registry checked PyPI ~3 s in,
+  before the upload landed (~35 s), and rejected the version (v0.9.0, v0.9.1).
+  The registry job now runs after the PyPI job and waits until PyPI serves the
+  version. A manual dispatch also registered the version `master` (taken from
+  the branch name); it now uses `server.json` or an explicit `version` input.
+
 ## [0.9.1] - 2026-10-10
 
 ### Fixed

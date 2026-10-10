@@ -1,9 +1,17 @@
 name: Publish to MCP Registry
 
+# Runs after PyPI, never alongside it: the registry validates that the PyPI
+# version exists, so registering on the same release event as the PyPI upload
+# raced and failed (v0.9.0, v0.9.1: "version ... was not found (status: 404)").
+# publish.yml calls this once its PyPI job succeeds; workflow_dispatch is for a
+# manual (re-)registration of an already-published version.
 on:
-  release:
-    types: [published]
+  workflow_call:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to register (default: the version in server.json)"
+        required: false
 
 jobs:
   publish:
@@ -16,12 +24,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Update server.json version from tag
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          FILE_VERSION="$(jq -r .version server.json)"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # A branch dispatch has no version in its ref ("master"); use the file.
+            VERSION="$FILE_VERSION"
+          fi
+          if [ "$VERSION" != "$FILE_VERSION" ]; then
+            echo "::warning::server.json says $FILE_VERSION; registering $VERSION"
+          fi
           jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
           mv server.json.tmp server.json
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           cat server.json
+
+      - name: Wait for the version on PyPI
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # PyPI's JSON API can lag the upload by a minute or more (CDN).
+          for i in $(seq 1 60); do
+            if curl -sf "https://pypi.org/pypi/pyghidra-lite/$VERSION/json" > /dev/null; then
+              echo "pyghidra-lite $VERSION is on PyPI"
+              exit 0
+            fi
+            echo "waiting for pyghidra-lite $VERSION on PyPI ($i/60)"
+            sleep 10
+          done
+          echo "::error::pyghidra-lite $VERSION did not appear on PyPI within 10 minutes"
+          exit 1
 
       - name: Install mcp-publisher
         run: |

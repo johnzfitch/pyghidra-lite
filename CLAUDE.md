@@ -43,7 +43,13 @@ Create a GitHub release (e.g., `v0.5.0`). The `publish.yml` workflow handles PyP
 
 ### 3. MCP Registry
 
-The MCP registry requires manual publish (OIDC workflow needs org-level permissions).
+Automatic: `publish.yml` runs the registry job (`mcp-registry.yml`, GitHub OIDC login) after
+the PyPI job succeeds, waiting until PyPI serves the new version -- the registry rejects a
+version PyPI doesn't have yet. To (re-)register an already-published version, run the
+**Publish to MCP Registry** workflow manually (`gh workflow run mcp-registry.yml`, optional
+`-f version=X.Y.Z`; default is the version in `server.json`), or re-run a failed job.
+
+Manual fallback from a workstation:
 
 ```bash
 # First time: download the publisher
