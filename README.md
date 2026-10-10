@@ -7,7 +7,7 @@
 
 <!-- mcp-name: io.github.johnzfitch/pyghidra-lite -->
 
-Token-efficient MCP server for Ghidra-based reverse engineering. Analyze ELF, Mach-O, and PE binaries with Swift, Objective-C, and Hermes support.
+Token-efficient MCP server for Ghidra-based reverse engineering. Analyze ELF, Mach-O, and PE binaries with Swift, Objective-C, and Hermes support &mdash; decompile, disassemble, trace calls and **value flow**, recover **data types**, and map addresses back to **file offsets**. Runs on Linux, macOS, and Windows; ships as a Claude Code plugin with a bundled reverse-engineering skill.
 
 **Bottom line:** a lean, security-first Ghidra MCP. It is **read-only by default** — analysis tools never mutate your binaries or the server's configuration (which is frozen for the life of the process). The one tool that writes, `annotate` (rename / comment / prototype), is **opt-in** (`--allow-write`) and **human-confirmed**: every change is approved by you through an MCP elicitation prompt before it's committed, and it fails closed if your client can't ask. You get an analyst-agent that can persist its findings — under supervision — without giving up the read-only safety story.
 
@@ -31,18 +31,27 @@ sudo pacman -S jdk21-openjdk
 yay -S ghidra
 ```
 
-Ghidra installed via Homebrew (`brew install ghidra`) or to `/opt/ghidra` or `~/ghidra` is found automatically. Set `GHIDRA_INSTALL_DIR` only for non-standard paths.
+Ghidra installed via Homebrew (`brew install ghidra`) or to `/opt/ghidra` or `~/ghidra` is found automatically. Elsewhere &mdash; including any Windows install &mdash; point `GHIDRA_INSTALL_DIR` at the extracted `ghidra_<version>_PUBLIC` folder.
 
-**2. Install pyghidra-lite**
+**2. Install** &mdash; pick one
+
+<dl>
+  <dt>Claude Code plugin (recommended for Claude Code)</dt>
+  <dd>MCP server + reverse-engineering skill in one step; prompts for your Ghidra directory. Needs <a href="https://docs.astral.sh/uv/">uv</a> on <code>PATH</code>.</dd>
+</dl>
+
+```
+/plugin install pyghidra-lite --marketplace johnzfitch/pyghidra-lite
+```
+
+<dl>
+  <dt>Any MCP client</dt>
+  <dd>Install the package, then add it to your client (Claude Code: <code>.mcp.json</code> in your project or <code>~/.claude.json</code>; other clients: see <a href="#mcp-configuration">MCP Configuration</a>).</dd>
+</dl>
 
 ```bash
 pip install pyghidra-lite
-pyghidra-lite doctor   # checks Ghidra, JDK, decompiler, project dir; exits 1 on problems
 ```
-
-**3. Add to Claude Code**
-
-Create `.mcp.json` in your project (or `~/.claude.json` for global):
 
 ```json
 {
@@ -53,6 +62,15 @@ Create `.mcp.json` in your project (or `~/.claude.json` for global):
   }
 }
 ```
+
+**3. Check the environment**
+
+```bash
+pyghidra-lite doctor   # Ghidra, JDK, decompiler, project dir, locks; exits 1 on problems
+```
+
+> [!TIP]
+> Plugin users without a shell install can run the same check with `uvx pyghidra-lite doctor`.
 
 **4. Use it**
 
@@ -67,19 +85,23 @@ Claude: [calls load, info, code...]
 ### Claude Code plugin
 
 Installs the MCP server (run with `uvx`, so [uv](https://docs.astral.sh/uv/) must be on
-`PATH`) together with a reverse-engineering workflow skill, and asks for your Ghidra
-directory, cache directory, optional path restriction and whether to allow `annotate`:
+`PATH`) together with the `pyghidra-lite:reverse-engineering` workflow skill, and asks
+for your Ghidra directory, cache directory, optional path restriction and whether to
+allow `annotate`:
 
 ```
 /plugin install pyghidra-lite --marketplace johnzfitch/pyghidra-lite
 ```
 
-On Claude Code before 2.1.275, run `/plugin marketplace add johnzfitch/pyghidra-lite`
-first, then `/plugin install pyghidra-lite@pyghidra-lite`. The plugin pins an exact
-package version; after a plugin update, run `/reload-plugins` (or start a new session)
-to switch to it. If you also have a manual `pyghidra-lite` entry in `.mcp.json` or
-`~/.claude.json`, remove it to avoid two copies of every tool.
+- On Claude Code before 2.1.275, run `/plugin marketplace add johnzfitch/pyghidra-lite`
+  first, then `/plugin install pyghidra-lite@pyghidra-lite`.
+- The plugin pins an exact package version and runs one server per session. After a
+  plugin update, run `/reload-plugins` (or start a new session) to switch to it.
+- Change the settings later under `/config`.
 
+> [!WARNING]
+> If you also have a manual `pyghidra-lite` entry in `.mcp.json` or `~/.claude.json`,
+> remove it &mdash; otherwise every tool appears twice.
 
 ### PyPI (recommended)
 
@@ -225,7 +247,7 @@ auto-detecting format (ELF/Mach-O/PE) and language (Swift/ObjC/Hermes):
 | `delete` | Remove binary and cancel jobs | `name` |
 | `binaries` | List binaries + job status | `jobs?`, `rank_sources?` |
 | `info` | Binary overview | `binary`, `detail?` (summary/full/format/sections/entropy) |
-| `functions` | List/search functions | `binary`, `query?`, `type?` (all/swift/objc/imports/exports) |
+| `functions` | List/search functions, imports, exports | `binary`, `query?`, `type?` (all/swift/objc/imports/exports/types/got/dylibs), `limit?` |
 | `code` | Decompile, disassemble, p-code, bytes | `binary`, `target`, `what?` (decompile/asm/pcode/bytes/string), `cfg?` |
 | `xrefs` | References and call graphs | `binary`, `target`, `direction?`, `depth?`, `diff?` |
 | `search` | Find strings, bytes, symbols, data types | `binary`, `query`, `type?` (strings/symbols/bytes/all/blob/extract/types), `mode?`, `bg?` |
@@ -347,6 +369,8 @@ pyghidra-lite is designed for minimal token usage:
 - **Compact JSON** - results are serialized without indentation, one text block per call
   (measured: 33% fewer characters than pretty-printed output across all tools on a sample binary)
 - **No empty fields** - false flags, empty tag lists and null context are omitted
+- **Slices, not dumps** - `code("func,var", what="pcode")` returns only the ops a value flows into
+  (on `ws2_32.dll` `WSAStartup`: ~1.9K characters vs ~22K for the full listing)
 - **Compact output by default** - `functions(binary, type="all")` returns minimal `{name, addr}` pairs
 - **Opt-in detail** - use `info(detail="full")`, `code(cfg=True)`, or richer `type`/`what` modes only when needed
 - **Progress reporting** - large imports report progress every 10% or 60s
@@ -362,7 +386,13 @@ Claude Code session 2 ──stdio──> proxy ──┼──HTTP──> shared
 Claude Code session 3 ──stdio──> proxy ──┘        localhost:19101
 ```
 
-The proxy auto-starts the backend on first use and the backend auto-exits after 30 minutes of idle. A file lock prevents concurrent proxy starts from spawning duplicate backends.
+The proxy auto-starts the backend on first use, and a file lock plus a port check stop concurrent proxies from spawning duplicates. The backend keeps running until `pyghidra-lite stop`; binaries idle for 30 minutes are unloaded from memory (the 2 most recent stay loaded) and reload transparently from disk.
+
+> [!IMPORTANT]
+> The proxy reuses whatever backend is already listening, whatever its version. After
+> upgrading pyghidra-lite, run `pyghidra-lite stop` so the next session starts the new
+> code. (`serve` and the Claude Code plugin run one server per session and don't have
+> this issue.)
 
 | Command | What it does |
 |---------|-------------|
@@ -374,6 +404,23 @@ The proxy auto-starts the backend on first use and the backend auto-exits after 
 
 Set `PYGHIDRA_LITE_NO_AUTOSTART=1` to disable auto-start (useful with systemd).
 
+## Configuration
+
+Every setting is a `serve` flag or an environment variable (handy in an MCP `env` block):
+
+| Variable | Flag | Default | Purpose |
+|:---|:---|:---|:---|
+| `GHIDRA_INSTALL_DIR` | `--ghidra-dir` | auto-detect | Ghidra installation |
+| `PYGHIDRA_LITE_PROJECT_DIR` | `--project-dir` | see [below](#multi-agent-support) | Analysis cache |
+| `PYGHIDRA_LITE_RESTRICT_PATHS` | `--restrict-path` (repeatable) | unrestricted | Only load binaries under these dirs (env: OS path separator) |
+| `PYGHIDRA_LITE_ALLOW_WRITE` | `--allow-write` | off | Enable `annotate` (still human-confirmed) |
+| `PYGHIDRA_LITE_DEFAULT_PROFILE` | `--profile` | `fast` | Default analysis profile |
+| `PYGHIDRA_LITE_TOOL_TIMEOUT` | &mdash; | `300` seconds | Per-call budget so a wedged JVM call can't hang the client; `0` disables |
+| `PYGHIDRA_LITE_AUTH_TOKEN` | `--auth-token` | none | Bearer token for HTTP transports (required off-loopback) |
+| `PYGHIDRA_LITE_NO_AUTOSTART` | &mdash; | off | Proxy never spawns a backend |
+| &mdash; | `--evict-after` / `--min-loaded` | `30` min / `2` | Memory eviction of idle binaries |
+| &mdash; | `--autopurge-days` | off | Delete projects not opened in N days |
+
 ## Multi-Agent Support
 
 Each binary gets its own Ghidra project, enabling:
@@ -384,7 +431,7 @@ Each binary gets its own Ghidra project, enabling:
 - Content-addressed storage (same binary = same analysis)
 
 Projects are stored in `~/pyghidra-lite/projects/` (Windows: `%LOCALAPPDATA%\pyghidra-lite\projects\`),
-or in the pre-0.9 location `~/.local/share/pyghidra-lite/projects/` if that already exists.
+or in the pre-0.8 location `~/.local/share/pyghidra-lite/projects/` if that already exists.
 Override with `--project-dir` or `PYGHIDRA_LITE_PROJECT_DIR`. Ghidra 12+ rejects project paths with a
 component starting with `.`, so a legacy `~/.local` directory only works with Ghidra 11.x —
 `pyghidra-lite doctor` flags this.
