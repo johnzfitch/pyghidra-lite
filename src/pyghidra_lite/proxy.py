@@ -296,6 +296,21 @@ def _port_is_free(host: str, port: int) -> bool:
     """
     import socket
 
+    if _IS_WINDOWS:
+        # Windows retries SYNs to a closed loopback port for ~2s before
+        # reporting refusal, so the connect probe times out and a free port
+        # reads as occupied. Probe by binding instead: SO_EXCLUSIVEADDRUSE
+        # fails if any socket (listening or not) already owns the port.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            sock.bind((host, port))
+            return True
+        except OSError:
+            return False
+        finally:
+            sock.close()
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(HEALTH_TIMEOUT)
     try:
