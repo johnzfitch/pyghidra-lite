@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 import pytest
+from conftest import symlink_or_skip
 from mcp import types
 
 from pyghidra_lite import server
@@ -51,7 +52,7 @@ def test_resolve_import_path_reports_symlink_target(
     target = outside / "target.bin"
     target.touch()
     link = root / "link.bin"
-    link.symlink_to(target)
+    symlink_or_skip(link, target)
     config = server.ServerConfig(restrict_paths=[root])
     monkeypatch.setattr(server, "_server_config", config)
 

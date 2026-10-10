@@ -18,12 +18,14 @@ Surfaces covered:
 """
 
 import asyncio
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 from mcp.server.transport_security import TransportSecurityMiddleware
 
+from conftest import symlink_or_skip
 from pyghidra_lite import server
 from pyghidra_lite.backend import parse_analysis_id
 
@@ -54,7 +56,7 @@ class TestRestrictPathEscape:
         outside = tmp / "outside.bin"
         outside.write_bytes(b"x")
         link = root / "innocent.bin"
-        link.symlink_to(outside)
+        symlink_or_skip(link, outside)
         with pytest.raises(ValueError):
             server._resolve_import_path(str(link))
 
@@ -70,7 +72,7 @@ class TestRestrictPathEscape:
         outside = tmp / "evil.bin"
         outside.write_bytes(b"x")
         link = root / "x.bin"
-        link.symlink_to(outside)
+        symlink_or_skip(link, outside)
         with pytest.raises(ValueError):
             server._assert_within_restrict_roots(link)
 
@@ -370,6 +372,7 @@ class TestDnsRebindingEndToEnd:
 # marker if run, then triggers the extraction path. The pinned extractor is the
 # only thing permitted to run; if any launcher fired (i.e. a `bun x`-style fetch
 # survived), the marker would appear. This executes real processes, not mocks.
+@pytest.mark.skipif(sys.platform == "win32", reason="plants POSIX sh scripts as PATH executables")
 class TestNoLauncherExecLive:
     def test_extraction_never_runs_a_package_launcher(self, tmp_path, monkeypatch):
         bindir = tmp_path / "bin"
