@@ -4832,6 +4832,30 @@ def list_cmd(project_dir, as_json):
             )
 
 
+@cli.command("doctor")
+@click.option("--ghidra-dir", type=click.Path(path_type=Path), default=None,
+              help="Ghidra installation directory (overrides GHIDRA_INSTALL_DIR env var)")
+@click.option("--project-dir", type=click.Path(path_type=Path), default=None,
+              help="Project directory (overrides PYGHIDRA_LITE_PROJECT_DIR env var)")
+@click.option("-p", "--port", type=int, default=19101, help="Shared backend port to probe")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def doctor_cmd(ghidra_dir, project_dir, port, as_json):
+    """Check Python deps, Ghidra, JDK, decompiler, project dir and locks.
+
+    Read-only: does not start the JVM or write files. Exits 1 if anything
+    would stop analysis.
+    """
+    from pyghidra_lite.doctor import FAIL, as_dicts, format_text, run_checks
+
+    checks = run_checks(ghidra_dir=ghidra_dir, project_dir=project_dir, port=port)
+    if as_json:
+        click.echo(json.dumps(as_dicts(checks), indent=2))
+    else:
+        click.echo(format_text(checks))
+    if any(c.status == FAIL for c in checks):
+        raise SystemExit(1)
+
+
 @cli.command("proxy")
 @click.option("-p", "--port", type=int, default=19101,
               help="Backend port (default 19101)")
