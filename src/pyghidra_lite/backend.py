@@ -32,8 +32,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Standard project location
-DEFAULT_PROJECT_DIR = Path.home() / ".local" / "share" / "pyghidra-lite" / "projects"
+# Pre-0.9 default. Ghidra 12+ rejects it (dot-leading ".local" component; see
+# _assert_ghidra_safe_project_dir), so it is only kept when it already exists.
+LEGACY_PROJECT_DIR = Path.home() / ".local" / "share" / "pyghidra-lite" / "projects"
+
+
+def _default_project_dir() -> Path:
+    """Default project location, chosen so Ghidra 12+ accepts it.
+
+    An existing legacy ~/.local dir is kept so earlier caches aren't orphaned.
+    Otherwise use a path with no dot-leading components: %LOCALAPPDATA% on
+    Windows, ~/pyghidra-lite elsewhere (~/.local and ~/Library/Application
+    Support are out -- dot / space in a path element).
+    """
+    if LEGACY_PROJECT_DIR.is_dir():
+        return LEGACY_PROJECT_DIR
+    if sys.platform == "win32" and (local := os.environ.get("LOCALAPPDATA")):
+        return Path(local) / "pyghidra-lite" / "projects"
+    return Path.home() / "pyghidra-lite" / "projects"
+
+
+DEFAULT_PROJECT_DIR = _default_project_dir()
 
 
 def _read_ghidra_major_version(install_dir: Path | str | None) -> int | None:
@@ -66,11 +85,12 @@ def _assert_ghidra_safe_project_dir(project_dir: Path, ghidra_major: int | None)
     Ghidra 12's ProjectLocator validates the whole absolute project path via
     GhidraURL.checkValidProjectPath -> NamingUtilities.checkName, which rejects any
     element starting with '.' ("Path element starting with '.' is not permitted").
-    DEFAULT_PROJECT_DIR lives under ~/.local/..., so on Ghidra 12 every import there
-    dies with that cryptic Java error deep inside an async worker (phase=import).
+    The legacy default (~/.local/..., still used when it already exists) or a
+    user-chosen dotted dir would otherwise die with that cryptic Java error deep
+    inside an async worker (phase=import).
     Surface it here, at startup, with actionable guidance instead.
 
-    Ghidra 11.x and earlier do NOT impose this restriction, so the default ~/.local
+    Ghidra 11.x and earlier do NOT impose this restriction, so the legacy ~/.local
     dir is perfectly valid there. The check is therefore gated to major version >= 12
     to avoid breaking working installs. If the version can't be determined
     (ghidra_major is None) we skip the check rather than risk a false positive.
@@ -406,7 +426,7 @@ class GhidraBackend:
 
         # Now that we know which Ghidra we're using, reject dot-leading project dirs
         # on Ghidra 12+ (still pre-JVM, before pyghidra.start()). Gated by version so
-        # the default ~/.local dir keeps working on Ghidra 11.x.
+        # the legacy ~/.local dir keeps working on Ghidra 11.x.
         _assert_ghidra_safe_project_dir(
             self.project_dir, _read_ghidra_major_version(install_dir)
         )

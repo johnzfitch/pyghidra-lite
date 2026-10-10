@@ -57,7 +57,7 @@ class GhidraAnalyzer:
 
         Args:
             project_name: Ghidra project name (use different names for concurrent access)
-            project_dir: Project directory (default: ~/.local/share/pyghidra-lite/projects)
+            project_dir: Project directory (default: backend.DEFAULT_PROJECT_DIR)
         """
         if isinstance(project_dir, str):
             project_dir = Path(project_dir)
